@@ -23,6 +23,7 @@ import urllib.request
 from datetime import datetime, time, timedelta, timezone
 
 from .db import iso, utcnow
+from .normalize import classify_web_request
 
 EMPLOYEES = ["alice", "bob", "carol", "dave", "erin", "frank", "grace", "heidi"]
 
@@ -180,6 +181,122 @@ def request_burst(day, rng):
     return events
 
 
+def _access(ts, scenario, ip, method, target, status, size=180, note=""):
+    """One access-log event, built the way the parser would build it.
+
+    The event type comes from normalize.classify_web_request rather than being written by hand, so a
+    scenario cannot claim a type the real parser would never produce — an injection payload is
+    `web_scan`, not `web_request`, and a 5xx is `web_error`. `http_status` is set here too, since
+    that is what normalize_weblog_line stores.
+    """
+    return _event(ts, scenario, classify_web_request(target, status), None, ip,
+                  outcome="success" if status < 400 else "failure", http_status=status, bytes=size,
+                  message=f"{method} {target} -> {status} [SYNTHETIC] {note}".strip())
+
+
+def web_login_abuse(day, rng):
+    """One client working through login endpoints: twelve refusals, two different codes.
+
+    Eight are 401s on a form that exists, four are 403s from a blocked WordPress login. The four are
+    deliberately under web_scanner's threshold of five, so this scenario shows the login rule reading
+    both `web_request` and `web_scan` events without also tripping the scanner rule.
+    """
+    ip, start = "203.0.113.90", _at(day, 15, 5)
+    events = [_access(start + timedelta(seconds=i * 12), "web_login_abuse", ip, "POST", "/login", 401,
+                      note="wrong password")
+              for i in range(8)]
+    events += [_access(start + timedelta(seconds=120 + i * 15), "web_login_abuse", ip, "POST",
+                       "/wp-login.php", 403, size=153, note="login form blocked by rule")
+               for i in range(4)]
+    return events
+
+
+def web_auth_brute_force(day, rng):
+    """Twelve 401s against one endpoint over two minutes: guesses at a single form."""
+    ip, start = "198.51.100.201", _at(day, 15, 30)
+    return [_access(start + timedelta(seconds=i * 9), "web_auth_brute_force", ip, "POST", "/login", 401,
+                    note="credential guessing")
+            for i in range(12)]
+
+
+def web_injection(day, rng):
+    """Three attack payloads in under a minute, two of which land in the request line as web_scan.
+
+    Targets are percent-encoded, as nginx records them. The middle one returns 200 because reflected
+    XSS succeeds, and the first returns 500 because the injection broke the query.
+    """
+    ip, start = "192.0.2.55", _at(day, 16, 0)
+    return [
+        _access(start, "web_injection", ip, "GET", "/product?id=1%27%20OR%20%271%27=%271", 500, size=210,
+                note="SQL injection in the id parameter"),
+        _access(start + timedelta(seconds=20), "web_injection", ip, "GET",
+                "/search?q=%3Cscript%3Ealert(1)%3C/script%3E", 200, size=1420, note="reflected XSS"),
+        _access(start + timedelta(seconds=40), "web_injection", ip, "GET", "/api/tools?cmd=%3Bid", 200,
+                size=980, note="command injection"),
+    ]
+
+
+def web_sensitive_files(day, rng):
+    """Four secret-bearing files served instead of refused.
+
+    Three of them are scanner-shaped paths, so the events arrive as web_scan — under five of them, so
+    web_scanner stays quiet. The fourth is an ordinary request for a file that should not be
+    reachable at all.
+    """
+    ip, start = "203.0.113.111", _at(day, 16, 20)
+    targets = ["/.env", "/.git/config", "/.aws/credentials", "/wp-config.php"]
+    return [_access(start + timedelta(seconds=i * 8), "web_sensitive_files", ip, "GET", target, 200,
+                    size=512 + i * 64, note="served, not refused")
+            for i, target in enumerate(targets)]
+
+
+def web_access_denied(day, rng):
+    """One client refused 24 times in two minutes while walking protected paths.
+
+    The paths are deliberately not scanner signatures and not login endpoints: no path looks like a
+    known probe, so nothing here is caught by web_scanner or web_login_abuse, and only the rule that
+    counts 403s has anything to say. Ten distinct paths, well under the breadth threshold.
+    """
+    ip, start = "198.51.100.66", _at(day, 16, 45)
+    paths = ["/admin/users", "/admin/settings", "/internal/reports", "/internal/keys",
+             "/api/v1/tenants", "/api/v1/billing", "/staff/directory", "/reports/export",
+             "/settings/security", "/portal/download"]
+    return [_access(start + timedelta(seconds=i * 5), "web_access_denied", ip, "GET",
+                    paths[i % len(paths)], 403, size=146, note="not authorised")
+            for i in range(24)]
+
+
+def web_server_errors(day, rng):
+    """One client answered with twelve 5xx responses: a request that breaks the application."""
+    ip, start = "192.0.2.201", _at(day, 17, 5)
+    paths = ["/api/checkout", "/api/checkout/submit", "/report/export"]
+    return [_access(start + timedelta(seconds=i * 7), "web_server_errors", ip, "POST",
+                    paths[i % len(paths)], 500, size=320, note="unhandled error")
+            for i in range(12)]
+
+
+ERROR_PROBE_PATHS = ["/uploads", "/files/private", "/backup", "/.well-known/../config",
+                     "/download", "/media", "/assets/private", "/archive"]
+
+
+def web_error_probe(day, rng):
+    """Twenty-two nginx error-log lines naming a request, from one client.
+
+    Access logging is off on this vhost, so the error log is the only record: every event here is
+    `web_error` with no response code at all. Eight distinct paths, so the breadth rule stays quiet.
+    """
+    ip, start = "203.0.113.222", _at(day, 17, 30)
+    events = []
+    for i in range(22):
+        path = ERROR_PROBE_PATHS[i % len(ERROR_PROBE_PATHS)]
+        events.append(_event(start + timedelta(seconds=i * 6), "web_error_probe", "web_error", None, ip,
+                             outcome="failure",
+                             message=f'GET {path} [error] open() "/var/www/html{path}" failed '
+                                     f"(2: No such file or directory), client: {ip}, "
+                                     f'server: shop.example, request: "GET {path} HTTP/1.1"'))
+    return events
+
+
 def impossible_travel(day, rng):
     return [
         _event(_at(day, 9, 0), "impossible_travel", "auth_success", "erin", "10.0.1.24", host="mail01",
@@ -254,7 +371,8 @@ SCENARIOS = {
                       "description": "Authorized internal scanner (10.0.50.5) - benign, but trips brute-force."},
     "noisy_scanner_repeat": {"build": noisy_scanner_repeat, "malicious": False, "expected": {},
                              "description": "The scanner's second pass later the same day."},
-    "web_scan": {"build": web_scan, "malicious": True, "expected": {"web_scanner": "203.0.113.80"},
+    "web_scan": {"build": web_scan, "malicious": True,
+                 "expected": {"web_scanner": "203.0.113.80", "web_injection_attempt": "203.0.113.80"},
                  "description": "One IP probes /.env, /wp-login.php, .git and injection strings in a minute."},
     "port_sweep": {"build": port_sweep, "malicious": True, "expected": {"firewall_port_sweep": "198.51.100.140"},
                    "description": "The firewall blocks one IP on 20 different ports in 40 seconds."},
@@ -281,6 +399,47 @@ SCENARIOS = {
                       "expected": {"web_request_burst": "198.51.100.77"},
                       "description": "One client sends 240 requests in 36 seconds to three URLs, while a "
                                      "reader loads a page and its assets alongside."},
+    # The OWASP web rules. Appended last for the same reason as the two above: the shared rng
+    # sequence for every scenario before them must not shift, or their synthetic data changes.
+    "web_login_abuse": {"build": web_login_abuse, "malicious": True,
+                        "expected": {"web_login_abuse": "203.0.113.90"},
+                        "description": "One client makes twelve failed login requests in under three "
+                                       "minutes, across a real form (401) and a blocked WordPress login "
+                                       "(403). Only eight hit the real form, so the narrower "
+                                       "per-endpoint 401 rule stays quiet."},
+    "web_auth_brute_force": {"build": web_auth_brute_force, "malicious": True,
+                             "expected": {"web_auth_brute_force": "198.51.100.201",
+                                          "web_login_abuse": "198.51.100.201"},
+                             "description": "Twelve 401s against one login endpoint in under two "
+                                            "minutes. Labelled for both credential rules, because "
+                                            "repeated failed logins on one form are both."},
+    "web_injection": {"build": web_injection, "malicious": True,
+                      "expected": {"web_injection_attempt": "192.0.2.55"},
+                      "description": "SQL injection, reflected XSS, and command injection in one "
+                                     "request each. The classifier types two of them web_scan and one "
+                                     "web_request, so a rule that read only one type would miss some. "
+                                     "Under web_scanner's threshold of five, so the single-request "
+                                     "rule is the only thing here that fires."},
+    "web_sensitive_files": {"build": web_sensitive_files, "malicious": True,
+                            "expected": {"web_sensitive_file_served": "203.0.113.111"},
+                            "description": "/.env, /.git/config, /.aws/credentials and wp-config.php "
+                                           "all answered 200 with content. The probe-only version of "
+                                           "this traffic is the web_scan scenario, where every one of "
+                                           "those paths is a 404 and this rule stays quiet."},
+    "web_access_denied": {"build": web_access_denied, "malicious": True,
+                          "expected": {"web_access_denied_burst": "198.51.100.66"},
+                          "description": "One client refused 24 times with 403 in two minutes, across "
+                                         "ten protected paths that match no scanner signature and no "
+                                         "login endpoint."},
+    "web_server_errors": {"build": web_server_errors, "malicious": True,
+                          "expected": {"web_server_error_burst": "192.0.2.201"},
+                          "description": "Twelve 5xx responses to one client in under two minutes, "
+                                         "from the access log, so the error-log rule stays quiet."},
+    "web_error_probe": {"build": web_error_probe, "malicious": True,
+                        "expected": {"web_error_probe_burst": "203.0.113.222"},
+                        "description": "Twenty-two nginx error-log lines naming a request from one "
+                                       "client, on a vhost with access logging off: no response codes "
+                                       "at all, so only the error-log rule can see them."},
 }
 
 

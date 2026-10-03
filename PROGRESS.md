@@ -952,5 +952,125 @@ the service reads the env file directly and was ingesting normally.
   defined `SERVICE_WAIT_SECONDS`) -- and that is what prompted the `${VAR:-default}` hardening above,
   so the mistake earned its keep.
 
+## OWASP web rules and the `http_status` column (2026-10-03, `watchpost/rules.py`)
+
+The phase `docs/WEB_DETECTION.md` had planned: the status column first, then the seven rules it
+unblocked. Five of the OWASP Top 10 are genuinely visible in nginx logs and are covered; the other
+five are application-level and the document says so rather than inventing a rule to look thorough.
+
+**Shipped — the column**
+
+- `http_status INTEGER` on `events`, added to `db.ADDED_COLUMNS` so an existing database gains it in
+  place at startup. Named `http_status` and deliberately **not** aliased from `status`, because
+  `FIELD_ALIASES` already maps `status` onto `outcome` and reusing the name would have quietly changed
+  what that alias picks up. Accepted names: `http_status`, `status_code`, `response_code`.
+- Set by `normalize_weblog_line` from the access log's status field. nginx error-log lines have no code,
+  so theirs stay `NULL` — which is exactly what `web_error_probe_burst` keys on.
+- In `engine.RULE_EVENT_FIELDS` so rules can read it, in `queries.EVENT_FIELDS` so the API returns it,
+  and shown in the event detail dialog.
+- Rules prefer the column and fall back to the `-> 404` in the message, so events ingested before the
+  column existed are still judged rather than silently skipping every status rule.
+
+**Shipped — the seven rules**
+
+| Rule | Fires when | OWASP | ATT&CK |
+|---|---|---|---|
+| `web_login_abuse` | ≥ 10 failed requests to a login endpoint from one IP in 300 s, whatever the code | A07 | T1110.001, T1078 |
+| `web_auth_brute_force` | ≥ 10 responses with status **401** on **one endpoint** from one IP in 300 s | A07 | T1110 |
+| `web_injection_attempt` | a **single** request carrying an injection payload | A03 | T1190, T1059 |
+| `web_sensitive_file_served` | a request for a secret-bearing file answered with **2xx content** | A05, A01 | T1552.001, T1190 |
+| `web_access_denied_burst` | ≥ 20 responses with status **403** to one IP in 300 s | A01 | T1083, T1078 |
+| `web_server_error_burst` | ≥ 10 responses with status **5xx** from the access log to one IP in 300 s | A05, A06 | T1190 |
+| `web_error_probe_burst` | ≥ 20 nginx **error.log** lines naming a request from one IP in 300 s | A01, A06 | T1595.003 |
+
+Four decisions worth not re-litigating:
+
+- **`web_injection_attempt` alerts on one request.** An injection string is classified `web_scan`, and
+  before this the only thing watching `web_scan` was `web_scanner`, which needs five requests in five
+  minutes — so one SQL injection was silent. It takes `window_seconds` not as a threshold but as a
+  grouping window, so a burst of attempts is one alert rather than fifty.
+- **`web_login_abuse` counts failures, `web_auth_brute_force` counts 401s per endpoint.** A blocked
+  login form answers 403 and one that never existed answers 404, so an attacker working through login
+  paths produces all three codes. The wider rule catches the campaign, the narrower one catches a form
+  being guessed at. They overlap on purpose.
+- **`web_sensitive_file_served` requires 2xx.** A refused `/.env` is probing, already covered by the
+  scanner and discovery rules. 3xx is excluded too: nginx redirecting an unknown path to the login page
+  must not read as a disclosure.
+- **The two error rules split on whether a code exists at all.** An access-log 5xx has a status; an
+  error.log line never does. So one probe recorded in both logs is counted by one rule and not two.
+
+The subtlest part is which event types each rule reads. `classify_web_request` types a request to
+`/wp-login.php` or `/.env`, or one carrying an injection payload, as **`web_scan`** rather than
+`web_request`, and a 5xx as `web_error`. So the rules about *what was asked for* read `web_request`
+**and** `web_scan`, and there is a test for each pair that a rule reading only one type would miss.
+Getting this wrong would have produced rules that pass their scenarios and see nothing in production.
+
+**The bug this phase uncovered — and it was pre-existing**
+
+`RULE_EVENT_FIELDS` (the column list the engine projects for rules) never included **`outcome`**. A rule
+asking for a field the projection omits gets `None`, so `web_path_discovery` — added last phase, and
+written to test what *percentage of requests failed* — **never fired on a single ingested event**. It
+passed its labeled scenario the whole time, because `improve.evaluate` hands rules the raw scenario
+dicts, which set `outcome` themselves; only the engine applies the projection. Two things made it
+invisible: the unit tests build events directly, and the smoke check's expectation for that rule could
+not be run here.
+
+Found by walking the whole path for the first time — normalize, ingest, detect, read the alerts back —
+rather than by reading the code. `web_login_abuse` reads `outcome` too, so it would have been stillborn
+in exactly the same way.
+
+Fixed, and guarded: `tests/test_engine.py::ScenarioPathTests` ingests every labeled scenario through the
+real engine into an in-memory store and asserts each expected rule raised an alert on the expected
+group_key. In-memory, so it needs no temporary directory and runs everywhere. Mutation-checked — with
+`outcome` removed from the projection again the test fails on 3 scenarios, and passes with it restored.
+
+**Verification**
+
+- **20/20 rules fire through the real engine** on all 22 labeled scenarios (620 events, 67 carrying
+  `http_status`), read back from the `alerts` table. `web_path_discovery` works on ingested data for the
+  first time.
+- `improve.evaluate`: every rule `fn == 0` and `recall == 1.0`, and **every new rule has precision
+  1.0** — the seven added no false positive on any of the fifteen pre-existing scenarios. The only false
+  positives in the whole evaluation are the two deliberate ones from `noisy_scanner` that
+  `tests/test_rules.py` asserts by name.
+- Two new scenarios' worth of design care, visible in the labels: the `web_scan` scenario already sent
+  two injection payloads, so `web_injection_attempt` is now labelled there rather than being counted as a
+  false positive; and `web_auth_brute_force`'s scenario is labelled for `web_login_abuse` as well,
+  because twelve failed logins on one form genuinely are both.
+- New synthetic web events go through a `simulate._access` helper that derives the event type from
+  `normalize.classify_web_request` instead of writing it by hand, so a scenario cannot claim a type the
+  parser would never produce. Both new scenario groups are appended last in `SCENARIOS`, so the seeded
+  rng sequence for every earlier scenario is unchanged.
+- `tests/test_rules.py`: a new `OwaspWebRuleTests` class, 22 tests — thresholds at the boundary,
+  per-endpoint versus per-client for the two credential rules, 403-versus-404, 5xx-versus-error-log,
+  single-request injection, each payload family, encoded payloads, redirects not counting as
+  disclosures, and the message fallback for events with no `http_status` column.
+- ATT&CK catalog 20 → **22** by adding `T1059` and `T1552.001`; the "catalog equals exactly what the
+  rules use" invariant still holds and 22 stays inside the 15–25 bound. `tests/test_attack.py` was
+  updated for two real changes it caught: `T1078` now has five covering rules, and `T1595.003` is now
+  covered by an enabled rule (`web_error_probe_burst`), where before only the disabled `web_scanner`
+  claimed it.
+- Also updated: `README.md` (new rule rows, 22 techniques, the `http_status` note), `docs/API.md` (the
+  alias row and why `status` is not one of them), `docs/WEB_DETECTION.md` (what shipped, and tuning
+  notes for the two rules that overlap), and `scripts/smoke.py` (its expected set now names all 20).
+- **Honest gap:** `scripts/smoke.py` needs a running server and a live ingest, so the extended
+  expectation could not be executed here. What is verified instead is that all 20 rules raised alerts
+  through the same engine and database the smoke check exercises; the HTTP layer above it is unchanged
+  by this work apart from one additive field.
+
+**Notes for the owner**
+
+- The `RULE_EVENT_FIELDS` bug is the part worth remembering: **a field a rule reads but the projection
+  omits is silently `None`, and neither the unit tests nor the evaluation harness can see it.** Anything
+  a rule reads has to be listed there, and `ScenarioPathTests` is what keeps that true now.
+- Re-running against your live database needs nothing: the column is added in place at startup, and
+  events ingested before it simply have `NULL` there. Status rules skip those rather than guessing.
+- `web_injection_attempt` is the one likely to surprise you on first contact, because it alerts on a
+  single request by design. If you run an authorised scanner or a WAF test suite against your own site,
+  allow-list it with `ignore_ips` — raising a threshold is the wrong lever for a rule whose whole point
+  is that one payload is enough.
+- `SCHEMA_VERSION` was left at 2, matching the convention already used for `dest_port` and `bytes`:
+  `ADDED_COLUMNS` is what upgrades a database, and the version number does not gate it.
+
 
 

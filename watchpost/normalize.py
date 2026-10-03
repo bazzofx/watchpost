@@ -1,7 +1,7 @@
 """Parse and normalize raw security events into the Watchpost schema.
 
 Normalized event fields:
-    ts, source, host, event_type, outcome, severity, user, src_ip, dest_ip, dest_port, bytes, message, raw
+    ts, source, host, event_type, outcome, severity, user, src_ip, dest_ip, dest_port, bytes, http_status, message, raw
 
 Every input record either becomes a normalized event or a rejection with a reason.
 Nothing is dropped silently.
@@ -79,6 +79,10 @@ FIELD_ALIASES = {
     "dest_ip": ["dest_ip", "destination_ip", "server_ip", "dst_ip"],
     "dest_port": ["dest_port", "destination_port", "dst_port", "dport"],
     "bytes": ["bytes", "bytes_out", "bytes_sent", "sent_bytes", "out_bytes"],
+    # Deliberately *not* aliased from "status": that name already maps onto `outcome`, and the two
+    # are different ideas (a 404 is a failure, but a 200 is not a success of anything in
+    # particular). A source that logs the code as `status` alone keeps setting `outcome`.
+    "http_status": ["http_status", "status_code", "response_code"],
     "message": ["message", "msg", "description"],
 }
 
@@ -258,6 +262,9 @@ def normalize_record(record, default_source, now=None):
         "dest_ip": parse_ip(_pick(record, "dest_ip"), "dest_ip"),
         "dest_port": parse_int(_pick(record, "dest_port"), "dest_port", 65535),
         "bytes": parse_int(_pick(record, "bytes"), "bytes", MAX_BYTES),
+        # 100-599 is the range a response code can occupy. nginx error.log lines carry no code, so
+        # this stays NULL for them, which is also how the error-log rule tells the two apart.
+        "http_status": parse_int(_pick(record, "http_status"), "http_status", 599),
         "message": redact(clean_text(_pick(record, "message"), "message")),
         "raw": redact(raw)[: MAX_LEN["raw"]],
     }
@@ -372,6 +379,9 @@ def normalize_weblog_line(line, default_source, now=None):
         "user": match.group("user"), "src_ip": match.group("ip"),
         "outcome": "failure" if status >= 400 else "success",
         "bytes": match.group("size"),
+        # The code as a field of its own. Rules that care about *what* was answered (403 probing,
+        # 401 brute force, 5xx breakage) read this rather than re-parsing the message.
+        "http_status": status,
         "message": f"{match.group('method')} {path[:500]} -> {status}"
                    + (f" ua={match.group('agent')[:120]}" if match.group("agent") not in (None, "", "-") else ""),
     }

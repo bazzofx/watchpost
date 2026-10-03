@@ -12,12 +12,13 @@ These are the regression guards for the "database is locked" report. Two propert
 
 import json
 import os
+import random
 import sqlite3
 import tempfile
 import unittest
 from datetime import timedelta
 
-from watchpost import engine, normalize, rules as rules_mod
+from watchpost import engine, normalize, rules as rules_mod, simulate
 from watchpost.db import connect, init_schema, iso, utcnow
 
 
@@ -152,6 +153,50 @@ class DetectionUnderLoadTests(_Detector):
                       "src_ip": "203.0.113.5"} for _ in range(5)])
         summary = engine.run_detection(self.conn, trigger="test-full")
         self.assertEqual(summary["events_scanned"], 5)
+
+
+class ScenarioPathTests(unittest.TestCase):
+    """Every labeled scenario must alert through the engine, not only through improve.evaluate().
+
+    Regression: RULE_EVENT_FIELDS did not list `outcome`, so a rule reading it got None. Nothing in
+    the evaluation harness could see that — it feeds rules the raw scenario dicts, which carry
+    `outcome` themselves, whereas the engine hands rules the projected columns. web_path_discovery
+    therefore passed its labeled scenario and never fired on a real ingested event, and a new rule
+    reading `outcome` would have been stillborn in exactly the same way. This walks the real path:
+    normalize, ingest, detect, read the alerts back.
+
+    An in-memory store is all this needs; nothing here is about files or locking.
+    """
+
+    def alerts_for(self, name, spec):
+        """{(rule_id, group_key)} raised by ingesting one scenario through the engine."""
+        conn = connect(":memory:")
+        try:
+            init_schema(conn)
+            engine.seed_rules(conn)
+            events = [normalize.normalize_record(record, f"demo:{name}")
+                      for record in spec["build"](simulate.demo_day(), random.Random(7))]
+            engine.ingest(conn, events, [], f"demo:{name}", "json", "tester", synthetic=True)
+            return {(row["rule_id"], row["group_key"])
+                    for row in conn.execute("SELECT rule_id, group_key FROM alerts")}
+        finally:
+            conn.close()
+
+    def test_every_labeled_scenario_alerts_through_the_engine(self):
+        for name, spec in simulate.SCENARIOS.items():
+            if not spec["expected"]:
+                continue
+            with self.subTest(scenario=name):
+                by_rule = {}
+                for rule_id, group_key in self.alerts_for(name, spec):
+                    by_rule.setdefault(rule_id, set()).add(group_key)
+                for rule_id, want in spec["expected"].items():
+                    self.assertIn(rule_id, by_rule,
+                                  f"{name}: {rule_id} raised no alert through the engine "
+                                  f"(raised: {sorted(by_rule)})")
+                    if want is not None:
+                        self.assertIn(want, by_rule[rule_id],
+                                      f"{name}: {rule_id} alerted on {sorted(by_rule[rule_id])}, not {want}")
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@
 
 Each rule is a pure function: (events, params) -> list of findings.
 Events are dicts with at least id, ts, event_type, user, src_ip (and, for the 2.0 rules,
-host, dest_ip, dest_port, bytes, message).
+host, dest_ip, dest_port, bytes, http_status, message).
 A finding is {"group_key", "event_ids", "first_seen", "last_seen", "title", "explanation"}.
 Every rule also lists the MITRE ATT&CK techniques it maps to (see attack.py).
 
@@ -10,6 +10,7 @@ Rules are deliberately simple, threshold-based, and explainable. No machine lear
 """
 
 from collections import Counter, defaultdict, deque
+from urllib.parse import unquote_plus
 
 import re
 
@@ -110,6 +111,94 @@ DEFAULT_RULES = [
         "techniques": techniques("T1499"),
         "severity": "medium",
         "params": {"threshold": 200, "window_seconds": 60, "ignore_ips": [], "ignore_users": []},
+    },
+    {
+        "id": "web_login_abuse",
+        "name": "Failed logins against a login endpoint from one address",
+        "description": "Fires when one source IP makes at least `threshold` failed requests to a login "
+                       "endpoint within `window_seconds`. Any refusal counts — 401, 403, or 404 on a "
+                       "login path that was never there — because an attacker working through a list of "
+                       "login URLs produces all three. `web_auth_brute_force` is the narrower rule that "
+                       "insists on 401s against a single endpoint.",
+        "techniques": techniques("T1110.001", "T1078"),
+        "severity": "high",
+        "params": {"threshold": 10, "window_seconds": 300, "ignore_ips": [], "ignore_users": []},
+    },
+    {
+        "id": "web_injection_attempt",
+        "name": "Attack payload in a web request",
+        "description": "Fires on a single request whose path or query string carries an injection "
+                       "payload: SQL injection, cross-site scripting, path traversal, command injection, "
+                       "template injection, or XXE, encoded or plain. One request is enough, because a "
+                       "payload like that is never part of using the site; before this rule the only "
+                       "thing watching injection strings was web_scanner, which needs five requests in "
+                       "five minutes, so a lone SQL injection was silent. Attempts from one address "
+                       "within `window_seconds` are gathered into one alert.",
+        "techniques": techniques("T1190", "T1059"),
+        "severity": "high",
+        "params": {"window_seconds": 300, "ignore_ips": [], "ignore_users": []},
+    },
+    {
+        "id": "web_sensitive_file_served",
+        "name": "Sensitive file served to a client",
+        "description": "Fires when a request for a secret-bearing file (.env, .git/config, "
+                       ".aws/credentials, id_rsa, wp-config.php, a .sql or .bak backup, and similar) is "
+                       "answered with content instead of a refusal. Success is the whole rule: a refused "
+                       "request is only probing, which web_scanner and web_path_discovery cover, while a "
+                       "200 means the file was served and the secret is out. A 3xx is not counted, so a "
+                       "redirect to a login page does not read as a disclosure.",
+        "techniques": techniques("T1552.001", "T1190"),
+        "severity": "critical",
+        "params": {"window_seconds": 300, "ignore_ips": [], "ignore_users": []},
+    },
+    {
+        "id": "web_access_denied_burst",
+        "name": "Repeated access denials to one client",
+        "description": "Fires when one source IP receives at least `threshold` responses with status 403 "
+                       "within `window_seconds`. Each refusal confirms that something exists, so a run of "
+                       "them is how broken access control is discovered by hand. Needs the http_status "
+                       "column: an outcome of 'failure' alone cannot tell 403 from 404, and 404s across "
+                       "many paths are ordinary enumeration.",
+        "techniques": techniques("T1083", "T1078"),
+        "severity": "medium",
+        "params": {"threshold": 20, "window_seconds": 300, "ignore_ips": [], "ignore_users": []},
+    },
+    {
+        "id": "web_auth_brute_force",
+        "name": "Password guessing against one login endpoint",
+        "description": "Fires when one endpoint answers at least `threshold` requests from one source IP "
+                       "with status 401 within `window_seconds`. The threshold is per endpoint, not per "
+                       "client, which is what separates this from web_login_abuse: a scanner collecting "
+                       "404s across hundreds of paths never reaches it, and a form being guessed at does. "
+                       "A 401 is the server saying the credentials were wrong, so the count is a count of "
+                       "guesses.",
+        "techniques": techniques("T1110"),
+        "severity": "high",
+        "params": {"threshold": 10, "window_seconds": 300, "ignore_ips": [], "ignore_users": []},
+    },
+    {
+        "id": "web_server_error_burst",
+        "name": "Server errors caused by one client",
+        "description": "Fires when one source IP is answered with at least `threshold` 5xx responses "
+                       "within `window_seconds`: either requests that break the application are being "
+                       "sent deliberately, or a fault is being exercised while it is still exploitable. "
+                       "nginx error.log lines are excluded here (they carry no status) and counted by "
+                       "web_error_probe_burst, so a probe recorded in both logs cannot be counted twice.",
+        "techniques": techniques("T1190"),
+        "severity": "medium",
+        "params": {"threshold": 10, "window_seconds": 300, "ignore_ips": [], "ignore_users": []},
+    },
+    {
+        "id": "web_error_probe_burst",
+        "name": "Probing visible only in the error log",
+        "description": "Fires when one source IP appears in at least `threshold` nginx error-log lines "
+                       "that name a request, within `window_seconds`. Access logging can be switched off "
+                       "per vhost while error logging stays on, and then the error log is the only record "
+                       "that a probe happened. Those lines have no response code, which is what keeps this "
+                       "rule from overlapping web_server_error_burst.",
+        "techniques": techniques("T1595.003"),
+        "severity": "medium",
+        "params": {"threshold": 20, "window_seconds": 300, "ignore_ips": [], "ignore_users": []},
     },
     {
         "id": "firewall_port_sweep",
@@ -489,6 +578,294 @@ def web_request_burst(events, params):
     return findings
 
 
+# --- What the request asked for, and what came back -------------------------------------
+#
+# The rules below read two things the earlier web rules did not need: the *response code*, and the
+# shape of the request target. `http_status` is a column now (added after 1.0), so the code is a
+# field rather than something re-parsed out of the message.
+#
+# Note which event types each rule reads. A request to a scanner-shaped path (/.env, /wp-login.php)
+# or one carrying an injection payload is classified `web_scan` by normalize.classify_web_request,
+# not `web_request` — so a rule about *what was requested* has to read both, or it would miss the
+# very requests it exists to catch. A 5xx from the access log is `web_error`, and so is every line
+# from the nginx error log, so the status-based rules read all three.
+
+WEB_ACCESS_TYPES = ("web_request", "web_scan")
+
+# Endpoints a credential attack is aimed at. Matched against the path without its query string.
+LOGIN_PATHS = ("/login", "/signin", "/sign-in", "/signon", "/logon", "/log-in", "/session",
+               "/api/auth", "/api/login", "/api/session", "/auth/login", "/users/sign_in",
+               "/wp-login.php", "/wp-admin", "/administrator", "/admin/login")
+
+# Files that should never be downloadable. A *successful* request for one is a finding in its own
+# right; a refused one is only probing, which the scanner and discovery rules already cover.
+SENSITIVE_NAMES = ("/.env", "/.git/config", "/.git/head", "/.svn/", "/.aws/credentials",
+                   "/.ssh/id_rsa", "/id_rsa", "/.htpasswd", "/.htaccess", "/.ds_store",
+                   "/wp-config.php", "/configuration.php", "/config.php", "/settings.py",
+                   "/web.config", "/phpinfo", "/credentials", "/secrets.yml", "/credentials.json",
+                   "/dump.sql", "/backup.sql", "/db.sql", "/database.sql")
+# Backups of a real file, by extension. Deliberately not every archive: a .zip under /downloads is
+# ordinary, whereas index.php.bak is a copy of source that nobody meant to publish.
+_SENSITIVE_SUFFIX = re.compile(r"\.(?:sql|sql\.gz|bak|old|orig|save|swp)$")
+
+# Payloads that appear in a request target when someone is attacking the application rather than
+# using it. Broad on purpose: a false positive here costs an analyst one alert, a false negative
+# costs them the SQL injection. Matched against the target as written *and* URL-decoded, because a
+# pattern that looked only at the decoded form would miss `%00` (which decodes to a NUL byte).
+_INJECTION_PATTERNS = re.compile(
+    r"union\s+(?:all\s+)?select"                       # SQLi
+    r"|'\s*or\s+'?\d|\)\s*or\s*\(?\d|\bor\s+1\s*=\s*1|\band\s+1\s*=\s*1"
+    r"|sleep\(\s*\d|benchmark\(|pg_sleep\(|waitfor\s+delay"
+    r"|information_schema|extractvalue\(|updatexml\(|load_file\("
+    r"|;\s*(?:--|#)|'\s*(?:--|#)|/\*!\d"               # statement terminators, MySQL version comments
+    r"|<script|javascript:|onerror\s*=|onload\s*=|alert\(\s*\d|\"><img|<svg/onload"
+    r"|\.\./|\.\.%2f|%2e%2e(?:%2f|/)|\.\.\\"           # traversal, plain and encoded
+    r"|/etc/passwd|/etc/shadow|/proc/self"
+    r"|php://(?:filter|input|expect)|data://|phar://|zip://"   # PHP stream wrappers (local file read)
+    r"|;\s*(?:cat|id|whoami|uname|wget|curl|nc|bash|sh|python|chmod|rm)\b"
+    r"|\|\s*(?:cat|id|whoami|nc|bash|sh)\b"
+    r"|\$\(|`\s*(?:id|cat|whoami)"
+    r"|\{\{|\}\}|<%=|%7b%7b"                           # template injection
+    r"|<!entity|<!doctype\s+[^>]*\["                   # XXE
+    r"|\*\)\(|\)\(cn=|\(cn="                           # LDAP filter injection
+    r"|%00|%0d%0a"                                     # null byte, header splitting
+)
+
+
+def _web_status(event):
+    """The HTTP response code for a web event, or None if there is none.
+
+    The `http_status` column is authoritative. The "-> 404" suffix in the message is the fallback,
+    for events stored before the column existed. None means the event carries no response code at
+    all, which is exactly what an nginx error.log line looks like.
+    """
+    status = event.get("http_status")
+    if status is not None:
+        return status
+    return _web_request(event)[2]
+
+
+def _web_events(events, params, types=WEB_TYPES):
+    """Web events that carry a request path, in time order, with the ignores already applied."""
+    return [e for e in _filtered(events, params, types) if _web_request(e)[1]]
+
+
+def _request_target(event):
+    """The request target as written and URL-decoded, lowercased, for payload matching."""
+    path = _web_request(event)[1] or ""
+    return f"{path} {unquote_plus(path)}".lower()
+
+
+def _path_only(target):
+    """The path part of a request target: the query string is not part of the endpoint."""
+    return (target or "").split("?", 1)[0]
+
+
+def _is_login_path(target):
+    path = _path_only(target).lower().rstrip("/")
+    return any(path == p or path.startswith(p + "/") or path.endswith(p) for p in LOGIN_PATHS)
+
+
+def _is_sensitive_path(target):
+    path = _path_only(target).lower()
+    return any(name in path for name in SENSITIVE_NAMES) or bool(_SENSITIVE_SUFFIX.search(path))
+
+
+def _web_served(event):
+    """True when the server returned content (2xx).
+
+    A 3xx is not a disclosure: nginx commonly redirects an unknown path to a login page, so treating
+    every non-4xx as "served" would make each probe look like a leaked file.
+    """
+    status = _web_status(event)
+    return status is not None and 200 <= status < 300
+
+
+def web_login_abuse(events, params):
+    """Repeated failed logins against a login endpoint from one address.
+
+    Counts failed requests rather than 401s alone, because a blocked login form answers 403 and a
+    login URL that was never there answers 404 — an attacker working through a list of login paths
+    produces all of them, and the shape of the campaign is the count, not the code.
+    `web_auth_brute_force` is the narrower rule that insists on 401s against a single endpoint.
+    """
+    threshold, window = params["threshold"], params["window_seconds"]
+    attempts = [e for e in _web_events(events, params, WEB_ACCESS_TYPES)
+                if e.get("outcome") == "failure" and _is_login_path(_web_request(e)[1])]
+    findings = []
+    for ip, group in _group(attempts, "src_ip").items():
+        for cluster in _clusters(group, window, lambda scope: len(scope) >= threshold):
+            paths = Counter(_path_only(_request_path(e)) for e in cluster)
+            top = ", ".join(p[:60] for p, _ in paths.most_common(4))
+            findings.append(_finding(
+                ip, cluster,
+                f"Repeated failed logins from {ip}: {len(cluster)} attempts",
+                f"{ip} made {len(cluster)} failed request(s) to login endpoints between "
+                f"{cluster[0]['ts']} and {cluster[-1]['ts']}, across {len(paths)} endpoint(s): {top}. "
+                f"Threshold: {threshold} within {window}s. A user who mistyped a password twice is "
+                f"not this; check whether the attempts name the same account, which the event detail "
+                f"shows.",
+            ))
+    return findings
+
+
+def web_injection_attempt(events, params):
+    """A request carrying an attack payload: SQLi, XSS, traversal, command or template injection.
+
+    One request is enough, which is the point of the rule. An injection string is classified
+    `web_scan` (see normalize.classify_web_request), and until this rule existed the only thing
+    watching those was `web_scanner`, which needs five requests in five minutes — so a single SQL
+    injection was silent. Repeated attempts from one address inside `window_seconds` are gathered
+    into one alert rather than one per request.
+    """
+    window = params["window_seconds"]
+    hits = [e for e in _web_events(events, params, WEB_ACCESS_TYPES)
+            if _INJECTION_PATTERNS.search(_request_target(e))]
+    findings = []
+    for ip, group in _group(hits, "src_ip").items():
+        for cluster in _clusters(group, window, lambda scope: scope):
+            samples = ", ".join(sorted({_request_path(e)[:80] for e in cluster})[:3])
+            findings.append(_finding(
+                ip, cluster,
+                f"Injection payload from {ip}: {len(cluster)} request(s)",
+                f"{ip} sent {len(cluster)} request(s) carrying an attack payload between "
+                f"{cluster[0]['ts']} and {cluster[-1]['ts']}: {samples}. One request is enough to "
+                f"alert, because a payload like this is never part of using the site. The pattern set "
+                f"covers SQL injection, cross-site scripting, path traversal, command injection, "
+                f"template injection, XXE, and their URL-encoded forms.",
+            ))
+    return findings
+
+
+def web_sensitive_file_served(events, params):
+    """A request for a secret-bearing file that was answered with content.
+
+    Success is the whole rule. A refused request for /.env is probing, and probing is what
+    `web_scanner` and `web_path_discovery` are for; a 200 on /.env means the file was served, and
+    the only question left is what it contained. That is also why nothing here counts 3xx: nginx
+    redirecting an unknown path to a login page must not read as a disclosure.
+    """
+    window = params["window_seconds"]
+    hits = [e for e in _web_events(events, params, WEB_ACCESS_TYPES)
+            if _is_sensitive_path(_web_request(e)[1]) and _web_served(e)]
+    findings = []
+    for ip, group in _group(hits, "src_ip").items():
+        for cluster in _clusters(group, window, lambda scope: scope):
+            paths = sorted({_request_path(e) for e in cluster})
+            codes = sorted({_web_status(e) for e in cluster if _web_status(e) is not None})
+            findings.append(_finding(
+                ip, cluster,
+                f"Sensitive file served to {ip}: {paths[0][:60]}",
+                f"{ip} asked for {len(paths)} sensitive path(s) between {cluster[0]['ts']} and "
+                f"{cluster[-1]['ts']} and the server answered "
+                f"{', '.join(str(c) for c in codes) or 'with content'} instead of refusing: "
+                f"{', '.join(p[:80] for p in paths)}. This is a disclosure rather than an attempt: "
+                f"treat whatever those files held as exposed and rotate it.",
+            ))
+    return findings
+
+
+def web_access_denied_burst(events, params):
+    """Many 403s to one client: authorisation probing that keeps finding things that exist."""
+    threshold, window = params["threshold"], params["window_seconds"]
+    denied = [e for e in _web_events(events, params) if _web_status(e) == 403]
+    findings = []
+    for ip, group in _group(denied, "src_ip").items():
+        for cluster in _clusters(group, window, lambda scope: len(scope) >= threshold):
+            paths = Counter(_path_only(_request_path(e)) for e in cluster)
+            top = ", ".join(p[:60] for p, _ in paths.most_common(4))
+            findings.append(_finding(
+                ip, cluster,
+                f"Access denied to {ip} {len(cluster)} times",
+                f"{ip} received {len(cluster)} 403 responses between {cluster[0]['ts']} and "
+                f"{cluster[-1]['ts']} across {len(paths)} path(s): {top}. Repeated refusals are how "
+                f"broken access control is found: each 403 confirms that something is there, and the "
+                f"client keeps asking. Threshold: {threshold} within {window}s. A page that loads "
+                f"several forbidden assets can also produce 403s, so an authorised integration "
+                f"belongs in ignore_ips.",
+            ))
+    return findings
+
+
+def web_auth_brute_force(events, params):
+    """401s against one endpoint from one address: guesses at a real login form.
+
+    The threshold is per endpoint rather than per client, which is what separates this from
+    `web_login_abuse`. A scanner collecting 404s across hundreds of paths never reaches it; a form
+    being guessed at does. A 401 is the server saying the credentials were wrong, so the count is a
+    count of guesses.
+    """
+    threshold, window = params["threshold"], params["window_seconds"]
+    rejected = [e for e in _web_events(events, params) if _web_status(e) == 401]
+    grouped = defaultdict(list)
+    for event in rejected:
+        grouped[(event["src_ip"], _path_only(_request_path(event))[:120])].append(event)
+    findings = []
+    for (ip, endpoint), group in grouped.items():
+        # _filtered sorted the whole list by time, so each group kept that order.
+        for cluster in _clusters(group, window, lambda scope: len(scope) >= threshold):
+            findings.append(_finding(
+                ip, cluster,
+                f"Password guessing against {endpoint} from {ip}: {len(cluster)} rejections",
+                f"{ip} received {len(cluster)} 401 responses on {endpoint} between "
+                f"{cluster[0]['ts']} and {cluster[-1]['ts']}, so this is one form being guessed at "
+                f"rather than a scan across many paths. Threshold: {threshold} within {window}s.",
+            ))
+    return findings
+
+
+def web_server_error_burst(events, params):
+    """Many 5xx answers to one client: requests that break the application.
+
+    Only access-log events carry a response code, so nginx error.log lines are excluded here and
+    counted by `web_error_probe_burst` instead. That split is deliberate: a probe recorded in both
+    logs must not be counted by two rules, or the first of them to have a low threshold fires early.
+    """
+    threshold, window = params["threshold"], params["window_seconds"]
+    broken = [e for e in _web_events(events, params) if (_web_status(e) or 0) >= 500]
+    findings = []
+    for ip, group in _group(broken, "src_ip").items():
+        for cluster in _clusters(group, window, lambda scope: len(scope) >= threshold):
+            paths = Counter(_path_only(_request_path(e)) for e in cluster)
+            top = ", ".join(p[:60] for p, _ in paths.most_common(4))
+            findings.append(_finding(
+                ip, cluster,
+                f"Server errors caused by {ip}: {len(cluster)} responses",
+                f"{ip} was answered with {len(cluster)} 5xx response(s) between {cluster[0]['ts']} "
+                f"and {cluster[-1]['ts']} across {len(paths)} path(s): {top}. Either a request that "
+                f"breaks the application is being sent deliberately, or a fault is being exercised "
+                f"while it is still exploitable. Threshold: {threshold} within {window}s.",
+            ))
+    return findings
+
+
+def web_error_probe_burst(events, params):
+    """Many nginx error-log lines that name a request, from one client.
+
+    Access logging can be switched off per vhost while error logging stays on, and then the error
+    log is the only record that a probe happened at all. Those lines carry no response code, which
+    is also what separates this rule from `web_server_error_burst`: a 5xx from the access log has a
+    status and an error.log line never does, so no event is counted by both.
+    """
+    threshold, window = params["threshold"], params["window_seconds"]
+    probes = [e for e in _web_events(events, params, ("web_error",)) if _web_status(e) is None]
+    findings = []
+    for ip, group in _group(probes, "src_ip").items():
+        for cluster in _clusters(group, window, lambda scope: len(scope) >= threshold):
+            paths = Counter(_path_only(_request_path(e)) for e in cluster)
+            top = ", ".join(p[:60] for p, _ in paths.most_common(4))
+            findings.append(_finding(
+                ip, cluster,
+                f"Error-log probing from {ip}: {len(cluster)} failed requests",
+                f"{ip} appears in {len(cluster)} nginx error-log line(s) between "
+                f"{cluster[0]['ts']} and {cluster[-1]['ts']}, across {len(paths)} distinct path(s): "
+                f"{top}. Missing and forbidden files are recorded here even where access logging is "
+                f"off, so on such a vhost this is the only sight of the probe. Threshold: "
+                f"{threshold} within {window}s.",
+            ))
+    return findings
+
+
 def firewall_port_sweep(events, params):
     needed, window = params["distinct_ports"], params["window_seconds"]
     denied = [e for e in _filtered(events, params, "fw_deny") if e.get("dest_port") is not None]
@@ -632,6 +1009,13 @@ RULE_FUNCTIONS = {
     "web_scanner": web_scanner,
     "web_path_discovery": web_path_discovery,
     "web_request_burst": web_request_burst,
+    "web_login_abuse": web_login_abuse,
+    "web_injection_attempt": web_injection_attempt,
+    "web_sensitive_file_served": web_sensitive_file_served,
+    "web_access_denied_burst": web_access_denied_burst,
+    "web_auth_brute_force": web_auth_brute_force,
+    "web_server_error_burst": web_server_error_burst,
+    "web_error_probe_burst": web_error_probe_burst,
     "firewall_port_sweep": firewall_port_sweep,
     "impossible_geo_login": impossible_geo_login,
     "privilege_escalation_after_login": privilege_escalation_after_login,

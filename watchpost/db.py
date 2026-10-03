@@ -243,6 +243,7 @@ ADDED_COLUMNS = [
     ("rules", "techniques", "TEXT"),
     ("events", "dest_port", "INTEGER"),
     ("events", "bytes", "INTEGER"),
+    ("events", "http_status", "INTEGER"),
     ("detection_runs", "correlation", "TEXT"),
 ]
 

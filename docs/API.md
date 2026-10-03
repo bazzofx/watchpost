@@ -65,6 +65,7 @@ Accepted fields (aliases in parentheses):
 | `dest_ip` | `destination_ip`, `server_ip`, `dst_ip` | |
 | `dest_port` | `destination_port`, `dst_port`, `dport` | Integer 0–65535 (firewall events) |
 | `bytes` | `bytes_out`, `bytes_sent`, `sent_bytes`, `out_bytes` | Non-negative integer (outbound volume) |
+| `http_status` | `status_code`, `response_code` | Integer 100–599 (the HTTP response code). Deliberately **not** aliased from `status`, which already means `outcome`: a 404 is a failure, but a 200 is not a success of anything in particular. `NULL` on nginx error-log lines, which carry no code |
 | `host` | `hostname`, `Computer`, `device`, `host.name` | |
 | `severity` | `level` | `info`, `low`, `medium`, `high`, or `critical`; defaults by type |
 | `outcome`, `message`, `source` | | Secrets like `password=` are redacted before storage |

@@ -12,9 +12,17 @@ from .db import audit, iso, now_iso, parse_iso, row_to_dict, transaction
 from .diagnostics import describe_exception, record_error
 
 EVENT_COLUMNS = ["ts", "source", "host", "event_type", "outcome", "severity",
-                 "user", "src_ip", "dest_ip", "dest_port", "bytes", "message", "raw"]
+                 "user", "src_ip", "dest_ip", "dest_port", "bytes", "http_status", "message", "raw"]
 # Fields detection rules can read.
-RULE_EVENT_FIELDS = "id, ts, event_type, user, src_ip, host, dest_ip, dest_port, bytes, message, synthetic"
+#
+# `http_status` was added for the OWASP web rules, which need the response code as a field rather
+# than a regex over the message. `outcome` was missing until the same change, and its absence was
+# silent: a rule asking for a field this projection omits gets None, so `web_path_discovery` — which
+# tests what percentage of requests failed — never fired on live data, while its labeled scenario
+# passed because the evaluation harness feeds raw scenario dicts, which do carry `outcome`. Anything
+# a rule reads has to be listed here; tests/test_engine.py walks the real path to keep that true.
+RULE_EVENT_FIELDS = "id, ts, event_type, outcome, user, src_ip, host, dest_ip, dest_port, bytes," \
+                    " http_status, message, synthetic"
 
 # Detection runs are serialized so concurrent ingests cannot create duplicate alerts. Also held by
 # maintenance.reset_logs, so events cannot be deleted underneath a run that is reading them.

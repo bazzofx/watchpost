@@ -33,8 +33,13 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(by_id["T1110.001"]["hits"], 3)
         self.assertEqual(by_id["T1110"]["hits"], 2)  # success_after_failures also maps to T1110
         self.assertEqual({r["id"] for r in by_id["T1078"]["rules"]},
-                         {"success_after_failures", "impossible_geo_login", "privilege_escalation_after_login"})
-        self.assertFalse(by_id["T1595.003"]["covered"])  # only the disabled web_scanner covers it
+                         {"success_after_failures", "impossible_geo_login", "privilege_escalation_after_login",
+                          "web_login_abuse", "web_access_denied_burst"})
+        # Two rules cover wordlist scanning: web_scanner, disabled in this list, and the error-log
+        # rule, which is enabled — so the technique counts as covered either way.
+        self.assertEqual({r["id"] for r in by_id["T1595.003"]["rules"]},
+                         {"web_scanner", "web_error_probe_burst"})
+        self.assertTrue(by_id["T1595.003"]["covered"])
         self.assertEqual(result["summary"]["techniques"], len(attack.TECHNIQUES))
 
 

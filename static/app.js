@@ -406,7 +406,7 @@ async function eventDialog(id) {
   const e = await api(`/api/events/${id}`);
   $("#modal-body").replaceChildren(
     el("h2", {}, `Event #${e.id}`),
-    el("dl", { class: "kv" }, ...["ts", "ingested_at", "source", "host", "event_type", "outcome", "severity", "user", "src_ip", "dest_ip", "batch_id"]
+    el("dl", { class: "kv" }, ...["ts", "ingested_at", "source", "host", "event_type", "outcome", "severity", "user", "src_ip", "dest_ip", "http_status", "batch_id"]
       .flatMap((k) => [el("dt", {}, k), el("dd", {}, e[k] ?? "—")]), el("dt", {}, "synthetic"), el("dd", {}, e.synthetic ? "yes (demo data)" : "no")),
     el("h3", {}, "Linked alerts"),
     e.alerts.length ? e.alerts.map((a) => el("div", {}, el("a", { href: `#alerts/${a.id}`, onclick: () => $("#modal").close() }, `#${a.id} ${a.title}`), " ", status(a.status)))

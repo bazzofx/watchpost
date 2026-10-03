@@ -146,7 +146,7 @@ Caddy (Let's Encrypt, for a domain) or nginx (self-signed, for a bare IP) in fro
 
 `id, ts (UTC ISO-8601), ingested_at, source, host, event_type, outcome, severity, user, src_ip, dest_ip, message, raw (redacted, truncated), synthetic, batch_id`
 
-`event_type` is one of `auth_failure, auth_success, account_lockout, user_created, privilege_use, process_start, network_connection, file_access, other`, plus (2.0) `web_request, web_scan, web_error, fw_deny, fw_allow, vpn_login, cloud_api_call, cloud_iam_change, cloud_data_access, privilege_escalation`, and `syslog` (a line received by the syslog listener that no parser recognized). Events also carry `dest_port` and `bytes` when the source has them.
+`event_type` is one of `auth_failure, auth_success, account_lockout, user_created, privilege_use, process_start, network_connection, file_access, other`, plus (2.0) `web_request, web_scan, web_error, fw_deny, fw_allow, vpn_login, cloud_api_call, cloud_iam_change, cloud_data_access, privilege_escalation`, and `syslog` (a line received by the syslog listener that no parser recognized). Events also carry `dest_port`, `bytes`, and `http_status` when the source has them. `http_status` is the HTTP response code (100–599, `NULL` on nginx error-log lines, which have none) and is deliberately **not** aliased from `status`, which already means `outcome`.
 
 ### Detection rules
 
@@ -160,15 +160,22 @@ Caddy (Let's Encrypt, for a domain) or nginx (self-signed, for a bare IP) in fro
 | `web_scanner` | ≥ 5 scanner-like web requests (`/.env`, `/wp-login.php`, injection strings, scanner agents) from one IP within 300 s | medium |
 | `web_path_discovery` | one IP asks for ≥ 30 distinct paths within 300 s and ≥ 70 % of those requests failed — directory/file brute force, which `web_scanner`'s signature list cannot see | medium |
 | `web_request_burst` | one IP sends ≥ 200 requests within 60 s — a flood, a fast scanner, or credential stuffing, regardless of which paths it asks for | medium |
+| `web_login_abuse` | ≥ 10 failed requests to a login endpoint from one IP within 300 s, whatever the code (401, 403, or 404) | high |
+| `web_auth_brute_force` | ≥ 10 responses with status 401 on **one endpoint** from one IP within 300 s | high |
+| `web_injection_attempt` | a **single** request whose path or query carries an injection payload — SQLi, XSS, traversal, command injection, template injection, XXE, encoded or plain | high |
+| `web_sensitive_file_served` | a request for a secret-bearing file (`.env`, `.git/config`, `.aws/credentials`, `id_rsa`, `wp-config.php`, `.sql`/`.bak` backups) answered with **2xx content** rather than a refusal | critical |
+| `web_access_denied_burst` | ≥ 20 responses with status 403 to one IP within 300 s — access-control probing that keeps finding protected things | medium |
+| `web_server_error_burst` | ≥ 10 responses with status 5xx from the access log to one IP within 300 s — requests that break the application | medium |
+| `web_error_probe_burst` | ≥ 20 nginx **error.log** lines naming a request from one IP within 300 s — probing on a vhost where access logging is off | medium |
 | `firewall_port_sweep` | the firewall denies one IP on ≥ 10 distinct ports within 300 s | medium |
 | `impossible_geo_login` | one account logs in from two places ≥ 500 km apart faster than 900 km/h (synthetic geo table only) | high |
 | `privilege_escalation_after_login` | sudo/su/runas within 30 min of a login that followed ≥ 3 failures | critical |
 | `cloud_iam_change_by_new_principal` | an IAM change by a cloud principal with no activity in the previous 24 h | high |
 | `data_exfil_volume` | one account (or IP) moves ≥ 1 GB out, or makes ≥ 100 cloud data reads, within 1 h | high |
 
-Every rule maps to MITRE ATT&CK techniques from a small static catalog (`watchpost/attack.py`, 20 techniques, no network fetch). `GET /api/attack/coverage` shows which techniques are covered and how often they fired.
+Every rule maps to MITRE ATT&CK techniques from a small static catalog (`watchpost/attack.py`, 22 techniques, no network fetch). `GET /api/attack/coverage` shows which techniques are covered and how often they fired.
 
-Web attacks are the fastest-growing part of the rule set; [docs/WEB_DETECTION.md](docs/WEB_DETECTION.md) maps the OWASP Top 10 onto what nginx logs can and cannot show, and lists the rules planned next.
+Web attacks are the largest part of the rule set; [docs/WEB_DETECTION.md](docs/WEB_DETECTION.md) maps the OWASP Top 10 onto what nginx access and error logs can and cannot show, and records why each threshold sits where it does.
 
 ### Incidents (correlation)
 

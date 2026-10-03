@@ -124,6 +124,25 @@ def web(sec, path, ip="203.0.113.1", outcome="failure", event_type="web_request"
     return ev(sec, event_type, None, ip, outcome=outcome, message=f"GET {path} -> {status}")
 
 
+def coded(sec, path, status, ip="203.0.113.1", event_type="web_request"):
+    """An access-log event carrying the code in the `http_status` column, as the parser stores it."""
+    return ev(sec, event_type, None, ip, outcome="success" if status < 400 else "failure",
+              http_status=status, message=f"GET {path} -> {status}")
+
+
+def error_line(sec, path, ip="203.0.113.1"):
+    """An nginx error.log line naming a request: no response code anywhere, which is the point."""
+    return ev(sec, "web_error", None, ip, outcome="failure",
+              message=f'GET {path} [error] open() "/var/www{path}" failed (2: No such file or directory), '
+                      f"client: {ip}")
+
+
+def error_line_without_a_request(sec, ip="203.0.113.1"):
+    """An error.log line with no request in it, such as a TLS handshake failure."""
+    return ev(sec, "web_error", None, ip, outcome="failure",
+              message="[crit] SSL_do_handshake() failed (SSL: error:0A000126), client: " + ip)
+
+
 class WebBehaviourRuleTests(unittest.TestCase):
     """Breadth (path discovery) and volume (request burst) are separate signals on purpose."""
 
@@ -331,6 +350,217 @@ class EvaluationTests(unittest.TestCase):
         after = evaluate({"brute_force_ip": tuned})["rules"]["brute_force_ip"]
         self.assertEqual(after["fp"], 0)
         self.assertEqual(after["tp"], evaluate(defaults)["rules"]["brute_force_ip"]["tp"])
+
+
+class OwaspWebRuleTests(unittest.TestCase):
+    """The OWASP Top 10 web rules: what nginx logs can and cannot show.
+
+    Five of the ten are observable from an access log; the rest are application-level and are
+    deliberately not claimed. These cover the boundaries, and the two distinctions the design leans
+    on: failure-versus-401 for credential attacks, and 5xx-versus-error-log for the error rules.
+    """
+
+    # --- A07: credential attacks -------------------------------------------------------
+
+    def test_login_abuse_threshold_and_endpoints(self):
+        p = params("web_login_abuse")
+        self.assertEqual(rules.web_login_abuse(make([coded(i, "/login", 401) for i in range(9)]), p), [])
+        found = rules.web_login_abuse(make([coded(i, "/login", 401) for i in range(10)]), p)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["group_key"], "203.0.113.1")
+        self.assertIn("10 failed request(s)", found[0]["explanation"])
+        self.assertIn("/login", found[0]["explanation"])
+
+    def test_login_abuse_reads_web_scan_as_well_as_web_request(self):
+        """ /wp-login.php is a scanner-shaped path, so the parser types those events web_scan.
+        A rule that only read web_request would miss WordPress login attacks entirely."""
+        p = params("web_login_abuse")
+        only_real_form = make([coded(i, "/login", 401) for i in range(6)])
+        self.assertEqual(rules.web_login_abuse(only_real_form, p), [])
+        with_wordpress = only_real_form + make(
+            [coded(100 + i, "/wp-login.php", 403, event_type="web_scan") for i in range(4)])
+        found = rules.web_login_abuse(with_wordpress, p)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(len(found[0]["event_ids"]), 10)
+
+    def test_successful_logins_are_not_abuse(self):
+        p = params("web_login_abuse")
+        self.assertEqual(rules.web_login_abuse(
+            make([coded(i, "/login", 200, event_type="web_request") for i in range(30)]), p), [])
+
+    def test_failures_away_from_a_login_endpoint_are_not_abuse(self):
+        p = params("web_login_abuse")
+        self.assertEqual(rules.web_login_abuse(make([coded(i, "/product/7", 404) for i in range(40)]), p), [])
+
+    def test_login_abuse_must_happen_inside_the_window(self):
+        p = params("web_login_abuse")
+        self.assertEqual(rules.web_login_abuse(
+            make([coded(i * 60, "/login", 401) for i in range(10)]), p), [])
+
+    def test_a_known_client_can_be_ignored(self):
+        p = params("web_login_abuse", ignore_ips=["203.0.113.1"])
+        self.assertEqual(rules.web_login_abuse(make([coded(i, "/login", 401) for i in range(20)]), p), [])
+
+    def test_auth_brute_force_counts_one_endpoint_not_one_client(self):
+        """Twelve 401s spread over two endpoints is not ten against one, which is the whole
+        difference between this rule and web_login_abuse."""
+        p = params("web_auth_brute_force")
+        spread = make([coded(i, "/login", 401) for i in range(6)]
+                      + [coded(60 + i, "/admin/login", 401) for i in range(6)])
+        self.assertEqual(rules.web_auth_brute_force(spread, p), [])
+        self.assertEqual(len(rules.web_login_abuse(spread, params("web_login_abuse"))), 1)
+
+    def test_auth_brute_force_threshold_and_that_403_is_not_a_401(self):
+        p = params("web_auth_brute_force")
+        self.assertEqual(rules.web_auth_brute_force(make([coded(i, "/login", 401) for i in range(9)]), p), [])
+        found = rules.web_auth_brute_force(make([coded(i, "/login", 401) for i in range(10)]), p)
+        self.assertEqual(len(found), 1)
+        self.assertIn("/login", found[0]["title"])
+        self.assertEqual(rules.web_auth_brute_force(make([coded(i, "/login", 403) for i in range(30)]), p), [])
+
+    # --- A03: injection ---------------------------------------------------------------
+
+    def test_one_request_is_enough(self):
+        p = params("web_injection_attempt")
+        found = rules.web_injection_attempt(make([coded(0, "/product?id=1%27%20OR%20%271%27=%271", 500,
+                                                        event_type="web_scan")]), p)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["group_key"], "203.0.113.1")
+        self.assertIn("One request is enough", found[0]["explanation"])
+
+    def test_each_payload_family_is_caught(self):
+        p = params("web_injection_attempt")
+        payloads = [
+            "/product?id=1%20UNION%20SELECT%20password%20FROM%20users",
+            "/search?q=%3Cscript%3Ealert(1)%3C/script%3E",
+            "/download?file=../../etc/passwd",
+            "/api/tools?cmd=%3Bcat%20/etc/shadow",
+            "/render?name=%7B%7Bconfig%7D%7D",
+            "/index.php?page=php://filter/convert.base64-encode/resource=index",
+            "/xml?data=%3C!ENTITY%20xxe%20SYSTEM%20'file:///etc/passwd'%3E",
+            "/login?user=admin%27--",
+        ]
+        for i, payload in enumerate(payloads):
+            with self.subTest(payload=payload):
+                self.assertEqual(len(rules.web_injection_attempt(make([coded(i, payload, 200)]), p)), 1)
+
+    def test_ordinary_requests_are_not_injections(self):
+        p = params("web_injection_attempt")
+        ordinary = ["/", "/search?q=shoes", "/product/7", "/api/orders?page=2&size=25",
+                    "/assets/app.4f2a1b.js", "/blog/2026/10/03/hello-world", "/users/erin/profile"]
+        events = make([coded(i, path, 200) for i, path in enumerate(ordinary * 5)])
+        self.assertEqual(rules.web_injection_attempt(events, p), [])
+
+    def test_encoded_payloads_are_decoded_before_matching(self):
+        p = params("web_injection_attempt")
+        for payload in ["/p?q=%27%20OR%20%271%27%3D%271", "/p?f=%2e%2e%2f%2e%2e%2fetc%2fpasswd",
+                        "/p?c=%3Bid"]:
+            with self.subTest(payload=payload):
+                self.assertEqual(len(rules.web_injection_attempt(make([coded(0, payload, 200)]), p)), 1)
+
+    def test_repeated_attempts_become_one_alert_within_the_window(self):
+        p = params("web_injection_attempt")
+        burst = make([coded(i * 10, "/p?q=%3Bid", 200) for i in range(5)])
+        found = rules.web_injection_attempt(burst, p)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(len(found[0]["event_ids"]), 5)
+        spread = make([coded(i * 600, "/p?q=%3Bid", 200) for i in range(5)])
+        self.assertEqual(len(rules.web_injection_attempt(spread, p)), 5)
+
+    def test_injection_is_read_from_the_message_when_the_column_is_absent(self):
+        """Events stored before http_status existed still have to be judged."""
+        p = params("web_injection_attempt")
+        legacy = make([web(0, "/p?id=1'%20OR%20'1'='1", event_type="web_scan", status=500)])
+        self.assertNotIn("http_status", legacy[0])
+        self.assertEqual(len(rules.web_injection_attempt(legacy, p)), 1)
+
+    # --- A05 / A01: sensitive files ---------------------------------------------------
+
+    def test_a_served_secret_is_a_finding_and_a_refusal_is_not(self):
+        p = params("web_sensitive_file_served")
+        served = make([coded(0, "/.env", 200, event_type="web_scan")])
+        found = rules.web_sensitive_file_served(served, p)
+        self.assertEqual(len(found), 1)
+        self.assertIn("/.env", found[0]["title"])
+        for status in (403, 404):
+            with self.subTest(status=status):
+                self.assertEqual(rules.web_sensitive_file_served(
+                    make([coded(0, "/.env", status, event_type="web_scan")]), p), [])
+
+    def test_a_redirect_is_not_a_disclosure(self):
+        """nginx sends unknown paths to the login page with a 302; that must not read as a leak."""
+        p = params("web_sensitive_file_served")
+        self.assertEqual(rules.web_sensitive_file_served(
+            make([coded(0, "/.env", 302, event_type="web_scan")]), p), [])
+
+    def test_ordinary_files_are_not_sensitive(self):
+        p = params("web_sensitive_file_served")
+        ordinary = ["/", "/assets/app.js", "/downloads/release-notes.txt", "/api/orders",
+                    "/.well-known/acme-challenge/token"]
+        self.assertEqual(rules.web_sensitive_file_served(
+            make([coded(i, path, 200) for i, path in enumerate(ordinary)]), p), [])
+
+    def test_sensitive_paths_cover_the_usual_suspects(self):
+        p = params("web_sensitive_file_served")
+        for path in ["/.env", "/.git/config", "/.aws/credentials", "/wp-config.php", "/backup/db.sql",
+                     "/id_rsa", "/config.php", "/uploads/dump.sql", "/index.php.bak"]:
+            with self.subTest(path=path):
+                self.assertEqual(len(rules.web_sensitive_file_served(make([coded(0, path, 200)]), p)), 1)
+
+    # --- A01 / A06: denials, breakage, and the error log -------------------------------
+
+    def test_access_denied_burst_threshold_and_that_404_does_not_count(self):
+        p = params("web_access_denied_burst")
+        self.assertEqual(rules.web_access_denied_burst(make([coded(i, f"/admin/{i}", 403)
+                                                             for i in range(19)]), p), [])
+        found = rules.web_access_denied_burst(make([coded(i, f"/admin/{i}", 403) for i in range(20)]), p)
+        self.assertEqual(len(found), 1)
+        self.assertIn("20 403 responses", found[0]["explanation"])
+        self.assertEqual(rules.web_access_denied_burst(make([coded(i, f"/x{i}", 404)
+                                                             for i in range(60)]), p), [])
+
+    def test_server_error_burst_needs_5xx_not_4xx(self):
+        p = params("web_server_error_burst")
+        self.assertEqual(rules.web_server_error_burst(make([coded(i, "/checkout", 500)
+                                                            for i in range(9)]), p), [])
+        found = rules.web_server_error_burst(
+            make([coded(i, "/checkout", 500 if i % 2 else 503, event_type="web_error")
+                  for i in range(10)]), p)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(rules.web_server_error_burst(make([coded(i, "/checkout", 404)
+                                                            for i in range(40)]), p), [])
+
+    def test_error_probe_burst_threshold_and_that_a_request_is_required(self):
+        p = params("web_error_probe_burst")
+        self.assertEqual(rules.web_error_probe_burst(
+            make([error_line(i, f"/dir{i}") for i in range(19)]), p), [])
+        found = rules.web_error_probe_burst(make([error_line(i, f"/dir{i}") for i in range(20)]), p)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(len(found[0]["event_ids"]), 20)
+        # A TLS handshake failure names a client but no request, so it is not probing.
+        self.assertEqual(rules.web_error_probe_burst(
+            make([error_line_without_a_request(i) for i in range(60)]), p), [])
+
+    def test_the_two_error_rules_never_count_the_same_event(self):
+        """The split the design rests on: a 5xx from the access log has a status, an error.log line
+        never does. Without it, one probe recorded in both logs would be counted twice and whichever
+        rule had the lower threshold would fire early."""
+        access_five_hundreds = make([coded(i, "/checkout", 500) for i in range(12)])
+        error_lines = make([error_line(i, f"/checkout{i}") for i in range(22)])
+        self.assertEqual(len(rules.web_server_error_burst(access_five_hundreds,
+                                                          params("web_server_error_burst"))), 1)
+        self.assertEqual(rules.web_error_probe_burst(access_five_hundreds,
+                                                     params("web_error_probe_burst")), [])
+        self.assertEqual(rules.web_server_error_burst(error_lines, params("web_server_error_burst")), [])
+        self.assertEqual(len(rules.web_error_probe_burst(error_lines,
+                                                         params("web_error_probe_burst"))), 1)
+
+    def test_the_web_rules_fall_back_to_the_message_for_the_status(self):
+        """Every status rule has to keep working on events stored before the column existed."""
+        legacy_denials = make([web(i, f"/admin/{i}", status=403) for i in range(20)])
+        self.assertNotIn("http_status", legacy_denials[0])
+        self.assertEqual(len(rules.web_access_denied_burst(legacy_denials,
+                                                           params("web_access_denied_burst"))), 1)
 
 
 if __name__ == "__main__":
