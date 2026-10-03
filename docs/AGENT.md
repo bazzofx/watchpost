@@ -39,9 +39,11 @@ same file from the UI. That keeps one implementation of every parser (`watchpost
    It prompts for the token with input hidden (or take it from a file with
    `--token-file /root/wp.token`, which keeps it out of your shell history).
 
-3. **Confirm data is arriving.** On the server, open **Ingest > Recent batches**; you should see
-   sources named `<hostname>-auth`, `<hostname>-firewall`, and so on, and **Events** should fill
-   up with `synthetic=0` rows.
+3. **Confirm data is arriving.** On the server, open **Agents** (the fleet view): the agent should
+   appear with its hostname, the log sources it is capturing, and a `reporting` status — or
+   `never_reported` if nothing has been received yet. **Ingest > Recent batches** shows the raw
+   batches (sources named `<hostname>-auth`, `<hostname>-firewall`, …), and **Events** fills up with
+   `synthetic=0` rows.
 
 Check the agent's own log with `journalctl -u watchpost-agent -f`.
 

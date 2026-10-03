@@ -124,6 +124,7 @@ Caddy (Let's Encrypt, for a domain) or nginx (self-signed, for a bare IP) in fro
 |---|---|
 | `watchpost/normalize.py` | Parses JSON, JSONL, CSV, Linux `auth.log` (OpenSSH), and Windows Security events (4624/4625/4672/4688/4720/4740). Accepts common field aliases, including ECS-style nesting. Validates timestamps, IPs, severities, and lengths, strips control characters, and redacts secrets. Every rejected record gets a reason and a position. |
 | `watchpost/correlate.py`, `watchpost/incidents.py` | Pure alert-to-incident grouping; incident queries, status changes, and ATT&CK coverage. |
+| `watchpost/agents.py` | The collection-agent fleet, derived from `ingest_batches.submitted_by` (`token:<name>`): each agent's hostname, log sources, provisioning date, and how recently logs arrived. |
 | `watchpost/attack.py`, `watchpost/geo.py` | Static ATT&CK subset; synthetic geo table for demo IP ranges (never a real lookup). |
 | `watchpost/rules.py` | Eleven threshold rules as pure functions over event lists, each with a plain-English explanation. Also validates rule parameters. |
 | `watchpost/engine.py` | Stores each batch atomically, then runs detection over the batch's time range plus the longest rule window. Deduplicates and extends open alerts, and records every detection run. |
@@ -201,6 +202,20 @@ This is **not machine learning**. It is transparent, deterministic tuning suppor
 The landing view is a dark SOC console built for a 1280×800 screen: a status strip (events per minute, open and critical alerts, incidents, stored events, health checks, stream state, UTC clock), an attacker world map, a live event stream, alerts over time, top attacker IPs, the MITRE ATT&CK coverage heat matrix, an incident board, top rules, and health. Live updates arrive over Server-Sent Events (`GET /api/stream`); if the stream fails, the page polls every 3 seconds. Charts and the map are inline SVG drawn by `static/charts.js` and `static/map.js`, with no libraries and no external tiles.
 
 **The map positions are synthetic.** `watchpost/geo.py` maps only the RFC 5737 documentation ranges to fictional city names at fixed coordinates, and the RFC 1918 ranges to internal sites. It is not a geo lookup. Any other address is listed as "unknown" and never guessed. The map is labeled "synthetic geo".
+
+## Agents
+
+**Agents** lists the collection agents reporting to this instance. There is no registration step: an
+agent *is* an ingest token plus the batches it sent, so the page is derived from data already stored
+and works for agents already deployed. Each row shows the agent's name (its token), the hostname its
+own logs reported, the log sources it is capturing, who provisioned it and when, how recently a batch
+arrived, and how many events it has delivered. Selecting a row breaks the agent down per source
+(batches, accepted, rejected, events, last log).
+
+The status column is honest about what it measures: `reporting`, `quiet`, `silent`, `never_reported`,
+or `revoked`, based on how recently logs arrived. An agent only contacts the server when it has new
+lines to send, so a quiet host and a stopped agent look alike — the page says so rather than
+claiming the process is alive. See [docs/AGENT.md](docs/AGENT.md) for the agent itself.
 
 ## Attack storyline
 

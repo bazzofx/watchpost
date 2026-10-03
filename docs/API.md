@@ -210,6 +210,36 @@ Clients that cannot hold a stream can poll `GET /api/events?since_id=<last id>` 
 
 The dashboard also reads `GET /api/incidents`, `GET /api/attack/coverage`, and `GET /api/storyline/status` when the server has them (workstreams A and C). A 404 shows a "pending" panel.
 
+## Collection agents
+
+The **Agents** page shows the fleet of collection agents that report to this instance. There is no
+registration step and no agent table: an agent *is* an ingest token plus the batches it sent, so the
+fleet is derived from data already stored. Any batch sent with `Authorization: Bearer wp_...` is
+recorded as `submitted_by = "token:<name>"`, which is what links batches, events, and sources back
+to a token. Nothing extra has to be deployed for an agent to appear.
+
+`GET /api/agents` (viewer):
+
+| Field | Meaning |
+|---|---|
+| `name`, `token_prefix`, `token_id` | The ingest token the agent authenticates with |
+| `installed_at`, `installed_by` | When the token was created, and by whom. This is the agent's provisioning date |
+| `hostname` | The hostname the agent's own events reported (the most frequent non-empty `host`), not a value the agent declares |
+| `sources` | Per log source: `source` (as stored, e.g. `web01-auth`), `kind` (the short name, e.g. `auth`), `formats`, `batches`, `accepted`, `rejected`, `events`, `last_log_at` |
+| `batches`, `events`, `rejected`, `detection_failures` | Totals across the agent's sources |
+| `first_batch_at`, `last_batch_at` | First and most recent batch received from this agent |
+| `last_token_use_at` | When the token was last presented on any request |
+| `status` | `reporting`, `quiet`, `silent`, `never_reported`, or `revoked` |
+
+`reporting` means a batch arrived within `reporting_seconds` (default 600), `quiet` within
+`quiet_seconds` (default 3600), `silent` longer than that, `never_reported` no batches at all, and
+`revoked` the token is revoked. Both thresholds are returned so a client can label them.
+
+**Status is activity based, not a heartbeat.** An agent only contacts the server when it has new log
+lines to send, so an idle host and a stopped agent look the same. A `silent` agent means no logs
+arrived, which may be a quiet machine rather than a broken service. Batches submitted by a user
+session (UI uploads, the demo loader) or by the syslog listener are not agents and are excluded.
+
 ## Health and administration
 
 | Endpoint | Role | Notes |

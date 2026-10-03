@@ -12,7 +12,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from . import __version__, auth, engine, geo, improve, incidents, queries, report, simulate, storyline, stream
+from . import (__version__, agents, auth, engine, geo, improve, incidents, queries, report, simulate,
+               storyline, stream)
 from .ratelimit import TokenBucketLimiter
 from .config import Config
 from .db import audit, connect, init_schema, now_iso, row_to_dict
@@ -319,6 +320,14 @@ def incident_status(req, incident_id):
 @route("GET", "/api/attack/coverage")
 def attack_coverage(req):
     return incidents.coverage(req.conn)
+
+
+# Collection agents (ingest tokens that report to this instance) -------------------------
+
+@route("GET", "/api/agents")
+def agents_overview(req):
+    """Every ingest token with the sources it reports and how recently logs arrived."""
+    return agents.overview(req.conn)
 
 
 # Reports ---------------------------------------------------------------------------------

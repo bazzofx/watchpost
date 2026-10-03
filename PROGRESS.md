@@ -349,3 +349,59 @@ demo data. First step of a larger "deployable agent" effort; a Windows collector
   the `auth` source. Install rsyslog, or use the syslog listener.
 - No Windows collector, no local disk buffering during a long outage, and no smoke-check step for
   the agent yet.
+
+## Agents page: the collection fleet (2026-10-03)
+
+Goal: see, in the UI, which agents are installed and whether they are still feeding data.
+
+**Shipped**
+- **No new data model and no agent change.** An agent *is* an ingest token plus the batches it sent,
+  so the fleet is derived from data already stored: `ingest_batches.submitted_by` records
+  `token:<name>` for anything sent with `Authorization: Bearer wp_...`. The page therefore works for
+  agents that are already deployed, with nothing to re-deploy.
+- `watchpost/agents.py` + `GET /api/agents` (viewer, like the other read routes). Per agent: name,
+  token prefix, `installed_at` (the token's `created_at`, i.e. when the agent was provisioned) and
+  `installed_by`, hostname, per-source breakdown (source, short `kind`, formats, batches, accepted,
+  rejected, events, last log), totals, `first_batch_at`, `last_batch_at`, `last_token_use_at`, and a
+  `status`, plus a summary. Four grouped queries assembled in Python, so no per-agent N+1.
+  - `hostname` is taken from the events the agent delivered (the most frequent non-empty `host`),
+    not from anything the agent declares, so it is the hostname the logs themselves claim.
+  - The short source `kind` ("auth") is derived from the shared prefix of an agent's source names.
+    With a single source there is nothing to compare, so the agent's `<host>-<source>` convention is
+    used *only* when that source literally starts with the hostname its own events reported;
+    otherwise the full source name is shown rather than a guess.
+  - `status` is `reporting` / `quiet` / `silent` / `never_reported` / `revoked`, from the age of the
+    last batch, with both thresholds returned by the API.
+- `static/`: an **Agents** nav entry and view — KPI tiles (installed, reporting, quiet, silent, never
+  reported, events received) and a fleet table (agent, host, status, logs captured, installed by,
+  installed, last received, events) with a per-source detail modal on row click. Reuses the existing
+  `.kpi`/`.pill`/`table()` conventions and the `st-ok`/`st-degraded`/`st-failing` status classes, so
+  no new CSS. A small `ago()` helper renders relative ages next to absolute timestamps.
+- `tests/test_agents.py`: 29 tests. 26 run against an **in-memory** database with hand-built rows
+  (no temporary directory, so they run anywhere); 3 go through a real server using the same
+  `/api/ingest/upload?format=authlog` path the agent uses.
+
+**The honest limit, stated in the API, the docs, and the UI**
+- Every available signal is *activity* based. An agent only contacts the server when it has new lines
+  to ship, so an idle host and a stopped agent are indistinguishable. The page says this plainly and
+  describes `status` as "the last log received", not as agent liveness. A real heartbeat endpoint
+  (which would need an agent change) is the next step if process-level liveness is wanted.
+
+**Verification**
+- `python -m unittest tests.test_agents` → 29 tests OK.
+- No regressions: `discover` runs **275 tests** with the **same 25 pre-existing Windows-only
+  failures** as the 199-test baseline — no new failures. That matters here because
+  `tests/test_viewer.py` sweeps every registered route, so an added route is a real risk; the new
+  route answers a viewer 200 and stays closed to anonymous access.
+- `node --check static/app.js` passes; `static/index.html` parses and the nav now exposes
+  `['dashboard','incidents','alerts','events','overview','ingest','agents','rules','health','admin']`.
+- End to end: a token created the way an agent uses one, real lines shipped through
+  `scripts/agent.py`, then `GET /api/agents` reports `web01-agent` on host `web01`, sources
+  `auth`/`firewall`/`web`/`audit`, 14 events, status `reporting` (and `quiet` once the data aged past
+  the 10-minute threshold, which is the intended behaviour).
+
+**Not done / notes for the owner**
+- No agent-side heartbeat, so `silent` cannot distinguish "no logs to send" from "service stopped".
+- The page is read-only: no way to rename or revoke an agent from it (use Admin > API tokens).
+- Source `kind` is presentational only. The exact stored `source` is always shown in the row tooltip
+  and the detail modal, and is what `GET /api/events?source=` filters on.

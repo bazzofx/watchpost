@@ -25,6 +25,15 @@ function el(tag, attrs = {}, ...children) {
 }
 const $ = (sel) => document.querySelector(sel);
 const fmtTime = (ts) => (ts ? ts.replace("T", " ").replace(/\.\d+Z$/, "Z") : "—");
+// Relative age, for freshness columns where "3 min ago" beats a timestamp.
+function ago(ts) {
+  if (!ts) return "—";
+  const secs = Math.max(0, (Date.now() - new Date(ts).getTime()) / 1000);
+  if (secs < 90) return `${Math.max(1, Math.round(secs))}s ago`;
+  if (secs < 5400) return `${Math.round(secs / 60)} min ago`;
+  if (secs < 172800) return `${Math.round(secs / 3600)} h ago`;
+  return `${Math.round(secs / 86400)} d ago`;
+}
 const pill = (text, cls) => el("span", { class: `pill ${cls}` }, text);
 const sev = (s) => pill(s, `sev-${s}`);
 const status = (s) => pill(s, `st-${s}`);
@@ -125,7 +134,8 @@ function route() {
   document.querySelectorAll("#nav button").forEach((b) => b.classList.toggle("active", b.dataset.view === view));
   if (view !== "dashboard") Dash.unmount();
   const views = { dashboard: socDashboard, incidents: () => (id ? incidentDetail(Number(id)) : incidentsView()),
-    alerts: () => (id ? alertDetail(Number(id)) : alerts()), events, overview, ingest, rules, health, admin };
+    alerts: () => (id ? alertDetail(Number(id)) : alerts()), events, overview, ingest, agents: agentsView,
+    rules, health, admin };
   guarded(views[view] || socDashboard);
 }
 
@@ -478,6 +488,72 @@ function ingestSummary(r) {
   return el("div", { class: "explain" },
     el("div", {}, `Accepted ${r.accepted}, rejected ${r.rejected}. Detection: ${d.status}${d.error ? ` — ${d.error}` : ""}. Alerts created ${d.alerts_created ?? 0}, updated ${d.alerts_updated ?? 0}.`),
     r.rejections?.length ? el("ul", {}, r.rejections.slice(0, 10).map((x) => el("li", {}, `Record ${x.index}: ${x.reason}`))) : null);
+}
+
+// ---------- agents ----------
+// Status classes reuse the existing pills: reporting is healthy, quiet is degraded, silent fails.
+const AGENT_STATUS_CLASS = { reporting: "st-ok", quiet: "st-degraded", silent: "st-failing",
+  never_reported: "st-degraded", revoked: "st-failing" };
+
+async function agentsView() {
+  const data = await api("/api/agents");
+  const s = data.summary;
+  const kpi = (v, l) => el("div", { class: "kpi" }, el("div", { class: "v" }, v ?? "—"), el("div", { class: "l" }, l));
+  const when = (ts) => el("span", { title: fmtTime(ts) }, ago(ts));
+
+  const captured = (a) => (a.sources.length
+    ? el("span", { class: "row" }, a.sources.map((src) => el("span", {
+      class: "pill",
+      title: `${src.source} · format ${src.formats.join(", ")} · ${src.events} event(s), last ${fmtTime(src.last_log_at)}`,
+    }, `${src.kind} · ${src.formats.join("/")}`)))
+    : el("span", { class: "muted" }, "nothing received yet"));
+
+  const detail = (a) => {
+    $("#modal-body").replaceChildren(
+      el("h2", {}, a.hostname ? `${a.name} on ${a.hostname}` : a.name),
+      el("p", {}, pill(a.status, AGENT_STATUS_CLASS[a.status] || "st-degraded"),
+        el("span", { class: "muted" },
+          `  Token ${a.token_prefix}… created ${fmtTime(a.installed_at)} by ${a.installed_by}`
+          + (a.revoked_at ? ` · revoked ${fmtTime(a.revoked_at)}` : ""))),
+      el("p", { class: "muted" }, a.first_batch_at
+        ? `First batch ${fmtTime(a.first_batch_at)} · last batch ${fmtTime(a.last_batch_at)}`
+          + ` · last token use ${fmtTime(a.last_token_use_at)}.`
+        : "This agent has never sent a batch. Check its token and that the service is running."),
+      table(["Source", "Kind", "Format", "Batches", "Accepted", "Rejected", "Events", "Last log"],
+        a.sources.map((src) => ({ cells: [el("code", {}, src.source), src.kind, src.formats.join(", "),
+          { num: src.batches }, { num: src.accepted }, { num: src.rejected }, { num: src.events },
+          when(src.last_log_at)] }))),
+      el("p", {}, el("button", { onclick: () => $("#modal").close() }, "Close")));
+    $("#modal").showModal();
+  };
+
+  render(
+    el("h1", {}, "Agents"),
+    el("div", { class: "kpis" },
+      kpi(s.total, "Agents installed"), kpi(s.reporting, "Reporting"), kpi(s.quiet, "Quiet"),
+      kpi(s.silent, "Silent"), kpi(s.never_reported, "Never reported"),
+      kpi(s.events.toLocaleString(), "Events received")),
+    el("div", { class: "card" },
+      el("div", { class: "row", style: { justifyContent: "space-between" } },
+        el("h2", {}, "Collection fleet"),
+        el("button", { class: "ghost", onclick: () => guarded(() => agentsView()) }, "Refresh")),
+      el("p", { class: "muted" },
+        `Status reflects the last log received, not a heartbeat: an agent only contacts the server when it has new `
+        + `lines to send, so an idle host and a stopped agent look alike. Reporting = a batch in the last `
+        + `${Math.round(data.reporting_seconds / 60)} min, quiet = within ${Math.round(data.quiet_seconds / 60)} min, `
+        + `silent = longer. "Installed" is when the agent's ingest token was created. Select a row for its sources.`),
+      table(["Agent", "Host", "Status", "Logs captured", "Installed by", "Installed", "Last received", "Events"],
+        data.agents.map((a) => ({ agent: a, cells: [
+          el("span", {}, a.name, a.revoked_at ? pill(" revoked", "st-failing") : null),
+          a.hostname || "—",
+          pill(a.status, AGENT_STATUS_CLASS[a.status] || "st-degraded"),
+          captured(a),
+          a.installed_by,
+          when(a.installed_at),
+          a.last_batch_at ? when(a.last_batch_at) : el("span", { class: "muted" }, "never"),
+          { num: a.events }] })),
+        (row) => detail(row.agent))),
+  );
 }
 
 // ---------- rules ----------
