@@ -1,4 +1,4 @@
-#!/usr/bin/env  python3
+#!/usr/bin/env python3
 # added new comment
 """Watchpost Linux agent: collect this host's logs and ship them to a Watchpost server.
 
@@ -11,10 +11,10 @@ re-implemented here. The agent decides *what* to send, in which of the server's 
 formats, and under which source name.
 
     export WATCHPOST_AGENT_TOKEN=wp_...        # ingest-only token, created by an admin
-    ./agent.py --list-sources                  # no --url needed: this reads only this host
-    ./agent.py --url http://192.168.8.178:8080 --dry-run
-    ./agent.py --url http://192.168.8.178:8080 --check
-    ./agent.py --url http://192.168.8.178:8080 --state /var/lib/watchpost-agent/positions.json
+    python3 agent.py --list-sources             # no --url needed: this reads only this host
+    python3 agent.py --url http://192.168.8.178:8080 --dry-run
+    python3 agent.py --url http://192.168.8.178:8080 --check
+    python3 agent.py --url http://192.168.8.178:8080 --state /var/lib/watchpost-agent/positions.json
 
 `--url` is passed as an option (`--url URL`), not as a bare argument. It is required to ship and
 to run `--check`, and not needed for `--list-sources` or `--dry-run`, which only read this host.
@@ -238,6 +238,15 @@ def resolve_sources(selected, hostname, prefix="", log_dir=DEFAULT_LOG_DIR):
         for path in paths:
             files.append((path, _format_for(source, path),
                           _source_name(source, path, prefix or hostname, log_dir)))
+            # A source with `paths` lists them in order of preference, so any other file is a
+            # fallback. Worth saying out loud: kern.log stands in for ufw.log on a host with UFW
+            # logging off, and it carries unrelated kernel messages that arrive as generic events.
+            preferred = os.path.abspath(os.path.join(log_dir, source["paths"][0])) \
+                if source.get("paths") else None
+            if preferred and path != preferred:
+                warnings.append(
+                    f"source '{name}' is reading {path} because {preferred} is not present; that is a "
+                    f"fallback and may contain records this source was not meant to cover")
             if source.get("transform"):
                 # Bind the hostname now: the shipper calls a transform with the line only.
                 transforms[path] = functools.partial(TRANSFORMS[source["transform"]], hostname=hostname)

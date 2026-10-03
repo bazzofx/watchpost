@@ -271,6 +271,22 @@ class ResolveSourcesTests(unittest.TestCase):
         self.assertEqual([f[2] for f in files],
                          ["web01-web", "web01-web-error", "web01-web-shop.access"])
 
+    def test_the_preferred_file_produces_no_fallback_warning(self):
+        _, _, _, warnings = agent.resolve_sources(["firewall"], "host01", log_dir=LOGS)
+        self.assertEqual(warnings, [], "ufw.log is present here, so nothing stands in for it")
+
+    def test_a_fallback_source_is_reported(self):
+        """kern.log standing in for ufw.log is worth saying out loud: with UFW logging switched off
+        it carries unrelated kernel messages, which arrive as generic events rather than firewall
+        decisions, so the operator would otherwise wonder why firewall detection went quiet."""
+        files, _, skipped, warnings = agent.resolve_sources(
+            ["firewall"], "host01", log_dir=ROOT / "tests" / "fixtures" / "logs-kern-only")
+        self.assertEqual(skipped, [])
+        self.assertEqual([os.path.basename(f[0]) for f in files], ["kern.log"])
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("kern.log", warnings[0])
+        self.assertIn("fallback", warnings[0])
+
     def test_selecting_both_overlapping_sources_warns(self):
         """auth and syslog both carry the same sshd lines under rsyslog."""
         files, _, skipped, warnings = agent.resolve_sources(["auth", "syslog"], "host01", log_dir=LOGS)

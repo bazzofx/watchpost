@@ -39,6 +39,12 @@ same file from the UI. That keeps one implementation of every parser (`watchpost
    It prompts for the token with input hidden (or take it from a file with
    `--token-file /root/wp.token`, which keeps it out of your shell history).
 
+   Before committing to anything, `sudo ./deploy/agent/install-agent.sh --dry-run --url ...` prints
+   the whole plan — whether the agent would accept that URL, and what each source would collect on
+   this host — and changes nothing. `--help` lists every option, and
+   `sudo ./deploy/agent/install-agent.sh --uninstall` removes it again (add `--yes` to skip the
+   prompt). See [The installer](#the-installer) for the rest.
+
 3. **Confirm data is arriving.** On the server, open **Agents** (the fleet view): the agent should
    appear with its hostname, the log sources it is capturing, and a `reporting` status — or
    `never_reported` if nothing has been received yet. **Ingest > Recent batches** shows the raw
@@ -203,6 +209,37 @@ empty` **after** authenticating, so a `400` means the token is valid and nothing
 
 Exit codes: `0` success, `2` a configuration problem (unknown source, no readable sources, a
 rejected token, or plain HTTP to a remote host).
+
+## The installer
+
+`deploy/agent/install-agent.sh` is idempotent: re-running it refreshes the agent and the unit, and
+leaves your `/etc/watchpost-agent/agent.env` alone.
+
+| Option | Meaning |
+|---|---|
+| `--url URL` | Where the agent ships. Required to install. Use `http://127.0.0.1:8080` when the agent runs on the Watchpost host itself |
+| `--sources LIST` | Comma-separated sources for `WATCHPOST_AGENT_SOURCES` (default `auth,firewall,web,audit`) |
+| `--log-dir` | Value for `WATCHPOST_AGENT_LOG_DIR` (default `/var/log`) |
+| `--token-file PATH` | Read the ingest token from a file instead of the hidden prompt |
+| `--agent-args "FLAGS"` | Extra `agent.py` flags for the service, stored in `WATCHPOST_AGENT_EXTRA_ARGS`, for example `--agent-args "--batch-lines 4000 --from-start"` |
+| `--allow-insecure-http` | Accept the ingest token travelling in clear text to a non-loopback host |
+| `--dry-run` | Print the plan, ask whether the agent would accept the URL, list what each source would collect, and change nothing. Needs no root |
+| `--uninstall` | Stop, disable, and remove the unit, the installed files, the env file, the state, and the service user (`--yes` skips the prompt) |
+
+Three deliberate behaviours:
+
+- **It asks the agent's own `check_url()` whether the URL is acceptable** instead of guessing from
+  the host name, so what it warns about can never disagree with what the service will do. A
+  plain-HTTP URL on another host is refused by the agent, and `Restart=always` turns that into a
+  restart loop, so the installer says so before installing anything. Loopback is a question of the
+  address, not the spelling: `127.0.1.1` and `[::1]` are loopback, `127.0.0.1.example.com` is not.
+- **The env file wins once it exists.** A re-run only rewrites the token and `--agent-args`, so
+  edits you made by hand survive. If a `--url`, `--sources`, or `--log-dir` therefore cannot be
+  applied, it says so rather than appearing to accept the option and quietly using the old value.
+- **`--agent-args` is validated, because the service restarts forever.** `--check`, `--list-sources`
+  and `--dry-run` print something and exit, which under `Restart=always` leaves a unit that reports
+  "running" while ingesting nothing; `--url` would contradict `WATCHPOST_AGENT_URL`. Both are
+  refused. `--once` and `--state` warn, since they work but not as intended.
 
 ## How it behaves
 

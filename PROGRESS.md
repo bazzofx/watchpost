@@ -781,3 +781,87 @@ after 4 passes:
   offset — nothing was lost, but the backlog is still there.
 - The same head-of-line risk exists in principle for any future per-pass budget: the fairness property
   is now covered by tests rather than by inspection.
+
+## The agent installer (2026-10-03, `deploy/agent/install-agent.sh`)
+
+The owner's report was that the installer was missing `--dry-run` and `--allow-insecure-http` and that
+it needed to be "working perfect and sending the correct data to our dashboard". Both flags were
+indeed absent. The deeper problem was that the installer had two habits which produce exactly the
+symptom of a broken agent: it **discarded** what it had been given, and it **said nothing** when it
+did.
+
+**Shipped**
+- `--dry-run` prints the whole plan, asks whether the agent would accept the URL, runs the agent's own
+  `--list-sources` and `--dry-run`, and changes nothing. It needs no root, so it is safe to run first.
+  `--uninstall` (`--yes` skips the prompt) removes the unit, the installed files, the env file, the
+  state, and the service user, and reminds the owner to revoke the token. `--agent-args "FLAGS"` stores
+  extra agent flags in `WATCHPOST_AGENT_EXTRA_ARGS`, which is where the unit picks them up;
+  `--allow-insecure-http` is accepted as a first-class flag.
+- **A supplied token is always stored.** When `/etc/watchpost-agent/agent.env` already existed, the
+  installer prompted for a token, threw it away, and then printed "no token is set" in the next line.
+- **The env file is written with `set_env_value`, not `sed -i`.** A token or a flag list containing `&`
+  or `|` was substituted instead of stored literally, because those are sed's replacement
+  metacharacters. The file is rewritten in place, so its inode (and therefore its owner and mode)
+  survive a re-run.
+- **An option that cannot be applied is now reported.** On a re-run the env file owns `--url`,
+  `--sources`, and `--log-dir`, which is what keeps local edits from being overwritten. Silently
+  keeping the old value is how a service ends up shipping to the wrong place after an install that
+  reported success, so `warn_if_ignored` names the flag that was dropped and what the file says instead.
+- **The plain-HTTP verdict is the agent's own.** The installer used to guess from the host with glob
+  patterns, and that guess disagreed with `shipper.check_url()` in both directions:
+  `http://127.0.1.1:8080` is loopback to the agent but drew a false crash-loop warning, while
+  `http://127.0.0.1.example.com:8080` is *not* loopback to the agent but kept the installer quiet --
+  the exact crash loop the warning exists to prevent. It now asks the agent's own `check_url()` through
+  a small Python shim, so the two cannot disagree; the literal comparison survives only as a fallback
+  for when that cannot be run, and errs towards warning.
+- **`--agent-args` is validated, because the service restarts forever.** `--check`, `--list-sources`,
+  and `--dry-run` print something and exit, and under `Restart=always` that is a unit reporting
+  "running" while ingesting nothing -- the hardest install failure to notice, and easy to create by
+  passing `--agent-args "--check"` in order to "just test the token". Those three and `--url` are
+  refused; `--once` and `--state` warn, since they work but not as intended.
+- Smaller: `--help` is now the header comment block itself, self-terminating at the script's first real
+  command, so adding a flag can no longer leave the help stale (it was a hand-maintained line range);
+  the "that is an agent flag" hint distinguishes flags that take a value from those that do not (it
+  used to suggest `--agent-args "--from-start <value>"`, which argparse rejects); a copy of the
+  installer without its checkout is refused up front instead of failing later somewhere confusing; the
+  post-install listing is run against the env file, so it reports the URL and log directory the service
+  will actually use; and the `--help` output no longer prints an empty `--url` when none was given.
+
+**Verification**
+- 65 assertions in a temporary harness (deleted afterwards), all passing. It was built by **extracting
+  the real functions out of the script** and exercising them, so the checks cannot drift from the code.
+  It covers `bash -n`, `--help`, every flag-hint path, the `--agent-args` refusals, `set_env_value`
+  (replace, append, `&` and `|` stored literally, mode and inode preserved), `warn_if_ignored`, and
+  `--dry-run` end to end.
+- The URL verdict was compared against the agent's own `check_url` for nine hosts -- loopback,
+  `localhost`, `127.0.1.1`, `[::1]`, https, a LAN address, a DNS name, and the `127.0.0.1.example.com`
+  trap -- installer answer against agent answer, not against a hand-written expectation. All nine agree.
+- `tests/test_agent.py` gained two cases for the fallback-source warning, using a new committed fixture
+  (`tests/fixtures/logs-kern-only/`) instead of a temporary directory, so they run in this machine's
+  sandbox as well. 42 tests across the module's server-free classes pass locally; the module's
+  `EndToEndAgentTests` error here for the usual reason.
+- The full suite is **360 tests**, of which 150 fail **in this sandbox only**: 110
+  `sqlite3.OperationalError: unable to open database file` and 38 `PermissionError` under the temporary
+  directory, plus the two known Windows-only failures (`test_file_spec_parsing` and a `charmap` decode
+  in the static-asset test). None of the 150 is in a file this work touched.
+- **Not yet done, and worth saying plainly:** this session has still never run the installer end to end
+  on a real host. Everything above is verified at the level of the script's own logic. The parts that
+  need root, systemd, and a live Watchpost -- service start, the token check, and data arriving in the
+  Agents view -- remain unverified here and need the owner's host.
+
+**Notes for the owner**
+- The behavioural fixes are the real answer to "is it sending the correct data": the token is now
+  stored, a URL is either applied or reported, and a `--agent-args` mistake fails loudly at install
+  time instead of leaving a service that looks healthy and sends nothing.
+- Re-running the installer on AiSwarm is safe. The env file is only rewritten for the token and
+  `--agent-args`, so `WATCHPOST_AGENT_SOURCES`, the log directory, and any other edit you made stay as
+  they are -- and if a `--url` you pass does not match the file, it now tells you instead of ignoring
+  you.
+- `scripts/agent.py` had picked up a double-space shebang (`#!/usr/bin/env  python3`) in an earlier
+  commit. Harmless, since `env` skips the extra space, but corrected.
+- These changes were written while the tree was on a **detached HEAD** and are re-applied here on
+  `main`, so they now sit on the branch that also carries the nginx starvation fix (above) and the
+  ingest-overload work. The two scratch logs (`.base.log`, `.full.log`) that were committed by mistake
+  in that detached line are deliberately **not** carried across; they still exist in the dangling
+  commit `49488ad` if anyone ever cherry-picks it.
+
