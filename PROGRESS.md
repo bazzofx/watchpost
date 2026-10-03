@@ -729,3 +729,55 @@ api  BrokenPipeError: [Errno 32] Broken pipe     on POST /api/ingest/upload
   ingest is where the architecture, not the queries, becomes the limit.
 - `synchronous = NORMAL` and the 20 s `busy_timeout` are hard-coded, not configurable. If either
   trade-off is wrong for a deployment, they want to become settings.
+
+## Regression: capping the agent starved whole log files (2026-10-03)
+
+**Reported by the owner:** "we are no longer digesting logs from the nginx folder."
+
+**Cause — mine.** `--max-batches-per-pass`, which I added two turns earlier and recommended as the fix
+for the ingest overload, walked `self.files` from the top on every pass and returned the moment the
+budget was spent. Since the file list is ordered auth → firewall → web → audit (and within `web`,
+nginx files sorted by name), any file whose backlog exceeded one pass's budget starved **every file
+after it**. Not slowly — at all. The user had set `--max-batches-per-pass 4`, so if an earlier source
+(auth, or a busy firewall log) had a backlog, all four nginx logs and the audit log received nothing.
+
+Reproduced before changing anything, with the AiSwarm layout and the settings in use:
+
+```
+agent settings: --batch-lines 120 --max-batches-per-pass 4
+after 4 passes:
+    events stored, by source: aiswarm-auth  1920
+    STARVED: ufw.log, nginx/access.log, nginx/cybersamurai_error.log,
+             nginx/cybersamurai_security.log, nginx/error.log, audit/audit.log
+```
+
+**Shipped**
+- `shipper.Shipper.ship_once` now serves files **round-robin, one batch each per cycle**, until the
+  budget is spent or a whole cycle finds nothing. A single file with a huge backlog can no longer
+  monopolise a pass.
+- The rotation position is saved with the positions under a `__cursor__` key and restored on start, so
+  separate invocations (cron, `--once`) stay fair across restarts and not just within one process.
+  The key cannot collide with a real entry, which is always an absolute path.
+- With no cap the rotation is cleared once every file is drained, so the state file stays as it was.
+
+**Verification**
+- The same repro after the fix: every source ships, with the earlier backlogs still draining fairly —
+  `auth` 480, `firewall` 480, `web-cybersamurai_security` 480, and 60 each for `access.log`,
+  `cybersamurai_error.log`, `error.log` and `audit`. No file starved.
+- Four new tests in `tests/test_live_ingest.py`: a capped pass serves every file in one pass; a long
+  backlog elsewhere delays a small file by at most a pass; the rotation survives a restart (a new
+  process resumes at the recorded file, verified through the state file); and an uncapped pass clears
+  the rotation.
+- No regressions: **358 tests**, the same failure set in both the full run and the baseline. (The four
+  new tests error in this machine's plain runner for the same reason every other `ShipperTests` does —
+  `tempfile` directories are unwritable here — and pass under a workspace temporary directory.)
+
+**Notes for the owner**
+- **Re-check the agent after updating.** On the affected host, `--max-batches-per-pass` should be kept
+  now that it is fair, but confirm from the journal that nginx files are being sent, not just that the
+  service is running.
+- Anything the agent skipped while starved was **skipped, not queued**: the batch was never sent, so
+  the position file never advanced past it. It will therefore be sent on the next pass from that
+  offset — nothing was lost, but the backlog is still there.
+- The same head-of-line risk exists in principle for any future per-pass budget: the fairness property
+  is now covered by tests rather than by inspection.

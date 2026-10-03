@@ -375,6 +375,71 @@ class ShipperTests(unittest.TestCase):
         self.assertEqual(tail.ship_once(), 10)
         self.assertEqual(len(fake.requests), 3)
 
+    def multi(self, fake, files, **kwargs):
+        """A Shipper over several files, for the fairness tests below."""
+        tail = shipper.Shipper(fake.url, self.TOKEN,
+                               [(str(self.dir / name), "authlog", source) for name, source in files],
+                               self.state, sleep=self.sleeps.append, **kwargs)
+        self.addCleanup(tail.close)
+        return tail
+
+    def test_a_capped_pass_gives_every_file_a_turn(self):
+        """Regression: nginx logs stopped arriving entirely.
+
+        A capped pass used to walk the file list from the top and return the moment the budget was
+        spent, so one source with a backlog larger than a single pass starved every file after it.
+        Those files were not shipped slowly — they were never shipped at all.
+        """
+        fake = self.fake()
+        (self.dir / "auth.log").write_text("".join(f"b{i}\n" for i in range(40)))
+        (self.dir / "access.log").write_text("".join(f"s{i}\n" for i in range(2)))
+        tail = self.multi(fake, [("auth.log", "box-auth"), ("access.log", "box-web")],
+                          batch_lines=5, from_start=True, max_batches_per_pass=2)
+        tail.ship_once()
+        sources = sorted(r["query"]["source"] for r in fake.requests)
+        self.assertEqual(sources, ["box-auth", "box-web"],
+                         "the small file must be served in the same pass as the big one")
+
+    def test_capping_does_not_delay_the_small_file_by_more_than_a_pass(self):
+        fake = self.fake()
+        (self.dir / "auth.log").write_text("".join(f"b{i}\n" for i in range(400)))
+        (self.dir / "access.log").write_text("".join(f"s{i}\n" for i in range(4)))
+        tail = self.multi(fake, [("auth.log", "box-auth"), ("access.log", "box-web")],
+                          batch_lines=5, from_start=True, max_batches_per_pass=2)
+        for _ in range(3):
+            tail.ship_once()
+        shipped = {}
+        for request in fake.requests:
+            shipped[request["query"]["source"]] = \
+                shipped.get(request["query"]["source"], 0) + request["body"].count(b"\n")
+        self.assertEqual(shipped.get("box-web"), 4, "a long backlog elsewhere must not hold this back")
+
+    def test_the_rotation_position_survives_a_restart(self):
+        """Cron and `--once` passes are separate processes, so the turn has to be written down."""
+        fake = self.fake()
+        (self.dir / "a.log").write_text("".join(f"a{i}\n" for i in range(20)))
+        (self.dir / "b.log").write_text("".join(f"b{i}\n" for i in range(20)))
+        files = [("a.log", "box-a"), ("b.log", "box-b")]
+
+        first = self.multi(fake, files, batch_lines=5, from_start=True, max_batches_per_pass=1)
+        first.ship_once()
+        saved = json.loads(self.state.read_text())
+        self.assertIn(shipper.CURSOR_KEY, saved, "a capped pass must record whose turn is next")
+        self.assertTrue(saved[shipper.CURSOR_KEY].endswith("b.log"))
+
+        restarted = self.multi(fake, files, batch_lines=5, from_start=True, max_batches_per_pass=1)
+        restarted.ship_once()
+        self.assertEqual(fake.requests[-1]["query"]["source"], "box-b",
+                         "the next process must resume the rotation, not restart at the top")
+
+    def test_an_uncapped_pass_clears_the_rotation(self):
+        """Nothing to remember once every file has been drained."""
+        fake = self.fake()
+        (self.dir / "a.log").write_text("a\n")
+        tail = self.multi(fake, [("a.log", "box-a")], batch_lines=5, from_start=True)
+        tail.ship_once()
+        self.assertNotIn(shipper.CURSOR_KEY, json.loads(self.state.read_text()))
+
     def test_batches_respect_line_limit(self):
         fake = self.fake()
         self.append("".join(f"l{i}\n" for i in range(7)))

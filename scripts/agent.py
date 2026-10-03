@@ -421,7 +421,8 @@ def build_parser():
                              "detection runs on the server")
     parser.add_argument("--max-batches-per-pass", type=int, default=0, metavar="N",
                         help="send at most N batches per pass, then wait --interval (0 = no limit). "
-                             "Use it to trickle a large --from-start backlog instead of flooding")
+                             "Use it to trickle a large --from-start backlog instead of flooding. "
+                             "Files take turns, so one file's backlog cannot starve the others")
     parser.add_argument("--year", type=int, help="year for BSD syslog lines (default: the server decides)")
     parser.add_argument("--from-start", action="store_true",
                         help="ship existing content of files seen for the first time (default: new lines only)")

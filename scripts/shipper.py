@@ -40,6 +40,8 @@ from pathlib import Path
 DEFAULT_STATE = "watchpost-shipper-positions.json"
 SKIP_STATUSES = {400, 413, 415, 422}   # the batch itself is bad; retrying cannot help
 MAX_BACKOFF = 60.0
+# Marks which file a capped pass stopped on. Cannot collide with a real key, which is a path.
+CURSOR_KEY = "__cursor__"
 
 
 def log(message):
@@ -140,6 +142,7 @@ class Shipper:
         self.max_batches_per_pass = max_batches_per_pass
         self.context = ssl.create_default_context(cafile=cafile) if url.startswith("https:") else None
         state = self._load_state()
+        self._cursor_path = state.get(CURSOR_KEY)
         self.files = [TailedFile(path, fmt, source, state, from_start) for path, fmt, source in files]
         self.stats = {"batches": 0, "lines": 0, "skipped_batches": 0, "retries": 0}
 
@@ -154,6 +157,8 @@ class Shipper:
 
     def save_state(self):
         state = {f.path: f.state() for f in self.files if f.state()}
+        if self._cursor_path:
+            state[CURSOR_KEY] = self._cursor_path
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.state_path.with_name(self.state_path.name + ".tmp")
         tmp.write_text(json.dumps(state, indent=1, sort_keys=True))
@@ -188,27 +193,56 @@ class Shipper:
         return status
 
     def ship_once(self, max_retries=None):
-        """Send everything currently available, or as much as max_batches_per_pass allows.
+        """Send what is available, spending the batch budget fairly across files.
+
+        Files are served round-robin, one batch each per cycle, until the budget is spent or a whole
+        cycle finds nothing. A first attempt simply walked the list from the top and returned when
+        the budget ran out, which meant one file with a backlog bigger than one pass starved every
+        file after it: those files stopped being shipped altogether, not merely slowly. The rotation
+        position is saved with the positions so separate invocations (cron, `--once`) stay fair too.
 
         Returns the number of lines sent or skipped. Stopping between batches is safe: each batch
         commits its offset first, so the next pass resumes exactly where this one stopped.
         """
         total = batches = 0
-        for tailed in self.files:
-            while True:
+        count = len(self.files)
+        if not count:
+            return 0
+        start = 0
+        for index, tailed in enumerate(self.files):
+            if tailed.path == self._cursor_path:
+                start = index
+                break
+
+        progressed = True
+        while progressed:
+            progressed = False
+            for step in range(count):
+                index = (start + step) % count
+                tailed = self.files[index]
                 if self.max_batches_per_pass and batches >= self.max_batches_per_pass:
+                    # Out of budget. Remember whose turn it is, rather than restarting at the top.
+                    if self._cursor_path != tailed.path:
+                        self._cursor_path = tailed.path
+                        self.save_state()
                     return total
                 lines, end = tailed.read_lines(self.batch_lines, self.batch_bytes)
                 if not lines:
                     if end != tailed.offset:  # only blank lines: just advance
                         tailed.commit(end)
                         self.save_state()
-                    break
+                    continue                  # nothing here; the rest of the cycle still gets a turn
                 self._send_with_backoff(tailed, lines, max_retries)
                 tailed.commit(end)
                 self.save_state()
                 total += len(lines)
                 batches += 1
+                progressed = True
+
+        # A whole cycle passed without any file having data, so the next pass starts from the top.
+        if self._cursor_path:
+            self._cursor_path = None
+            self.save_state()
         return total
 
     def _send_with_backoff(self, tailed, lines, max_retries):
@@ -294,7 +328,8 @@ def main(argv=None):
                         help="lines per request; a bigger batch means fewer detection runs server-side")
     parser.add_argument("--max-batches-per-pass", type=int, default=0, metavar="N",
                         help="send at most N batches per pass, then wait --interval (0 = no limit). "
-                             "Use it to trickle a large --from-start backlog instead of flooding")
+                             "Use it to trickle a large --from-start backlog instead of flooding. "
+                             "Files take turns, so one file's backlog cannot starve the others")
     parser.add_argument("--year", type=int, help="year for BSD syslog lines (default: server decides)")
     parser.add_argument("--from-start", action="store_true",
                         help="ship existing content of files seen for the first time (default: only new lines)")

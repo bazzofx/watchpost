@@ -187,7 +187,7 @@ read from its current end and live tailing resumes with nothing replayed.
 | `--token-env` / `--token-file` | Where the token comes from (default env `WATCHPOST_AGENT_TOKEN`) |
 | `--state` | Position file (default `./watchpost-agent-positions.json`) |
 | `--interval`, `--batch-lines` | Poll interval (default 2 s) and lines per request (default 500) |
-| `--max-batches-per-pass N` | Send at most N batches in one pass, then wait `--interval` (0 = no limit). Use it to trickle a large backlog |
+| `--max-batches-per-pass N` | Send at most N batches in one pass, then wait `--interval` (0 = no limit). Use it to trickle a large backlog. Files take turns, so no log can be starved by another |
 | `--from-start` | Ship the existing content of a file seen for the first time. Default: only new lines |
 | `--year` | Year for BSD syslog lines, which carry none. Leave unset for live tailing |
 | `--cafile` | CA bundle, for a self-signed HTTPS certificate |
