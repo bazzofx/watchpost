@@ -4,12 +4,48 @@ import unittest
 from datetime import timedelta
 
 from tests.helpers import ADMIN_PW, ServerTestCase
+from watchpost import server
 from watchpost.db import iso, utcnow
 from watchpost.rules import DEFAULT_RULES
 
 # Kept as a set rather than a hard-coded number: the rule count changes when a rule is added,
 # and this test is about the API returning every rule with its techniques, not about the count.
 DEFAULT_RULE_IDS = {rule["id"] for rule in DEFAULT_RULES}
+
+
+class ConnectionHandlingTests(unittest.TestCase):
+    """A client that hangs up must not be treated as a server error.
+
+    Regression: a BrokenPipeError used to reach the generic handler, which wrote an error_log row —
+    a write to a database that is already busy, at the moment it can least afford one — and then
+    tried to answer the dead socket, raising again.
+    """
+
+    class Stub(server.Handler):
+        def __init__(self, path="/api/ingest/upload"):
+            self.command = "POST"          # deliberately not calling BaseHTTPRequestHandler.__init__
+            self.path = path
+
+    def stub_raising(self, exc):
+        handler = self.Stub()
+        def explode():
+            raise exc
+        handler._dispatch = explode
+        return handler
+
+    def test_a_broken_pipe_is_swallowed(self):
+        self.assertIsNone(self.stub_raising(BrokenPipeError(32, "Broken pipe"))._handle())
+
+    def test_a_reset_connection_is_swallowed(self):
+        self.assertIsNone(self.stub_raising(ConnectionResetError(104, "Connection reset"))._handle())
+
+    def test_an_aborted_connection_is_swallowed(self):
+        self.assertIsNone(self.stub_raising(ConnectionAbortedError(103, "Aborted"))._handle())
+
+    def test_other_exceptions_are_not_swallowed_here(self):
+        """Only connection errors belong to _handle; everything else keeps its own path."""
+        with self.assertRaises(ValueError):
+            self.stub_raising(ValueError("real bug"))._handle()
 
 
 def recent(minutes_ago=30):

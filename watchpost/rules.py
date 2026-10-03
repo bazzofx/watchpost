@@ -640,13 +640,25 @@ RULE_FUNCTIONS = {
 }
 
 
-# The largest time span a rule can look across; used to pick the rescan window after ingest.
+# How far back a rule can look. Detection uses these per rule, so a 300-second rule reads 300
+# seconds of events rather than the whole span the widest rule needs.
+def rule_span(rule):
+    """Seconds this rule alone can look back from an event: its window plus any escalation reach."""
+    params = rule["params"]
+    return params.get("window_seconds", 0) + params.get("escalation_seconds", 0)
+
+
+def rule_history(rule):
+    """Extra context this rule alone needs *before* its window (e.g. 'no prior activity' checks)."""
+    return rule["params"].get("history_seconds", 0)
+
+
+# The widest window any of these rules needs, and the longest history: the worst case a scan can
+# span. Kept for reporting and for the detectors that reason about the overall range; detection
+# itself no longer uses them to size every rule's read.
 def lookback_seconds(rules):
-    spans = [r["params"].get("window_seconds", 0) + r["params"].get("escalation_seconds", 0) for r in rules]
-    return max(spans + [3600])
+    return max([rule_span(r) for r in rules] + [3600])
 
 
-# Extra history some rules need before the rescan window (e.g. "no prior activity" checks).
-# Events in this span are context only: the engine ignores findings that end inside it.
 def history_seconds(rules):
-    return max([r["params"].get("history_seconds", 0) for r in rules] + [0])
+    return max([rule_history(r) for r in rules] + [0])

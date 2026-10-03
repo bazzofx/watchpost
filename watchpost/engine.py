@@ -157,8 +157,33 @@ def _apply_finding(conn, rule, finding, synthetic):
     return "created"
 
 
+def _rule_scan(conn, rule, max_id, start, end):
+    """The events one rule needs for a range, and the time before which its findings are context only.
+
+    Each rule gets its own window. Using one global window — the longest lookback plus the longest
+    history, about 30 hours — made every rule re-read all of it on every batch, so the cost of an
+    ingest grew with the whole store instead of with the batch. A 300-second rule now reads 300
+    seconds of events.
+    """
+    sql = f"SELECT {RULE_EVENT_FIELDS} FROM events WHERE id <= ?"
+    args = [max_id]
+    scan_start = None
+    if start and end:
+        pad = timedelta(seconds=rules_mod.rule_span(rule))
+        history = timedelta(seconds=rules_mod.rule_history(rule))
+        scan_start = iso(parse_iso(start) - pad)
+        sql += " AND ts >= ? AND ts <= ?"
+        args += [iso(parse_iso(start) - pad - history), iso(parse_iso(end) + pad)]
+    return [dict(r) for r in conn.execute(sql, args)], scan_start
+
+
 def run_detection(conn, trigger="manual", start=None, end=None):
     """Run all enabled rules over a time range (default: all events).
+
+    Rules are evaluated *before* any write transaction is opened. They are pure Python over
+    potentially large event lists, and holding SQLite's single writer lock for that whole time is
+    what makes unrelated requests fail with "database is locked"; the lock is now held only for the
+    inserts that follow.
 
     Failures are recorded in detection_runs and error_log and returned honestly;
     the ingested events stay stored so the run can be retried.
@@ -179,29 +204,40 @@ def run_detection(conn, trigger="manual", start=None, end=None):
                 rule["params"] = rules_mod.validate_params(rule["id"], rule["params"])
 
             max_id = conn.execute("SELECT COALESCE(MAX(id), 0) FROM events").fetchone()[0]
-            sql, args = f"SELECT {RULE_EVENT_FIELDS} FROM events WHERE id <= ?", [max_id]
-            scan_start = None
-            if start and end:
-                pad = timedelta(seconds=rules_mod.lookback_seconds(active))
-                history = timedelta(seconds=rules_mod.history_seconds(active))
-                scan_start = iso(parse_iso(start) - pad)
-                sql += " AND ts >= ? AND ts <= ?"
-                args += [iso(parse_iso(start) - pad - history), iso(parse_iso(end) + pad)]
-            events = [dict(r) for r in conn.execute(sql, args)]
-            synthetic_ids = {e["id"] for e in events if e["synthetic"]}
-            summary["events_scanned"] = len(events)
+            full_scan = not (start and end)
+            everything = None
+            if full_scan:
+                # An explicit full scan means every event, and reading them once for all rules is
+                # cheaper than one read per rule.
+                everything = [dict(r) for r in conn.execute(
+                    f"SELECT {RULE_EVENT_FIELDS} FROM events WHERE id <= ?", (max_id,))]
+
+            planned = []
+            scanned = set()
+            for rule in active:
+                if full_scan:
+                    events, scan_start = everything, None
+                else:
+                    events, scan_start = _rule_scan(conn, rule, max_id, start, end)
+                # Distinct events, not the sum of what each rule read: the number stays comparable
+                # with the single-window scans it replaces, and "how much history did this run look
+                # at" is the useful figure. Work per rule is what went down, not this.
+                scanned.update(e["id"] for e in events)
+                synthetic_ids = {e["id"] for e in events if e["synthetic"]}
+                for finding in rules_mod.RULE_FUNCTIONS[rule["id"]](events, rule["params"]):
+                    if scan_start and finding["last_seen"] < scan_start:
+                        continue  # built only from history context; outside this scan
+                    planned.append((rule, finding,
+                                    all(i in synthetic_ids for i in finding["event_ids"])))
+            summary["events_scanned"] = len(scanned)
 
             with transaction(conn):
-                for rule in active:
-                    for finding in rules_mod.RULE_FUNCTIONS[rule["id"]](events, rule["params"]):
-                        if scan_start and finding["last_seen"] < scan_start:
-                            continue  # built only from history context; outside this scan
-                        synthetic = all(i in synthetic_ids for i in finding["event_ids"])
-                        outcome = _apply_finding(conn, rule, finding, synthetic)
-                        if outcome == "created":
-                            summary["alerts_created"] += 1
-                        elif outcome == "updated":
-                            summary["alerts_updated"] += 1
+                for rule, finding, synthetic in planned:
+                    outcome = _apply_finding(conn, rule, finding, synthetic)
+                    if outcome == "created":
+                        summary["alerts_created"] += 1
+                    elif outcome == "updated":
+                        summary["alerts_updated"] += 1
             summary["status"] = "ok"
             conn.execute(
                 "UPDATE detection_runs SET status='ok', finished_at=?, events_scanned=?, alerts_created=?,"
@@ -209,7 +245,7 @@ def run_detection(conn, trigger="manual", start=None, end=None):
                 (now_iso(), summary["events_scanned"], summary["alerts_created"],
                  summary["alerts_updated"], max_id, run_id),
             )
-            if not (start and end):
+            if full_scan:
                 # A full scan covers every stored event, including batches whose detection failed.
                 conn.execute(
                     "UPDATE ingest_batches SET detection_status = 'recovered'"

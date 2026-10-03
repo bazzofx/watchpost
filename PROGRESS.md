@@ -639,3 +639,93 @@ the rules.
 - The reset is logs-only by design; a "factory reset" that also clears rules, tokens and accounts is
   not offered, because deleting the database file (documented in `docs/AGENT.md`) already does that
   and is the operation that should require shell access.
+
+## Ingest overload: "database is locked" and broken pipes (2026-10-03)
+
+**Reported by the owner**, from the Health page:
+
+```
+api  OperationalError: database is locked        on POST /api/auth/login
+api  OperationalError: database is locked        on POST /api/ingest/upload
+api  BrokenPipeError: [Errno 32] Broken pipe     on POST /api/ingest/upload
+```
+
+**Diagnosis.** Three causes, only one of which was "the logs arrive too fast":
+
+1. **Journal mode was set per connection.** `db.connect()` ran `PRAGMA journal_mode = WAL`, and the
+   server opens a connection for **every HTTP request** (`App.conn()`), so every ingest, login and
+   health poll took a lock on the database header. WAL is a property of the file and persists, so all
+   of that locking bought nothing. This is the most likely direct source of `database is locked` on a
+   request as trivial as a login.
+2. **Rules ran inside the write transaction.** `run_detection` opened `BEGIN IMMEDIATE` and then
+   evaluated all thirteen rules — pure Python over a large event list — inside it. SQLite has a
+   single writer, so the write lock was held for the whole evaluation, which is what made unrelated
+   requests fail.
+3. **Every rule re-read a ~30-hour window.** One global window (longest lookback 6 h + longest
+   history 24 h) was read once and handed to every rule, so a 300-second rule cost the same as a
+   24-hour one and the cost of an ingest grew with the whole store. Combined with the agent's
+   500-line batches this is what pushed a single ingest past the shipper's 30 s timeout, and the
+   resulting client disconnect is the `BrokenPipeError`.
+4. The broken pipes then **amplified** the problem: each one reached the generic handler, which wrote
+   an `error_log` row (a write to a database that was already too busy) and then tried to answer the
+   dead socket, raising again.
+
+**Shipped**
+- `db.connect()` no longer touches the journal mode and stays lock-free; `init_schema()` sets
+  `journal_mode = WAL` and `synchronous = NORMAL` once per database. WAL with NORMAL is the usual
+  pairing: an fsync at checkpoints rather than every commit, so sustained ingest is much cheaper, at
+  the cost of losing the last transactions only on power loss or a kernel panic. `busy_timeout` went
+  from 10 s to 20 s — deliberately **below** the shipper's 30 s request timeout, so a caller gets a
+  real error rather than a broken pipe.
+- `engine.run_detection` now **evaluates every rule before opening the write transaction**, collects
+  the findings, and applies them in one short transaction. The write lock is held only for the
+  inserts. (An explicit full scan still reads every event once for all rules, because that is cheaper
+  than one read per rule and a full scan is deliberate.)
+- **Per-rule scan windows.** `rules.rule_span(rule)` and `rules.rule_history(rule)` size each rule's
+  read, and `engine._rule_scan` uses them, so a 300-second rule reads 300 seconds of events. The
+  global `lookback_seconds`/`history_seconds` are kept as the worst case for reporting and remain
+  covered by their existing tests.
+- `detection.events_scanned` counts **distinct** events examined, not the sum per rule. The sum was
+  tried first and is misleading: it rises while the system gets faster, because thirteen rules each
+  reading a small window adds up to more than one shared window. Distinct events keeps the number
+  comparable with the single-window scans it replaces.
+- `Handler._handle` is now a thin wrapper that swallows `BrokenPipeError`, `ConnectionResetError`, and
+  `ConnectionAbortedError` at debug level, with the request logic moved to `_dispatch`. A client that
+  hangs up is normal; it no longer writes an `error_log` row and no longer attempts a reply to a dead
+  socket.
+
+**Verification**
+- Measured against the same fixture as the earlier backfill benchmark (20,000 events, 40 batches of
+  500): **19.5 s → 8.6 s (2.3× faster)**, per-batch detection ~0.49 s → ~0.12 s, distinct events
+  examined per run 5,102 → 4,438. The larger share of the win is rule-evaluation work falling from
+  13 rules × one window to each rule over its own window.
+- `tests/test_engine.py` (new, 11 tests): each rule reads only its own window (a 60-second rule does
+  not see an event 20 hours old, a 6-hour rule does, a 24-hour-history rule sees all three); a full
+  scan still reads everything; `events_scanned` counts distinct events; detection still creates
+  alerts; and — the lock regression — **a second connection writing with `busy_timeout = 0`
+  succeeds while rules are evaluating**, which fails immediately if the write lock were held.
+- `tests/test_db.py` (new, 12 tests): `connect()` alone leaves the journal mode at `delete` and takes
+  no lock; `init_schema()` sets WAL and `synchronous = NORMAL`; WAL persists to later connections;
+  `busy_timeout` is 20 s on every connection and stays under the shipper's timeout; `:memory:` is
+  left alone; the schema version is recorded and `init_schema` is idempotent.
+- `tests/test_api.py` gained `ConnectionHandlingTests` (4 tests): the three connection errors are
+  swallowed by `_handle`, and any other exception still propagates.
+- No regressions: **354 tests**, the **same 27 pre-existing Windows-only failures**, empty diff of
+  the failure sets. `EndToEndTests.test_full_analyst_flow` passes, which exercises the whole
+  detect → alert → correlate → report path through the restructured code.
+
+**Not done / notes for the owner**
+- **The dominant read is still two rules.** Per-rule windows cut the total, but
+  `impossible_geo_login` (6 h) and `cloud_iam_change_by_new_principal` (24 h of history) set the
+  floor: one run still reads ~25 hours of events. The lever that needs no code is a reviewed change
+  to those two parameters (`docs/AGENT.md` and the Rules page); the cleaner fix is to answer "has
+  this principal been seen in the last 24 h" with a targeted indexed query instead of loading the
+  events, which would turn that rule from a pure function into one that reads the database — a design
+  change worth deciding deliberately, since every rule is currently a pure function.
+- **Detection still runs once per batch.** Coalescing bursts (one pass per N batches) would help
+  further, and would not have helped this particular incident because a single agent ships
+  sequentially. Bigger `--batch-lines` remains the cheapest lever and is the agent-side advice.
+- **SQLite still has one writer.** These fixes move the ceiling a long way, but concurrent multi-host
+  ingest is where the architecture, not the queries, becomes the limit.
+- `synchronous = NORMAL` and the 20 s `busy_timeout` are hard-coded, not configurable. If either
+  trade-off is wrong for a deployment, they want to become settings.

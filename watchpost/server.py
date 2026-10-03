@@ -604,6 +604,18 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     def _handle(self):
+        """Answer one request. A client that hangs up is normal, not an error worth recording."""
+        try:
+            self._dispatch()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as exc:
+            # The peer went away: a shipper that hit its own request timeout, a closed browser tab, a
+            # load balancer giving up. There is nobody left to answer, and recording this would add a
+            # write to a database that is already busy at exactly the moment it can least afford one
+            # — and then try to send a 500 to a dead socket, which raises again.
+            log.debug("client disconnected during %s %s (%s)", self.command,
+                      urlparse(self.path).path, type(exc).__name__)
+
+    def _dispatch(self):
         parsed = urlparse(self.path)
         if self._rate_limited(parsed.path):
             return

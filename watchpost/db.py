@@ -265,14 +265,22 @@ def parse_iso(value):
 
 
 def connect(db_path):
+    """Open a connection.
+
+    Deliberately cheap: the server opens one of these per HTTP request, so nothing here may take a
+    lock. Journal mode and durability used to be set here, which meant every request took a lock on
+    the database header — one of the causes of 'database is locked' under load. They are now set once
+    in init_schema().
+    """
     if db_path != ":memory:":
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path, timeout=10, isolation_level=None)
+    conn = sqlite3.connect(db_path, timeout=30, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA busy_timeout = 10000")
-    if db_path != ":memory:":
-        conn.execute("PRAGMA journal_mode = WAL")
+    # A writer that has to wait longer than this is a sign of overload rather than a slow query, so
+    # the wait is bounded below the shipper's own 30 s request timeout: queuing beats failing, but a
+    # caller should still get a real error rather than a broken pipe.
+    conn.execute("PRAGMA busy_timeout = 20000")
     return conn
 
 
@@ -289,11 +297,21 @@ def transaction(conn):
 
 
 def init_schema(conn):
+    """Create or upgrade the schema. Also sets the file-level pragmas, exactly once at startup."""
     conn.executescript(SCHEMA)
     for table, column, kind in ADDED_COLUMNS:
         existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
         if column not in existing:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
+    # Journal mode and durability belong to the database file, not to a connection, and WAL persists
+    # once set — so this is done here rather than in connect(), which runs on every request.
+    if conn.execute("PRAGMA journal_mode").fetchone()[0] != "memory":
+        conn.execute("PRAGMA journal_mode = WAL")
+        # WAL with NORMAL is the usual pairing: an fsync at checkpoints rather than on every commit,
+        # which is a large throughput win under sustained ingest. A process crash stays safe; losing
+        # the last transactions is only possible on power loss or a kernel panic. Set FULL to refuse
+        # that trade.
+        conn.execute("PRAGMA synchronous = NORMAL")
     conn.execute(
         "INSERT INTO meta(key, value) VALUES ('schema_version', ?)"
         " ON CONFLICT(key) DO UPDATE SET value = excluded.value", (str(SCHEMA_VERSION),)
