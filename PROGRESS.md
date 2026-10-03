@@ -263,3 +263,83 @@ validate` passes on Caddy 2.6.2, the Debian 12 version, and `caddy fmt` reports 
   draft in the repo.
 - Rate-limit defaults suit a small public demo. Visitors behind one corporate NAT share a bucket. Raise
   `SIEM_RATE_PER_MIN` if that becomes a problem.
+
+## Linux collection agent (2026-10-03, `scripts/agent.py`)
+
+Goal: get *real* logs from a real Linux host into a running Watchpost, instead of only synthetic
+demo data. First step of a larger "deployable agent" effort; a Windows collector is not written yet.
+
+**Shipped**
+- `scripts/agent.py`: a stdlib-only collection agent. It **reuses `scripts/shipper.py`** for the whole
+  transport (tailing, rotation and truncation handling, atomic position file, batching,
+  exponential backoff, skipping refused batches, token from env/file, plain-HTTP guard) and adds:
+  - a source catalogue (`auth`, `firewall`, `web`, `audit`, `syslog`) whose paths are relative to a
+    `--log-dir` (default `/var/log`), with per-host availability detection and read-permission checks;
+  - stable, host-scoped source names (`<hostname>-auth`) that satisfy the server's
+    `normalize.validate_source` pattern;
+  - an **auditd line adapter**: raw `/var/log/audit/audit.log` records have no syslog prefix and the
+    server rejects them (`line is not in syslog format`), so the agent prefixes the envelope the
+    parser expects, using the record's own `msg=audit(<epoch>)` time. Non-records are dropped and
+    counted instead of poisoning a batch;
+  - `--list-sources`, `--dry-run`, and `--check` (a token probe that posts an empty body: the server
+    authenticates first, so `400 upload is empty` means the token is valid and nothing is stored);
+  - `--source syslog` deliberately **not** in `--source all`, plus a startup warning, because
+    rsyslog duplicates auth/firewall lines into syslog on Debian and Ubuntu and shipping both would
+    double every event and halve the effective detection thresholds.
+- `deploy/agent/`: `watchpost-agent.service` (unprivileged user in the `adm` group, `StateDirectory`
+  for the position file, sandboxed like the server unit), `agent.env.example`, and an idempotent
+  `install-agent.sh` (installs `agent.py` **and** `shipper.py` together, since the agent imports its
+  sibling; prompts for the token with hidden input; never overwrites an existing env file).
+- `docs/AGENT.md`: sources, quick start, CLI reference, the syslog overlap and auditd caveats,
+  security posture, a troubleshooting table, and honest limits. `README.md` and
+  `docs/LIVE_INGEST.md` now list the agent as the recommended third ingestion path.
+- `tests/test_agent.py`: 43 tests. The load-bearing ones assert **agreement with the server**: every
+  source's `format` is in `normalize.FORMATS`, and every line the agent produces is accepted by
+  `normalize.parse_payload` with the expected `event_type`. `tests/fixtures/logs/` holds committed
+  fixtures so these tests need no runtime temporary directory. Includes regressions for three real
+  bugs found while building (below).
+
+**Bugs found and fixed before shipping**
+- The transform map was keyed by host-scoped source name (`host01-audit`) while the catalogue is
+  keyed by source (`audit`), so the first run died with `KeyError`.
+- The auditd transform was stored unbound, so the first audit line died with
+  `TypeError: wrap_auditd() missing 1 required positional argument: 'hostname'`.
+- `--list-sources`/`--dry-run` ran the plain-HTTP guard first and failed on a purely local check
+  that sends no token; the guard now applies only when the agent is about to transmit.
+- Resolved paths mixed separators on Windows; they are normalized with `os.path.abspath`, matching
+  `shipper.parse_file_spec`.
+- `--check` sat *after* the "no sources available" guard, so on a host with no readable logs the
+  token was never probed and setup could not tell "wrong token" apart from "no sources". It now runs
+  before that guard, which is correct because it ships nothing.
+
+**Verification**
+- `python -m unittest tests.test_agent` → 43 tests OK (36 need no server; the 7 server-backed ones
+  need real temporary directories).
+- Verified against the owner's live server: `agent.py --check --allow-insecure-http` on
+  `http://192.168.8.178:8080` exited 0 with "token accepted by http://192.168.8.178:8080 (nothing
+  was stored)". That confirms the network path, the ingest token, and the probe against a real
+  deployment. It writes nothing: the probe posts an empty body, which the server rejects with
+  `400 upload is empty` *after* authenticating. No events were sent to the live instance.
+- No regressions: the **199 pre-existing tests fail on exactly the same 25 tests with and without
+  `scripts/agent.py` present** (Windows-only artifacts: `WinError 32` on temp-dir cleanup, the
+  `shipper.parse_file_spec` path-separator assertion, and a `charmap` decode). Those 25 are the
+  known Linux-verified suite failing on Windows, not new breakage.
+- End-to-end against a real server on an ephemeral port with a real ingest token: 5 sources
+  resolved; 22 events stored, all `synthetic=0`; event types confirmed as `auth_failure`×12,
+  `auth_success`, `privilege_use`/`privilege_escalation`, `user_created`, `fw_deny` (with
+  `dest_port=22`), `fw_allow`, `web_scan`×2, `web_request`, `process_start`, `file_access`; the
+  auditd non-record was dropped; a second run re-sent nothing (position file); and real detection
+  fired `brute_force_ip` (high) and `account_repeated_failures` (medium) on the shipped failures.
+- `bash -n` passes on `deploy/agent/install-agent.sh`.
+
+**Not done / notes for the owner**
+- The agent was not run on the real target host (`192.168.8.178`, Ubuntu 24.04). That needs the
+  owner's SSH access, an ingest token, and `sudo ./deploy/agent/install-agent.sh --url ...`.
+  `systemd-analyze verify` has not been run on the agent unit (no systemd on the build machine).
+- The target server is plain HTTP on a LAN, so the agent will refuse to send the token until
+  `WATCHPOST_AGENT_EXTRA_ARGS=--allow-insecure-http` is set in `/etc/watchpost-agent/agent.env`.
+  That is a deliberate opt-in; HTTPS in front of Watchpost is the better fix.
+- No journald source yet, so a stock Debian 12 (no rsyslog, no `/var/log/auth.log`) has nothing for
+  the `auth` source. Install rsyslog, or use the syslog listener.
+- No Windows collector, no local disk buffering during a long outage, and no smoke-check step for
+  the agent yet.

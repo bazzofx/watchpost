@@ -1,0 +1,64 @@
+# Watchpost agent unit: collect this host's logs and ship them to a Watchpost server.
+# Installed by deploy/agent/install-agent.sh to /etc/systemd/system/watchpost-agent.service
+# on a Debian 12 or Ubuntu 22.04+ log source. Re-installing overwrites this file; local
+# changes belong in /etc/watchpost-agent/agent.env instead.
+
+[Unit]
+Description=Watchpost log collection agent
+Documentation=file:///usr/local/share/doc/watchpost-agent/AGENT.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=watchpost-agent
+Group=watchpost-agent
+# URL, sources, log directory, and the ingest token live here (root:watchpost-agent 0640).
+# The token is never in this unit file and never on the command line.
+EnvironmentFile=/etc/watchpost-agent/agent.env
+Environment=PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+# ${VAR} is not word-split by systemd, so the comma list stays one argument; $VAR (unquoted)
+# is word-split, which is how the optional extra flags are passed through.
+ExecStart=/usr/bin/python3 /usr/local/bin/agent.py \
+    --url ${WATCHPOST_AGENT_URL} \
+    --source ${WATCHPOST_AGENT_SOURCES} \
+    --log-dir ${WATCHPOST_AGENT_LOG_DIR} \
+    --state /var/lib/watchpost-agent/positions.json \
+    $WATCHPOST_AGENT_EXTRA_ARGS
+Restart=always
+RestartSec=5
+# A restart must not replay the whole file: the position file is written after every accepted
+# batch, so at most the batches in flight are re-sent, and the server deduplicates nothing
+# (events are append-only), which is why the state file matters.
+
+# State: the position file, one byte offset per source.
+StateDirectory=watchpost-agent
+StateDirectoryMode=0750
+UMask=0077
+
+# Hardening. The agent only reads /var/log (via the adm group), writes its state directory,
+# and makes outbound TCP connections. Note: ProtectKernelLogs blocks the kernel ring buffer
+# syscalls, not reading /var/log/kern.log as a file, so the firewall source still works.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

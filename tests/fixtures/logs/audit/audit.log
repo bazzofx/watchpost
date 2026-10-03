@@ -1,0 +1,1 @@
+type=SYSCALL msg=audit(1760000000.123:4567): arch=c000003e syscall=59 success=yes exit=0 exe="/usr/bin/id" key="exec"

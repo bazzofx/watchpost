@@ -1,11 +1,16 @@
 # Live ingestion: point a Linux box at Watchpost
 
-Watchpost can take real logs as they are written, in two ways:
+Watchpost can take real logs as they are written, in three ways:
 
 | Path | Transport | Auth | Best for |
 |---|---|---|---|
+| **Agent** (`scripts/agent.py`) | HTTP(S) `POST /api/ingest/upload` | ingest-only API token | **a real Linux log source**; collects auth, firewall, web, and auditd with one command and one service. See [AGENT.md](AGENT.md) |
 | **Syslog listener** (`SIEM_SYSLOG=1`) | UDP or TCP syslog, RFC 3164 and RFC 5424 | none (address allow list only) | the Watchpost host itself, or boxes on a private network or SSH tunnel |
-| **File shipper** (`scripts/shipper.py`) | HTTPS `POST /api/ingest/upload` | ingest-only API token | any box, including over the internet behind HTTPS |
+| **File shipper** (`scripts/shipper.py`) | HTTPS `POST /api/ingest/upload` | ingest-only API token | any box, including over the internet behind HTTPS; a single file with no source catalogue |
+
+The agent is a superset of the shipper: it reuses the shipper's tailing, position file, and retry
+logic, and adds source detection, an auditd line adapter, and a systemd installer. Use the shipper
+directly when you know exactly which files you want and nothing else.
 
 Events from both paths are real, so they are stored with `synthetic=0`. They go through the same parsers as uploaded files: sshd and sudo lines become `auth_failure`, `auth_success`, `privilege_use`, and `privilege_escalation`; UFW/iptables lines become `fw_deny` and `fw_allow`; OpenVPN logins become `vpn_login`; nginx/Apache access lines become `web_request`, `web_scan`, and `web_error`. Detection runs on every batch.
 
@@ -118,6 +123,10 @@ RFC 3164 timestamps (`Sep 28 10:00:01`) have no year and no zone. Watchpost trea
 ---
 
 ## 2. File shipper
+
+To collect the usual Linux sources (auth.log, UFW, nginx, auditd) without listing `--file` flags by
+hand, use the agent instead — `sudo ./deploy/agent/install-agent.sh --url ...`, documented in
+[AGENT.md](AGENT.md). The rest of this section documents the shipper that the agent is built on.
 
 `scripts/shipper.py` is one file with no dependencies. It tails one or more files and posts complete new lines to `POST /api/ingest/upload` with an ingest token.
 

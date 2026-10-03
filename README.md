@@ -68,7 +68,7 @@ Then sign in as `admin`, open **Admin → Load synthetic demo data**, and follow
 ### Tests
 
 ```bash
-./run_tests.sh      # ~200 unit/integration tests + a 19-step end-to-end smoke check
+./run_tests.sh      # ~240 unit/integration tests + a 19-step end-to-end smoke check
 ```
 
 ### Replit
@@ -134,6 +134,7 @@ Caddy (Let's Encrypt, for a domain) or nginx (self-signed, for a bare IP) in fro
 | `watchpost/improve.py` | Scenario evaluation (TP/FN/FP, recall, precision), rule performance from analyst verdicts, heuristic suggestions, and two-person change review. |
 | `watchpost/syslog_listener.py` | Optional UDP/TCP syslog receiver (RFC 3164, RFC 5424, RFC 6587 framing). Runs each line through the auth.log parser, falls back to a generic `syslog` event with severity from PRI, and batches into the engine every 2 seconds. Reports itself as the `syslog` health component. |
 | `scripts/shipper.py` | Stdlib-only file tailer for Linux boxes: batches new lines to `/api/ingest/upload` with an ingest token, with backoff, rotation handling, and a position file. |
+| `scripts/agent.py` | Linux collection agent for real hosts: a catalogue of sources (auth, firewall, web, audit, syslog) with per-host availability detection, built on the shipper's transport, plus a systemd installer in `deploy/agent/`. See [docs/AGENT.md](docs/AGENT.md). |
 | `watchpost/simulate.py` | Labeled synthetic scenarios and a CLI that sends only to loopback unless you explicitly allow otherwise. |
 | `watchpost/report.py` | Incident and alert reports: one model (summary, timeline, entities, alerts with evidence, ATT&CK techniques by tactic, notes, recommended actions) rendered as Markdown or PDF. |
 | `watchpost/pdfwriter.py` | Minimal hand-written PDF 1.4 writer (Helvetica, wrapping, tables, page breaks, xref). |
@@ -234,10 +235,13 @@ labs/siem/
 ├── samples/            synthetic log files for upload
 ├── scripts/smoke.py    end-to-end smoke check against a real server process
 ├── scripts/shipper.py  log file shipper for Linux boxes (stdlib only)
+├── scripts/agent.py    Linux collection agent (auth, firewall, web, audit, syslog)
 ├── tests/              unittest suite
 ├── docs/API.md         API reference
 ├── docs/LIVE_INGEST.md syslog listener, rsyslog forwarding, and the file shipper
+├── docs/AGENT.md       the agent: sources, install, security, troubleshooting
 ├── deploy/             Debian 12 kit: systemd unit, install.sh, Caddyfile, nginx self-signed config
+├── deploy/agent/       agent kit: systemd unit, agent.env template, install-agent.sh
 ├── DEMO_SCRIPT.md      30-second shot list and 2-minute walkthrough
 ├── LINKEDIN.md         project entry, post, and honest limits
 └── PROGRESS.md         milestones, verification evidence, next steps
