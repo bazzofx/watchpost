@@ -23,6 +23,7 @@ TACTICS = [
 ]
 
 TECHNIQUES = {
+    "T1595": ("Active Scanning", "Reconnaissance"),
     "T1595.001": ("Active Scanning: Scanning IP Blocks", "Reconnaissance"),
     "T1595.002": ("Active Scanning: Vulnerability Scanning", "Reconnaissance"),
     "T1595.003": ("Active Scanning: Wordlist Scanning", "Reconnaissance"),
@@ -38,8 +39,10 @@ TECHNIQUES = {
     "T1110.001": ("Brute Force: Password Guessing", "Credential Access"),
     "T1110.003": ("Brute Force: Password Spraying", "Credential Access"),
     "T1046": ("Network Service Discovery", "Discovery"),
+    "T1083": ("File and Directory Discovery", "Discovery"),
     "T1530": ("Data from Cloud Storage", "Collection"),
     "T1048": ("Exfiltration Over Alternative Protocol", "Exfiltration"),
+    "T1499": ("Endpoint Denial of Service", "Impact"),
 }
 
 _TACTIC_ORDER = {name: i for i, (_, name) in enumerate(TACTICS)}

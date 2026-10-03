@@ -120,6 +120,90 @@ class WebAndFirewallRuleTests(unittest.TestCase):
         self.assertEqual(rules.firewall_port_sweep(make(no_port), p), [])
 
 
+def web(sec, path, ip="203.0.113.1", outcome="failure", event_type="web_request", status=404):
+    return ev(sec, event_type, None, ip, outcome=outcome, message=f"GET {path} -> {status}")
+
+
+class WebBehaviourRuleTests(unittest.TestCase):
+    """Breadth (path discovery) and volume (request burst) are separate signals on purpose."""
+
+    def test_path_discovery_needs_many_distinct_failing_paths(self):
+        p = params("web_path_discovery")
+        found = rules.web_path_discovery(make([web(i * 3, f"/dir{i}") for i in range(30)]), p)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["group_key"], "203.0.113.1")
+        self.assertIn("30 distinct paths", found[0]["explanation"])
+        self.assertIn("/dir0", found[0]["explanation"])
+        self.assertEqual(rules.web_path_discovery(make([web(i * 3, f"/dir{i}") for i in range(29)]), p), [])
+
+    def test_successful_browsing_is_not_discovery(self):
+        """Many distinct paths that all succeed is a crawl, not enumeration."""
+        p = params("web_path_discovery")
+        browsing = make([web(i * 3, f"/page{i}", outcome="success", status=200) for i in range(40)])
+        self.assertEqual(rules.web_path_discovery(browsing, p), [])
+
+    def test_repeating_one_path_is_not_discovery(self):
+        p = params("web_path_discovery")
+        self.assertEqual(rules.web_path_discovery(make([web(i, "/api/orders") for i in range(200)]), p), [])
+
+    def test_discovery_must_happen_inside_the_window(self):
+        """A patient walk across an hour is not a burst of enumeration."""
+        p = params("web_path_discovery")
+        self.assertEqual(rules.web_path_discovery(make([web(i * 120, f"/dir{i}") for i in range(30)]), p), [])
+
+    def test_a_known_scanner_can_be_ignored(self):
+        p = params("web_path_discovery", ignore_ips=["10.0.50.5"])
+        walk = make([web(i * 3, f"/dir{i}", ip="10.0.50.5") for i in range(40)])
+        self.assertEqual(rules.web_path_discovery(walk, p), [])
+
+    def test_nginx_error_log_probes_count_towards_discovery(self):
+        """Error lines carry a path and a failure outcome, so a host that only logs errors there
+        still gets breadth coverage."""
+        p = params("web_path_discovery")
+        errors = make([ev(i * 3, "web_error", None, outcome="failure",
+                          message=f"GET /dir{i} [error] access forbidden by rule") for i in range(30)])
+        self.assertEqual(len(rules.web_path_discovery(errors, p)), 1)
+
+    def test_lines_without_a_parseable_path_never_look_like_discovery(self):
+        p = params("web_path_discovery")
+        cert_failures = make([ev(i * 3, "web_error", None, outcome="failure",
+                                 message="[crit] SSL_do_handshake() failed, client: 198.51.100.9")
+                              for i in range(300)])
+        self.assertEqual(rules.web_path_discovery(cert_failures, p), [])
+
+    def test_burst_needs_volume_inside_the_window(self):
+        p = params("web_request_burst")
+        found = rules.web_request_burst(
+            make([web(i * 0.2, "/api/orders", outcome="success", status=200) for i in range(200)]), p)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["group_key"], "203.0.113.1")
+        self.assertIn("200 requests", found[0]["explanation"])
+        fewer = make([web(i * 0.2, "/api/orders", outcome="success", status=200) for i in range(199)])
+        self.assertEqual(rules.web_request_burst(fewer, p), [])
+
+    def test_a_spread_out_reader_is_not_a_burst(self):
+        p = params("web_request_burst")
+        spread = make([web(i * 5, "/index.html", outcome="success", status=200) for i in range(200)])
+        self.assertEqual(rules.web_request_burst(spread, p), [])
+
+    def test_the_rules_are_complementary_not_redundant(self):
+        """A fast narrow flood trips only volume; a slow wide walk trips only breadth."""
+        discovery, burst = params("web_path_discovery"), params("web_request_burst")
+        wide_and_slow = make([web(i * 3, f"/dir{i}") for i in range(36)])
+        self.assertEqual(len(rules.web_path_discovery(wide_and_slow, discovery)), 1)
+        self.assertEqual(rules.web_request_burst(wide_and_slow, burst), [])
+        fast_and_narrow = make([web(i * 0.25, "/health", outcome="success", status=200)
+                                for i in range(240)])
+        self.assertEqual(len(rules.web_request_burst(fast_and_narrow, burst)), 1)
+        self.assertEqual(rules.web_path_discovery(fast_and_narrow, discovery), [])
+
+    def test_a_known_heavy_client_can_be_ignored_for_bursts(self):
+        p = params("web_request_burst", ignore_ips=["10.0.1.9"])
+        flood = make([web(i * 0.2, "/health", ip="10.0.1.9", outcome="success", status=200)
+                      for i in range(240)])
+        self.assertEqual(rules.web_request_burst(flood, p), [])
+
+
 class GeoLoginRuleTests(unittest.TestCase):
     def test_impossible_travel(self):
         p = params("impossible_geo_login")

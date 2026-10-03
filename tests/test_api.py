@@ -5,6 +5,11 @@ from datetime import timedelta
 
 from tests.helpers import ADMIN_PW, ServerTestCase
 from watchpost.db import iso, utcnow
+from watchpost.rules import DEFAULT_RULES
+
+# Kept as a set rather than a hard-coded number: the rule count changes when a rule is added,
+# and this test is about the API returning every rule with its techniques, not about the count.
+DEFAULT_RULE_IDS = {rule["id"] for rule in DEFAULT_RULES}
 
 
 def recent(minutes_ago=30):
@@ -252,7 +257,7 @@ class IncidentApiTests(ServerTestCase):
     def test_attack_coverage_and_rule_techniques(self):
         analyst = self.client("analyst")
         rules = analyst.get("/api/rules")[1]
-        self.assertEqual(len(rules), 11)
+        self.assertEqual(len(rules), len(DEFAULT_RULE_IDS))
         for rule in rules:
             with self.subTest(rule=rule["id"]):
                 self.assertTrue(rule["techniques"])

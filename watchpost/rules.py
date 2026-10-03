@@ -11,6 +11,8 @@ Rules are deliberately simple, threshold-based, and explainable. No machine lear
 
 from collections import Counter, defaultdict, deque
 
+import re
+
 from . import geo
 from .attack import techniques
 from .db import parse_iso
@@ -82,6 +84,34 @@ DEFAULT_RULES = [
         "params": {"threshold": 5, "window_seconds": 300, "ignore_ips": [], "ignore_users": []},
     },
     {
+        "id": "web_path_discovery",
+        "name": "Brute-force path discovery on the web server",
+        "description": "Fires when one source IP requests at least `distinct_paths` different paths within "
+                       "`window_seconds` and at least `min_failure_percent` of those requests did not "
+                       "succeed. That combination is what directory and file enumeration looks like: a "
+                       "wordlist walk over /admin, /backup, /uploads and so on, nearly all of them 404. "
+                       "Ordinary browsing asks for a handful of known paths and mostly succeeds, so it "
+                       "does not reach the threshold. Catches enumeration that never touches a path in "
+                       "web_scanner's pattern list, which is most of it.",
+        "techniques": techniques("T1083", "T1595"),
+        "severity": "medium",
+        "params": {"distinct_paths": 30, "min_failure_percent": 70, "window_seconds": 300,
+                   "ignore_ips": [], "ignore_users": []},
+    },
+    {
+        "id": "web_request_burst",
+        "name": "Rapid request burst from one IP",
+        "description": "Fires when one source IP sends at least `threshold` requests to the web server "
+                       "within `window_seconds`. A person clicking through a site, or a browser loading "
+                       "one page and its assets, does not sustain a rate like this; a flood, a fast "
+                       "scanner, or credential stuffing against a login form does. Complements "
+                       "web_path_discovery: this one catches volume, that one catches breadth, so a "
+                       "patient attacker is caught by the other rule.",
+        "techniques": techniques("T1499"),
+        "severity": "medium",
+        "params": {"threshold": 200, "window_seconds": 60, "ignore_ips": [], "ignore_users": []},
+    },
+    {
         "id": "firewall_port_sweep",
         "name": "Port sweep blocked by the firewall",
         "description": "Fires when the firewall denies one source IP on at least `distinct_ports` different "
@@ -148,6 +178,8 @@ PARAM_SCHEMA = {
     "ignore_users": ("list", 0, 500),
     "privileged_users": ("list", 1, 500),
     "distinct_ports": ("int", 2, 65536),
+    "distinct_paths": ("int", 3, 100000),
+    "min_failure_percent": ("int", 1, 100),
     "max_speed_kmh": ("int", 100, 50000),
     "min_distance_km": ("int", 1, 20000),
     "escalation_seconds": ("int", 10, 86400),
@@ -367,9 +399,26 @@ def off_hours_privileged_login(events, params):
     return findings
 
 
+# Event types the web parsers produce: the combined access log and the nginx error log.
+WEB_TYPES = ("web_request", "web_scan", "web_error")
+
+# Both web parsers begin the message with "METHOD PATH": the access parser appends " -> STATUS",
+# the nginx error parser appends " [level]". Rules read path and status from here because the
+# events table has no dedicated columns for them.
+_WEB_MESSAGE = re.compile(r"^(?P<method>[A-Z]{3,10}) (?P<path>\S+?)(?: -> (?P<status>\d{3}))?(?=\s|$)")
+
+
+def _web_request(event):
+    """(method, path, status) from a web event's message. Any piece that is absent comes back None."""
+    match = _WEB_MESSAGE.match(event.get("message") or "")
+    if match is None:
+        return None, None, None
+    status = match.group("status")
+    return match.group("method"), match.group("path"), int(status) if status else None
+
+
 def _request_path(event):
-    parts = (event.get("message") or "").split()
-    return parts[1] if len(parts) > 1 else "?"
+    return _web_request(event)[1] or "?"
 
 
 def web_scanner(events, params):
@@ -385,6 +434,57 @@ def web_scanner(events, params):
                 f"{ip} sent {len(cluster)} scanner-like requests between {cluster[0]['ts']} and "
                 f"{cluster[-1]['ts']} ({len(paths)} distinct paths, e.g. {top}). "
                 f"Threshold: {threshold} within {window}s.",
+            ))
+    return findings
+
+
+def web_path_discovery(events, params):
+    """Directory and file brute force: one client asking for many paths that mostly do not exist.
+
+    Two conditions together, because either alone is normal: many *distinct* paths (browsing
+    repeats a few known ones) that mostly *failed* (a site crawl succeeds). Events are counted
+    per path, so the same request recorded in both access.log and error.log does not inflate the
+    path count the way it would inflate an event count.
+    """
+    needed, window = params["distinct_paths"], params["window_seconds"]
+    percent = params["min_failure_percent"]
+    findings = []
+    web = [e for e in _filtered(events, params, WEB_TYPES) if _web_request(e)[1]]
+    for ip, group in _group(web, "src_ip").items():
+        def qualifies(scope):
+            if len({_web_request(e)[1] for e in scope}) < needed:
+                return False
+            failed = sum(1 for e in scope if e.get("outcome") == "failure")
+            return failed * 100 >= percent * len(scope)
+
+        for cluster in _clusters(group, window, qualifies):
+            paths = sorted({_web_request(e)[1] for e in cluster})
+            samples = ", ".join(paths[:8]) + (" …" if len(paths) > 8 else "")
+            findings.append(_finding(
+                ip, cluster,
+                f"Path discovery from {ip}: {len(paths)} distinct paths",
+                f"{ip} asked for {len(paths)} different paths in {len(cluster)} request(s) between "
+                f"{cluster[0]['ts']} and {cluster[-1]['ts']}, and at least {percent}% of those requests "
+                f"did not succeed — the shape of directory and file enumeration rather than browsing. "
+                f"Paths included: {samples}. Threshold: {needed} distinct paths within {window}s.",
+            ))
+    return findings
+
+
+def web_request_burst(events, params):
+    """Volumetric: one client sending far more requests than a person or a browser would."""
+    threshold, window = params["threshold"], params["window_seconds"]
+    findings = []
+    for ip, group in _group(_filtered(events, params, WEB_TYPES), "src_ip").items():
+        for cluster in _clusters(group, window, lambda scope: len(scope) >= threshold):
+            paths = {_web_request(e)[1] for e in cluster} - {None}
+            findings.append(_finding(
+                ip, cluster,
+                f"Request burst from {ip}: {len(cluster)} requests",
+                f"{ip} sent {len(cluster)} requests between {cluster[0]['ts']} and {cluster[-1]['ts']} "
+                f"across {len(paths)} distinct path(s), meeting the threshold of {threshold} within "
+                f"{window}s. Rates like this are automated: a flood, a fast scanner, or credential "
+                f"stuffing against a login form. Add known heavy clients to ignore_ips.",
             ))
     return findings
 
@@ -530,6 +630,8 @@ RULE_FUNCTIONS = {
     "success_after_failures": success_after_failures,
     "off_hours_privileged_login": off_hours_privileged_login,
     "web_scanner": web_scanner,
+    "web_path_discovery": web_path_discovery,
+    "web_request_burst": web_request_burst,
     "firewall_port_sweep": firewall_port_sweep,
     "impossible_geo_login": impossible_geo_login,
     "privilege_escalation_after_login": privilege_escalation_after_login,

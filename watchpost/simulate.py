@@ -133,6 +133,53 @@ def port_sweep(day, rng):
     return events
 
 
+# Folder and file names a content-discovery wordlist would try. Deliberately none of these is a
+# substring of a SCAN_PATHS entry, so this scenario exercises web_path_discovery without also
+# tripping web_scanner: the point is enumeration that the scanner-pattern rule cannot see.
+DISCOVERY_PATHS = [
+    "/admin", "/administrator", "/backup", "/backups", "/old", "/test", "/dev", "/staging",
+    "/private", "/tmp", "/logs", "/db", "/database", "/sql", "/uploads", "/files",
+    "/download", "/downloads", "/config", "/settings", "/setup", "/install", "/portal",
+    "/intranet", "/internal", "/staff", "/users", "/accounts", "/reports", "/export",
+    "/api/v1/users", "/api/v2/orders", "/v1", "/docs", "/swagger", "/metrics",
+]
+
+
+def path_discovery(day, rng):
+    """One client walking a folder wordlist: many distinct paths, nearly all 404."""
+    ip, start = "203.0.113.61", _at(day, 13, 10)
+    events = [_event(start + timedelta(seconds=i * 3 + rng.randint(0, 2)), "path_discovery",
+                     "web_request", None, ip, outcome="failure", bytes=146,
+                     message=f"GET {path} -> 404 [SYNTHETIC] directory enumeration")
+              for i, path in enumerate(DISCOVERY_PATHS)]
+    # Enumeration finds something every so often.
+    events.append(_event(start + timedelta(seconds=45), "path_discovery", "web_request", None, ip,
+                         outcome="failure", bytes=153,
+                         message="GET /uploads -> 403 [SYNTHETIC] directory listing denied"))
+    # Ordinary readers alongside: a few known paths, all successful. These must not alert.
+    for i, path in enumerate(["/", "/pricing", "/docs", "/about", "/pricing", "/"]):
+        events.append(_event(start + timedelta(seconds=i * 20), "path_discovery", "web_request",
+                             None, f"10.0.1.{40 + i}", outcome="success", bytes=8400,
+                             message=f"GET {path} -> 200 [SYNTHETIC] normal browsing"))
+    return events
+
+
+def request_burst(day, rng):
+    """One client hammering a few URLs: high volume, almost no path variety."""
+    ip, start = "198.51.100.77", _at(day, 11, 20)
+    paths = ["/api/orders", "/api/orders/1", "/health"]
+    events = [_event(start + timedelta(milliseconds=150 * i), "request_burst", "web_request", None, ip,
+                     outcome="success", bytes=512,
+                     message=f"GET {paths[i % len(paths)]} -> 200 [SYNTHETIC] rapid sequence")
+              for i in range(240)]
+    # A reader loading one page and its assets: bursty, but nowhere near the threshold.
+    for i in range(40):
+        events.append(_event(start + timedelta(seconds=i * 0.5), "request_burst", "web_request", None,
+                             "10.0.1.55", outcome="success", bytes=2048,
+                             message=f"GET /assets/{i % 8}.png -> 200 [SYNTHETIC] page load"))
+    return events
+
+
 def impossible_travel(day, rng):
     return [
         _event(_at(day, 9, 0), "impossible_travel", "auth_success", "erin", "10.0.1.24", host="mail01",
@@ -224,6 +271,16 @@ SCENARIOS = {
     "exfiltration": {"build": exfiltration, "malicious": True,
                      "expected": {"data_exfil_volume": "svc-deploy-tmp"},
                      "description": "About 2 GB read from cloud storage in 10 minutes; normal report reads alongside."},
+    # Appended last so the seeded rng sequence for the scenarios above is unchanged.
+    "path_discovery": {"build": path_discovery, "malicious": True,
+                       "expected": {"web_path_discovery": "203.0.113.61"},
+                       "description": "One client walks 37 folder names in under three minutes, almost all "
+                                      "404. None of the paths is a known scanner signature, so web_scanner "
+                                      "stays quiet and only the breadth rule fires."},
+    "request_burst": {"build": request_burst, "malicious": True,
+                      "expected": {"web_request_burst": "198.51.100.77"},
+                      "description": "One client sends 240 requests in 36 seconds to three URLs, while a "
+                                     "reader loads a page and its assets alongside."},
 }
 
 

@@ -22,8 +22,9 @@ detection pipeline works from the raw log line to the incident report.
 - **Ingest:** Linux auth.log, Windows Security events, nginx/Apache access logs, firewall and VPN logs, and
   CloudTrail-style cloud audit records. Logs arrive through a token-authenticated API, file upload, a live syslog
   listener (UDP/TCP, RFC 3164/5424), or a file-tailing shipper. Everything is normalized into one schema in SQLite.
-- **Detect:** eleven explainable rules (brute force, password spray, web scanning, port sweeps, impossible travel,
-  privilege escalation after a suspicious login, IAM changes by new principals, data exfiltration volume, and more).
+- **Detect:** thirteen explainable rules (brute force, password spray, web scanning, directory brute force, request
+  floods, port sweeps, impossible travel, privilege escalation after a suspicious login, IAM changes by new
+  principals, data exfiltration volume, and more).
   Each one maps to MITRE ATT&CK techniques.
 - **Correlate:** related alerts are chained into incidents by shared IP, account, or host, with a kill-chain stage
   list. Severity escalates when an incident spans three or more ATT&CK tactics.

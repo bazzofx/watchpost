@@ -480,3 +480,63 @@ classified into `web_request`/`web_scan`/`web_error` by `normalize.classify_web_
 - `nginx_error` is not wired into the syslog listener, which tries `authlog` then `weblog` on a
   forwarded frame. Forwarding `error_log syslog:...` would land those lines as generic `syslog`
   events. Only matters for hosts that forward rather than tail.
+
+## Web attack rules: path discovery and request bursts (2026-10-03)
+
+Goal: detect web attacks from the nginx logs now arriving, starting with the two the owner asked
+for — brute-force path discovery and rapid request sequences — plus a plan for the rest.
+
+**The gap that motivated this**
+`web_scanner` only counts requests whose **path or user agent matches a known signature**
+(`SCAN_PATHS`, `_SCAN_PATTERN`, `_SCANNER_AGENT`). A wordlist walk over `/admin`, `/backup`,
+`/uploads`, `/config` matches none of those, and `classify_web_request` labels such a request
+`web_request`, so a directory brute-force of a few hundred paths was simply invisible.
+
+**Shipped — two new rules (13 total, up from 11)**
+- **`web_path_discovery`** (medium): one IP asks for ≥ `distinct_paths` (30) different paths within
+  `window_seconds` (300) **and** ≥ `min_failure_percent` (70) of those requests failed. Two conditions
+  because either alone is normal: browsing repeats a few known paths, and a site crawl succeeds. The
+  metric is a **set of paths**, so one probe recorded in both access.log and error.log cannot inflate
+  it the way it would inflate an event count. Mapped to **T1083** (File and Directory Discovery) and
+  **T1595** (Active Scanning).
+- **`web_request_burst`** (medium): one IP sends ≥ `threshold` (200) requests within
+  `window_seconds` (60), whatever the paths. Mapped to **T1499** (Endpoint Denial of Service).
+- Both are deliberate complements: breadth catches a patient scanner, volume catches a fast one, and
+  a test asserts neither substitutes for the other.
+- `rules.py` gained `_web_request(event) -> (method, path, status)`, parsing the leading
+  `METHOD PATH [-> STATUS]` that **both** web parsers write into the message, so the new rules need
+  no schema change. `_request_path` now delegates to it.
+- `attack.py` catalog grew 17 → 20 techniques (`T1595`, `T1083`, `T1499`), all referenced by rules
+  and within the 15–25 bound the catalog test enforces.
+- Two labeled scenarios: `path_discovery` (37 folder names, all 404/403, none matching a scanner
+  signature, plus four normal readers that must stay quiet) and `request_burst` (240 requests in 36 s
+  across three URLs, plus a 40-request page load that must stay quiet). Appended **last** in
+  `SCENARIOS` so the seeded rng sequence for existing scenarios is unchanged.
+- New params in `PARAM_SCHEMA`: `distinct_paths` (3–100000) and `min_failure_percent` (1–100).
+- `docs/WEB_DETECTION.md`: the OWASP Top 10 mapped onto what nginx logs can and cannot show (five of
+  the ten are genuinely observable), the planned tier-1 and tier-2 rules, and the honest note that
+  Watchpost detects rather than mitigates — blocking belongs in nginx (`limit_req`, `deny`, CRS).
+
+**Verification**
+- `tests/test_rules.py`: 32 tests OK (+11): threshold boundaries, successful browsing and repeated
+  single-path requests must not look like discovery, the window must be honoured, allow-listing,
+  nginx error lines counting towards breadth, status-less error lines never counting, burst
+  boundaries, a spread-out reader, and the complementarity test.
+- The project's own evaluation over all 15 labeled scenarios: **every one of the 13 rules has
+  recall 1.0 and 0 misses**; the two new rules detect exactly their scenario with **0 false
+  positives**; and the new scenarios introduce **no** false positives for any existing rule. The only
+  false positives anywhere remain the two intentional `noisy_scanner` ones.
+- No regressions: **305 tests**, the **same 25 pre-existing Windows-only failures**, empty diff of
+  the failure sets.
+- `test_api.py` no longer hard-codes the rule count (it compares against `rules.DEFAULT_RULES`), and
+  `scripts/smoke.py` now expects the two new rules among those that fire.
+
+**Not done / notes for the owner**
+- **`http_status` column not added yet.** This is the top recommendation in
+  `docs/WEB_DETECTION.md`: rules that must tell 401 from 403 from 404, or alert on a **2xx for
+  `/.env`**, cannot be written properly while the status only lives inside the message text. The name
+  must be `http_status`, because `FIELD_ALIASES` already maps `status` onto `outcome`.
+- Neither rule is wired into the storyline replay, and the two new rules are not yet mapped in any
+  incident narrative.
+- `web_request_burst` is the rule most likely to need tuning on a busy site; it is medium severity
+  and reviewed-change only, like every other threshold.

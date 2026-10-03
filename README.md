@@ -16,7 +16,7 @@ It uses only the Python standard library (3.10+). No packages to install, no pai
 
 | Workstream | What it adds |
 |---|---|
-| **A · Correlation and MITRE ATT&CK** | Parsers for nginx/Apache access logs, firewall/VPN, CloudTrail-style cloud audit, and host sudo/process events. Six new rules (eleven in total), each mapped to techniques from a static 17-technique ATT&CK subset. Alerts that share an IP, account, or host are correlated into **incidents** with kill-chain stages, and severity is escalated at 3+ tactics. Adds `GET /api/attack/coverage`. |
+| **A · Correlation and MITRE ATT&CK** | Parsers for nginx/Apache access logs, firewall/VPN, CloudTrail-style cloud audit, and host sudo/process events. Six new rules (thirteen in total), each mapped to techniques from a static 20-technique ATT&CK subset. Alerts that share an IP, account, or host are correlated into **incidents** with kill-chain stages, and severity is escalated at 3+ tactics. Adds `GET /api/attack/coverage`. |
 | **B · SOC dashboard** | A dark command-center view with a status strip, an attacker map (inline SVG, **synthetic geo** only), a live event stream over **Server-Sent Events** (`/api/stream`, with a polling fallback), alerts over time, top attacker IPs, an ATT&CK heat matrix, an incident board, and health. No JS libraries. |
 | **D · Incident reports** | One-click **Markdown and PDF** reports for incidents and alerts, with a timeline, entities, techniques by tactic, evidence, notes, and recommended actions per technique. The PDF writer is hand-written PDF 1.4. |
 | **E · Live ingestion** | A UDP/TCP **syslog listener** (RFC 3164/5424) and `scripts/shipper.py`, a file tailer that posts to the ingest API with a token. See [docs/LIVE_INGEST.md](docs/LIVE_INGEST.md). |
@@ -126,7 +126,7 @@ Caddy (Let's Encrypt, for a domain) or nginx (self-signed, for a bare IP) in fro
 | `watchpost/correlate.py`, `watchpost/incidents.py` | Pure alert-to-incident grouping; incident queries, status changes, and ATT&CK coverage. |
 | `watchpost/agents.py` | The collection-agent fleet, derived from `ingest_batches.submitted_by` (`token:<name>`): each agent's hostname, log sources, provisioning date, and how recently logs arrived. |
 | `watchpost/attack.py`, `watchpost/geo.py` | Static ATT&CK subset; synthetic geo table for demo IP ranges (never a real lookup). |
-| `watchpost/rules.py` | Eleven threshold rules as pure functions over event lists, each with a plain-English explanation. Also validates rule parameters. |
+| `watchpost/rules.py` | Thirteen threshold rules as pure functions over event lists, each with a plain-English explanation. Also validates rule parameters. |
 | `watchpost/engine.py` | Stores each batch atomically, then runs detection over the batch's time range plus the longest rule window. Deduplicates and extends open alerts, and records every detection run. |
 | `watchpost/queries.py` | Event search (parameterized SQL), alert detail with evidence and a related-events timeline, notes, status changes, and SOC metrics. |
 | `watchpost/auth.py` | PBKDF2-SHA256 password hashing, lockout, and server-side sessions (only token hashes are stored). Also ingest-only API tokens (hashed) and the viewer < analyst < admin roles. Viewers are read-only: the server refuses every non-GET request from them except logout. |
@@ -157,13 +157,17 @@ Caddy (Let's Encrypt, for a domain) or nginx (self-signed, for a bare IP) in fro
 | `success_after_failures` | a successful login follows ≥ 5 failures for that account within 600 s | critical |
 | `off_hours_privileged_login` | `root`/`admin`/`administrator` logs in outside 08:00–18:00 UTC on weekdays, or at any time on weekends | medium |
 | `web_scanner` | ≥ 5 scanner-like web requests (`/.env`, `/wp-login.php`, injection strings, scanner agents) from one IP within 300 s | medium |
+| `web_path_discovery` | one IP asks for ≥ 30 distinct paths within 300 s and ≥ 70 % of those requests failed — directory/file brute force, which `web_scanner`'s signature list cannot see | medium |
+| `web_request_burst` | one IP sends ≥ 200 requests within 60 s — a flood, a fast scanner, or credential stuffing, regardless of which paths it asks for | medium |
 | `firewall_port_sweep` | the firewall denies one IP on ≥ 10 distinct ports within 300 s | medium |
 | `impossible_geo_login` | one account logs in from two places ≥ 500 km apart faster than 900 km/h (synthetic geo table only) | high |
 | `privilege_escalation_after_login` | sudo/su/runas within 30 min of a login that followed ≥ 3 failures | critical |
 | `cloud_iam_change_by_new_principal` | an IAM change by a cloud principal with no activity in the previous 24 h | high |
 | `data_exfil_volume` | one account (or IP) moves ≥ 1 GB out, or makes ≥ 100 cloud data reads, within 1 h | high |
 
-Every rule maps to MITRE ATT&CK techniques from a small static catalog (`watchpost/attack.py`, 17 techniques, no network fetch). `GET /api/attack/coverage` shows which techniques are covered and how often they fired.
+Every rule maps to MITRE ATT&CK techniques from a small static catalog (`watchpost/attack.py`, 20 techniques, no network fetch). `GET /api/attack/coverage` shows which techniques are covered and how often they fired.
+
+Web attacks are the fastest-growing part of the rule set; [docs/WEB_DETECTION.md](docs/WEB_DETECTION.md) maps the OWASP Top 10 onto what nginx logs can and cannot show, and lists the rules planned next.
 
 ### Incidents (correlation)
 
@@ -223,7 +227,7 @@ Admin → "Attack storyline (synthetic)" replays a scripted six-stage intrusion 
 
 ## What is real vs. synthetic vs. future
 
-**Real, working, and tested:** everything in the architecture section. That includes the ingestion API and file upload, normalization, persistence, search, the eleven rules, ATT&CK mapping and coverage, incident correlation, Markdown and PDF reports, the SSE dashboard, the syslog listener and shipper, alerts with evidence and timelines, notes, status and verdicts, metrics, health checks and recovery, authentication, roles (including the read-only viewer), per-IP rate limiting, CSRF protection, API tokens, redaction, feedback-driven suggestions, two-person review, evaluation history, and the audit log.
+**Real, working, and tested:** everything in the architecture section. That includes the ingestion API and file upload, normalization, persistence, search, the thirteen rules, ATT&CK mapping and coverage, incident correlation, Markdown and PDF reports, the SSE dashboard, the syslog listener and shipper, alerts with evidence and timelines, notes, status and verdicts, metrics, health checks and recovery, authentication, roles (including the read-only viewer), per-IP rate limiting, CSRF protection, API tokens, redaction, feedback-driven suggestions, two-person review, evaluation history, and the audit log.
 
 **Synthetic:** all bundled data. The demo dataset and simulator scenarios (`watchpost/simulate.py`) and the files in `samples/` are invented. External IPs come from the RFC 5737 documentation ranges. Synthetic events are stored with `synthetic=1`, sourced `demo:*`, and tagged in the UI. The evaluation scores (recall and precision) measure the rules against these hand-labeled scenarios only. They say nothing about real-world accuracy.
 
@@ -255,6 +259,7 @@ labs/siem/
 ├── docs/API.md         API reference
 ├── docs/LIVE_INGEST.md syslog listener, rsyslog forwarding, and the file shipper
 ├── docs/AGENT.md       the agent: sources, install, security, troubleshooting
+├── docs/WEB_DETECTION.md  OWASP Top 10 vs nginx logs, and the planned web rules
 ├── deploy/             Debian 12 kit: systemd unit, install.sh, Caddyfile, nginx self-signed config
 ├── deploy/agent/       agent kit: systemd unit, agent.env template, install-agent.sh
 ├── DEMO_SCRIPT.md      30-second shot list and 2-minute walkthrough
