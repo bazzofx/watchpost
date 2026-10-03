@@ -165,6 +165,37 @@ set_env_value() {
     rm -f "$tmp"
 }
 
+# The value a KEY holds in the env file, or nothing if it is absent. Used for messages, so they can
+# name what the service will actually use rather than what this command line asked for -- and so a
+# setting that lives only in the env file is never referenced as a shell variable, which under
+# `set -u` would abort the script with a bare "unbound variable".
+env_value() {
+    sed -n "s|^$1=||p" "$ENV_FILE" | head -n 1
+}
+
+# How long to wait for the unit to come up before calling it a failure. `systemctl restart` returns
+# as soon as the process has been spawned, so a service that dies during startup can look started
+# for a moment and a slow host can look dead. Polling beats a fixed sleep at both ends: nothing is
+# reported until the state has settled, and a service that is already up costs no delay at all.
+SERVICE_WAIT_SECONDS=10
+
+# Prints the last state systemctl reported, so a failure can say *how* it is not running
+# ("failed", "activating", "inactive") rather than just that it is not. The budget is read with a
+# default rather than assumed: under `set -u` a missing assignment would otherwise abort the script
+# with a bare "unbound variable", which is exactly how the token check died on the first real run.
+wait_for_service() {
+    local budget="${SERVICE_WAIT_SECONDS:-10}" waited=0 state=""
+    while [ "$waited" -lt "$budget" ]; do
+        state="$(systemctl is-active "$SERVICE" 2>/dev/null || true)"
+        if [ "$state" = "active" ]; then
+            break
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    printf '%s' "${state:-unknown}"
+}
+
 # Say so when an option cannot be applied because the env file already owns that setting, instead
 # of appearing to accept it and quietly using the old value. A silently ignored --url is how a
 # service ends up shipping to the wrong place after a "successful" install.
@@ -173,7 +204,7 @@ warn_if_ignored() {
     if [ -z "$supplied" ]; then
         return 0
     fi
-    current="$(sed -n "s|^${key}=||p" "$ENV_FILE" | head -n 1)"
+    current="$(env_value "$key")"
     if [ "$current" = "$supplied" ]; then
         return 0
     fi
@@ -498,11 +529,15 @@ else
     warn "could not list sources as $SERVICE_USER (check that /var/log is readable)"
 fi
 
-sleep 2
-if systemctl is-active --quiet "$SERVICE"; then
+# Poll rather than sleep a fixed amount: `systemctl restart` has already returned by now, but the
+# unit may still be settling, and a hard-coded sleep is either too short for a slow host or wasted
+# time on a fast one.
+service_state="$(wait_for_service)"
+if [ "$service_state" = "active" ]; then
     log "$SERVICE is running"
 else
-    warn "$SERVICE is not running. Recent log lines:"
+    warn "$SERVICE is not active after ${SERVICE_WAIT_SECONDS:-10}s (systemctl reports '$service_state')."
+    warn "Recent log lines:"
     journalctl -u "$SERVICE" -n 20 --no-pager >&2 || true
 fi
 
@@ -515,14 +550,25 @@ fi
 
 if grep -Eq '^WATCHPOST_AGENT_TOKEN=wp_' "$ENV_FILE"; then
     log "verifying the token against the configured URL (writes nothing)"
+    # `set -a` is load-bearing. Sourcing the env file assigns *shell* variables, and a shell
+    # variable is not part of the environment, so the python3 child would see no
+    # WATCHPOST_AGENT_TOKEN at all and report "no ingest token" for a token that is perfectly
+    # good. It also matters that the flag list is word-split here and that the URL comes from the
+    # file, since that is what the service will use. systemd's EnvironmentFile= does export these,
+    # so only this check was ever affected -- the service itself was fine.
     if sudo -u "$SERVICE_USER" bash -c \
-        '. "$1"; exec python3 "$2" --url "$WATCHPOST_AGENT_URL" $WATCHPOST_AGENT_EXTRA_ARGS --check' \
+        'set -a; . "$1"; set +a; exec python3 "$2" --url "$WATCHPOST_AGENT_URL" $WATCHPOST_AGENT_EXTRA_ARGS --check' \
         _ "$ENV_FILE" "$BIN_DIR/agent.py"; then
         log "the server accepted the agent's token"
     else
-        warn "the token check failed. Until this passes the agent cannot ingest:"
-        warn "  - a 401/403 means the token is wrong or revoked: create a new one under Admin > API tokens"
-        warn "  - a connection error means nothing is listening on $WATCHPOST_AGENT_URL"
+        checked_url="$(env_value WATCHPOST_AGENT_URL)"
+        warn "the token check did not pass. Which line appeared above decides what it means:"
+        warn "  - 'no ingest token' means this script failed to hand the token to the agent, not that"
+        warn "    the token is bad: the service reads $ENV_FILE itself, so check Agents in Watchpost"
+        warn "    before changing anything here."
+        warn "  - 401 or 403 means the token really is wrong or revoked: create a new one under"
+        warn "    Admin > API tokens."
+        warn "  - a connection error means nothing is listening on ${checked_url:-$URL}."
     fi
 else
     warn "skipping the token check: no wp_ token is set in $ENV_FILE"

@@ -865,3 +865,92 @@ did.
   in that detached line are deliberately **not** carried across; they still exist in the dangling
   commit `49488ad` if anyone ever cherry-picks it.
 
+### The first real install, and the two bugs it exposed (2026-10-03)
+
+The installer was run for the first time on a real host (AiSwarm) after this work was pushed. It
+installed the service correctly, then failed at the last step and died with
+
+```
+2026-10-03T23:23:57 agent: no ingest token: set $WATCHPOST_AGENT_TOKEN or pass --token-file (tokens start with wp_)
+!!! the token check failed. Until this passes the agent cannot ingest:
+./install-agent.sh: line 525: WATCHPOST_AGENT_URL: unbound variable
+```
+
+Two separate faults, and the second is the reason the first was confusing rather than obvious.
+
+1. **The token check never gave the token to the agent.** The child shell ran `. "$1"` to read the env
+   file. Sourcing a file assigns **shell variables**, and a shell variable is not part of the
+   environment, so the `python3` child saw no `WATCHPOST_AGENT_TOKEN` at all and reported it missing --
+   for a token that was present, `wp_`-prefixed, and fine. **systemd's `EnvironmentFile=` does export
+   its values**, so the service itself was working the whole time; only the installer's own
+   verification was wrong. Fixed with `set -a` around the source, so the child inherits the file.
+   As with every false negative, the danger was the opposite of the symptom: a correct install was
+   being reported as "the agent cannot ingest".
+2. **`$WATCHPOST_AGENT_URL` was referenced as if it were a shell variable.** It exists only in the env
+   file, so under `set -u` the message that was supposed to explain the failure aborted the script
+   instead -- which also swallowed the closing "done. To confirm data is arriving..." guidance. Replaced
+   with a new `env_value KEY` helper that reads the setting out of the file, so messages can name what
+   the service will actually use without pretending the installer holds it. `warn_if_ignored` now uses
+   the same helper instead of repeating the `sed`.
+   This one was found by auditing **every** `WATCHPOST_AGENT_*` reference in the script: exactly two
+   were inside single-quoted child payloads (correct, expanded by the child after sourcing) and exactly
+   one was at top level, at line 525. The grep is the check.
+
+**Reproduced before fixing, then verified after**, with the child payload extracted *out of the script*
+and run against the real `agent.py` and an env file shaped like the one on AiSwarm:
+
+```
+BEFORE:  agent: no ingest token: set $WATCHPOST_AGENT_TOKEN ...   [exit 2]
+AFTER:   agent: could not reach http://127.0.0.1:1: URLError ...  [exit 2]
+```
+
+The "after" line is the proof: the token was read, and the only remaining failure was the connection --
+which is what a check against a port with nothing listening should say.
+
+**Made permanent.** `tests/test_agent.py` now has `InstallerChildPayloadTests`, which extracts that
+payload from `install-agent.sh` and runs it against a real `agent.py`, asserting the output never says
+"no ingest token". It is skipped unless `os.name == "posix"`, because a `bash` on Windows is a
+different filesystem namespace -- so it runs on the deployment target and skips on this dev box, where
+it was instead verified by hand with the reproduction above. A second assertion pins the deliberate
+asymmetry: the `--list-sources` payload must **not** use `set -a`, since it needs no token and there is
+no reason to put the secret in that child's environment.
+
+**Lesson for the next installer change:** anything the child process needs must be exported, and
+anything that lives only in the env file must be read with `env_value`, never referenced as a shell
+variable. Both are easy to get wrong and neither shows up until the script runs as root on a real host.
+
+### The startup check now polls instead of sleeping (2026-10-03)
+
+The owner's second report was "the agent works fine but I get a message saying it is failing", and the
+diagnosis offered was that the service check needed a sleep before it. **It did not:** the installer
+already slept 2 s before `systemctl is-active`, and that check passed on the run in question. The
+failing message came from the token check above, and the wording was the real problem -- "the token
+check failed. Until this passes the agent cannot ingest" reads as *the service is broken*, when in fact
+the service reads the env file directly and was ingesting normally.
+
+**Shipped**
+- `wait_for_service` replaces `sleep 2` + one `systemctl is-active`. `systemctl restart` returns as
+  soon as the process is spawned, so the race the owner suspected is real in principle: a unit that
+  dies during startup can look started for a moment, and a slow host can look dead. Polling fixes both
+  ends -- a service already up costs no delay at all, and a slow one gets up to `SERVICE_WAIT_SECONDS`
+  (10) to settle. It prints the state it last saw, so a failure can now distinguish `failed` from
+  `activating` from `inactive` instead of saying only "not running".
+- The token-check failure no longer over-claims. It now says which line above decides the meaning, and
+  states plainly that `no ingest token` is **this script's own fault, not a bad token**, and that the
+  service should be checked in Agents first.
+- `wait_for_service` reads its budget as `${SERVICE_WAIT_SECONDS:-10}` rather than assuming the
+  assignment is in scope. Same lesson as line 525: under `set -u`, a variable that is not there does
+  not degrade, it aborts.
+
+**Verification**
+- A stubbed `systemctl` driven through the extracted `wait_for_service`: already `active` -> returns at
+  once after **one** call (no fixed delay); `activating, activating, active` -> returns `active` after
+  three polls (a slow host is not called a failure); a permanent `failed` -> reports `failed` after
+  exactly the wait budget; a permanent `activating` -> reports `activating`, which is what a crash loop
+  looks like. Plus `bash -n`, and the recovered `set -a` payload re-checked end to end.
+- The first run of that harness reported 4 failures which were the harness's own fault (it had not
+  defined `SERVICE_WAIT_SECONDS`) -- and that is what prompted the `${VAR:-default}` hardening above,
+  so the mistake earned its keep.
+
+
+

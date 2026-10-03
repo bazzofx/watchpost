@@ -12,6 +12,10 @@ every line the agent produces must be accepted by watchpost.normalize.
 import importlib.util
 import io
 import os
+import re
+import shutil
+import subprocess
+import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -542,6 +546,57 @@ class EndToEndAgentTests(ServerTestCase):
                          {"203.0.113.80", "198.51.100.9", "192.0.2.10"}, "client IP is extracted")
         self.assertIn("web_scan", {e["event_type"] for e in by_source["testhost-web"]})
         self.assertEqual({e["synthetic"] for e in events["events"]}, {0})
+
+
+# The installer ships the env file to the agent through a child shell, which is the one part of it
+# that cannot be exercised without root, systemd, and a live server. Its payload is extracted from
+# the script rather than copied, so these assertions cannot drift away from what it really runs.
+# Skipped off POSIX: the installer is bash, and a `bash` found on Windows is a different namespace.
+BASH = shutil.which("bash") if os.name == "posix" else None
+
+
+@unittest.skipUnless(BASH, "needs a POSIX shell to run the installer's own command")
+class InstallerChildPayloadTests(unittest.TestCase):
+    def payload(self, marker):
+        text = (ROOT / "deploy" / "agent" / "install-agent.sh").read_text()
+        for found in re.findall(r"bash -c[^']*'([^']*)'", text, re.S):
+            if marker in found:
+                return found
+        self.fail(f"no bash -c payload in install-agent.sh contains {marker}")
+
+    def run_payload(self, payload, env_file):
+        return subprocess.run(
+            [BASH, "-c", payload, "_", str(env_file), str(ROOT / "scripts" / "agent.py")],
+            capture_output=True, text=True, timeout=60)
+
+    def test_the_token_check_makes_the_env_file_visible_to_the_agent(self):
+        """The first real install on AiSwarm reported "no ingest token: set
+        $WATCHPOST_AGENT_TOKEN or pass --token-file" for a token that was in the env file and
+        valid. Sourcing the file assigns shell variables, and a shell variable is not part of the
+        environment, so the python3 child never saw it. systemd's EnvironmentFile= does export, so
+        the service was fine and only this check was wrong -- which made a healthy install look
+        broken. Hence `set -a` in the payload.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / "agent.env"
+            env_file.write_text(
+                "WATCHPOST_AGENT_URL=http://127.0.0.1:1\n"   # nothing listens on port 1
+                "WATCHPOST_AGENT_SOURCES=auth,firewall,web,audit\n"
+                "WATCHPOST_AGENT_LOG_DIR=/var/log\n"
+                "WATCHPOST_AGENT_TOKEN=wp_testtoken00000000000000000000\n"
+                "WATCHPOST_AGENT_EXTRA_ARGS=\n"
+            )
+            done = self.run_payload(self.payload("--check"), env_file)
+        output = done.stdout + done.stderr
+        self.assertNotIn("no ingest token", output,
+                         "the agent could not see WATCHPOST_AGENT_TOKEN from the env file")
+        self.assertIn("could not reach", output,
+                      "the check should get past the token and fail only on the connection")
+
+    def test_the_listing_payload_does_not_export_the_token(self):
+        """It answers --list-sources, which needs no token: there is no reason to put the secret in
+        that child's environment."""
+        self.assertNotIn("set -a", self.payload("--list-sources"))
 
 
 if __name__ == "__main__":
