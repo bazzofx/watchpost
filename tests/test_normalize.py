@@ -3,8 +3,8 @@ import unittest
 from datetime import datetime, timezone
 
 from watchpost.diagnostics import redact
-from watchpost.normalize import (EventError, normalize_authlog_line, normalize_record, normalize_weblog_line,
-                                 parse_payload)
+from watchpost.normalize import (EventError, normalize_authlog_line, normalize_nginx_error_line,
+                                 normalize_record, normalize_weblog_line, parse_payload)
 
 NOW = datetime(2026, 9, 16, 12, 0, tzinfo=timezone.utc)
 
@@ -154,6 +154,98 @@ class WebLogTests(unittest.TestCase):
         events, rejections = parse_payload(text, "auto", "nginx", now=NOW)
         self.assertEqual(len(events), 1)
         self.assertEqual(rejections[0]["index"], 2)
+
+
+class NginxErrorTests(unittest.TestCase):
+    """error.log is not in the combined access format and used to be silently discarded."""
+
+    PROBE = ('2026/09/15 08:50:02 [error] 1234#1234: *5678 open() "/var/www/html/.env" failed '
+             '(2: No such file or directory), client: 203.0.113.80, server: example.com, '
+             'request: "GET /.env HTTP/1.1", host: "example.com"')
+    PLAIN = "2026/09/15 08:50:07 [notice] 1234#1234: signal process started"
+    CRIT = ('2026/09/15 08:50:04 [crit] 1234#1234: *5680 SSL_do_handshake() failed (SSL: error:1417D18C) '
+            'while SSL handshaking, client: 198.51.100.9, server: 0.0.0.0:443')
+
+    def parse(self, line=None):
+        return normalize_nginx_error_line(line or self.PROBE, "web01-web-error", now=NOW)
+
+    def test_probe_line_fields(self):
+        e = self.parse()
+        self.assertEqual((e["event_type"], e["severity"], e["src_ip"], e["outcome"]),
+                         ("web_error", "high", "203.0.113.80", "failure"))
+        self.assertEqual(e["ts"], "2026-09-15T08:50:02.000Z", "nginx writes local time; read as UTC")
+        self.assertTrue(e["message"].startswith("GET /.env [error]"),
+                        "the message leads with METHOD PATH, like an access-log event")
+
+    def test_never_emits_web_scan(self):
+        """A probe appears in access.log too; counting it twice would halve the web_scanner
+        threshold, so error lines stay web_error even when they look like a scan."""
+        for path in ("/.env", "/wp-login.php", "/../../etc/passwd"):
+            line = self.PROBE.replace("GET /.env", f"GET {path}")
+            with self.subTest(path=path):
+                self.assertEqual(self.parse(line)["event_type"], "web_error")
+
+    def test_severity_follows_the_nginx_level(self):
+        self.assertEqual(self.parse(self.CRIT)["severity"], "critical")
+        self.assertEqual(self.parse(self.PLAIN)["severity"], "low")
+        self.assertEqual(self.parse(self.PLAIN.replace("[notice]", "[warn]"))["severity"], "medium")
+
+    def test_lines_without_a_client_have_no_source_ip(self):
+        e = self.parse(self.PLAIN)
+        self.assertIsNone(e["src_ip"])
+        self.assertEqual(e["event_type"], "web_error")
+
+    def test_a_bad_client_value_does_not_lose_the_line(self):
+        line = self.PROBE.replace("client: 203.0.113.80", "client: not-an-ip")
+        e = self.parse(line)
+        self.assertIsNone(e["src_ip"])
+        self.assertTrue(e["message"])
+
+    def test_an_older_nginx_without_the_connection_field_still_parses(self):
+        line = '2026/09/15 08:50:02 [error] 1234#1234: open() "/nope" failed, client: 203.0.113.5'
+        e = self.parse(line)
+        self.assertEqual((e["event_type"], e["src_ip"]), ("web_error", "203.0.113.5"))
+
+    def test_non_error_lines_are_rejected(self):
+        for line in ("not an nginx error line",
+                     '203.0.113.80 - - [03/Oct/2026:08:50:02 +0000] "GET / HTTP/1.1" 200 1 "-" "x"'):
+            with self.subTest(line=line[:30]):
+                with self.assertRaises(EventError):
+                    self.parse(line)
+
+    def test_an_unparseable_timestamp_is_rejected(self):
+        with self.assertRaises(EventError):
+            self.parse("2026/13/45 99:99:99 [error] 1#1: nope")
+
+    def test_secrets_are_still_redacted(self):
+        e = self.parse(self.PROBE.replace("failed", "failed password=hunter2"))
+        self.assertIn("[REDACTED]", e["raw"])
+        self.assertNotIn("hunter2", e["raw"])
+
+
+class NginxErrorFormatTests(unittest.TestCase):
+    """Auto-detection used to call an error line CSV, which produced no records at all."""
+
+    def test_detect_format_picks_nginx_error_not_csv(self):
+        line = ('2026/09/15 08:50:02 [error] 1#1: *2 open() "/x" failed, client: 203.0.113.5, '
+                'server: example.com')
+        events, rejections = parse_payload(line, "auto", "web01-web-error", now=NOW)
+        self.assertEqual(rejections, [])
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["event_type"], "web_error")
+
+    def test_old_behaviour_would_have_lost_every_line(self):
+        """Guard against regressing to CSV: a DictReader on these lines yields no usable rows."""
+        text = "\n".join([
+            '2026/09/15 08:50:02 [error] 1#1: *2 open() "/.env" failed, client: 203.0.113.5',
+            '2026/09/15 08:50:03 [warn] 1#1: *3 conflicting server name "x", ignored',
+            '2026/09/15 08:50:04 [crit] 1#1: *4 SSL_do_handshake() failed, client: 198.51.100.9',
+            '2026/09/15 08:50:05 [error] 1#1: *5 access forbidden by rule, client: 192.0.2.10',
+        ])
+        events, rejections = parse_payload(text, "auto", "web01-web-error", now=NOW)
+        self.assertEqual(len(events), 4)
+        self.assertEqual(rejections, [])
+        self.assertEqual({e["event_type"] for e in events}, {"web_error"})
 
 
 class FirewallAndHostTests(unittest.TestCase):

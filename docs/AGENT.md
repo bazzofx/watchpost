@@ -53,15 +53,33 @@ Check the agent's own log with `journalctl -u watchpost-agent -f`.
 |---|---|---|---|
 | `auth` | `auth.log` | `authlog` | `auth_failure`, `auth_success`, `privilege_use`, `privilege_escalation`, `user_created` |
 | `firewall` | `ufw.log`, else `kern.log` | `authlog` | `fw_deny`, `fw_allow` (with `dest_port`) |
-| `web` | `nginx/access.log`, else `apache2/access.log` | `weblog` | `web_request`, `web_scan`, `web_error` |
+| `web` | every `*.log` under `nginx/` and `apache2/` | `weblog` for access logs, `nginx_error` for error logs | `web_request`, `web_scan`, `web_error` |
 | `audit` | `audit/audit.log` | `authlog` (adapted) | `process_start`, `file_access` |
 | `syslog` | `syslog` | `authlog` | mostly generic `other` events, plus anything the firewall and sshd patterns match |
 
 All paths are relative to `--log-dir` (default `/var/log`), so a container or a non-standard
 layout works with `--log-dir /opt/logs`.
 
-The default selection is **`auth,firewall,web,audit`**. A source whose file does not exist is
-skipped with a reason, so the same command works on a web server and on a database host.
+The `web` source takes the **whole tree**, not one file, because that is where the interesting
+nginx material is:
+
+| File | Source name | Format sent |
+|---|---|---|
+| `nginx/access.log` | `<host>-web` | `weblog` |
+| `nginx/error.log` | `<host>-web-error` | `nginx_error` |
+| `nginx/shop.access.log` (per-vhost, any name) | `<host>-web-shop.access` | `weblog` |
+| `nginx/access.log.1`, `*.gz` | *skipped* | rotated or compressed: history, not a live stream |
+
+`access.log` deliberately keeps the plain `<host>-web` name so upgrading an existing install does
+not re-attribute its events to a new source. Error logs need their own parser: `error.log` is not
+in the combined access format, and its lines contain commas, so before `nginx_error` existed they
+were mistaken for CSV and produced **no records at all** — the agent would report a clean run while
+shipping nothing. Field-by-field mapping: [API.md](API.md).
+
+The default selection is **`auth,firewall,web,audit`**. A source whose files do not exist is skipped
+with a reason, so the same command works on a web server and on a database host. Note that
+`firewall` takes only the *first* existing of `ufw.log`/`kern.log`: UFW writes the same lines to
+both, so taking both would double every firewall event.
 
 Run `agent.py --list-sources` to see what the current host actually offers:
 

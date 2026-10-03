@@ -405,3 +405,78 @@ Goal: see, in the UI, which agents are installed and whether they are still feed
 - The page is read-only: no way to rename or revoke an agent from it (use Admin > API tokens).
 - Source `kind` is presentational only. The exact stored `source` is always shown in the row tooltip
   and the detail modal, and is what `GET /api/events?source=` filters on.
+
+## Monitoring /var/log/nginx/* (2026-10-03)
+
+Goal: watch the whole nginx log directory for suspicious activity, not just `access.log`.
+
+**What already existed:** nginx/Apache **combined access** logs (`format=weblog`, auto-detected),
+classified into `web_request`/`web_scan`/`web_error` by `normalize.classify_web_request`, with the
+`web_scanner` rule (≥5 scan-like requests from one IP in 300 s) alerting on probes. The agent's
+`web` source watched **only** `nginx/access.log`.
+
+**Two gaps, both verified before changing anything**
+- **`error.log` was not just unparsed, it was silently discarded.** A realistic error line was
+  rejected by the `weblog` parser ("not in combined access log format") and by `authlog` ("not in
+  syslog format") — and `auto` **misdetected it as CSV**, because the line contains commas. A
+  `csv.DictReader` on a single error line yields *zero records and zero rejections*, and on a whole
+  file yields 0 accepted and 5 rejected. So an agent pointed at `error.log` would report a clean run
+  while shipping nothing at all.
+- **Only one file was watched.** Per-vhost logs (`shop.access.log`) and `error.log` were invisible.
+
+**Shipped**
+- `watchpost/normalize.py`: new **`nginx_error`** format (in `FORMATS`, so it is a first-class
+  choice for uploads, the shipper, and the agent). `normalize_nginx_error_line` maps each line to
+  `web_error`, takes severity from the nginx level (`crit`→critical, `error`→high, `warn`→medium,
+  `notice`→low), extracts the `client:` address into `src_ip` (validated, so a malformed value costs
+  the field and not the line), and prefixes the message with `METHOD PATH` when the line carries a
+  request, so error and access events read alike in the UI and in reports. `detect_format` now
+  recognises error lines **before** the CSV fallback, which fixes the misdetection. Timestamps are
+  read as UTC, the documented rule for zone-less input.
+- **Deliberate decision:** error lines are never classified as `web_scan`. A probe is normally
+  recorded in `access.log` *and* `error.log`, so counting both would make `web_scanner` fire at half
+  the real number of requests — a rule that alerts at 3 when it says 5 is not explainable to an
+  analyst. Scanner detection stays on access logs, which see every request. Error-log probes are
+  still stored, with their client IP and severity, so they are searchable and visible.
+- `scripts/agent.py`: the `web` source now **scans the tree** (`nginx/*.log`, `apache2/*.log`)
+  instead of naming one file. New source keys: `scan` (globs), `primary` (the file that keeps the
+  plain source name), and `filename_formats` (filename substring → server format). Rotated and
+  compressed files (`access.log.1`, `*.gz`, `*.bz2`, `*.xz`, `*.zst`, `*.10`) are skipped as
+  history. `web.log` yields `access.log`→`weblog`, `error.log`→`nginx_error`, and per-vhost logs →
+  `weblog`, each with a stable source name: `<host>-web` for access.log (unchanged, so an upgrade
+  does not re-attribute existing events), `<host>-web-error`, `<host>-web-<stem>`. `--list-sources`
+  now prints one line per file that would be tailed.
+  - Sources *without* `scan` keep first-existing-wins semantics. That is load-bearing for
+    `firewall`: UFW writes the same lines to `ufw.log` and `kern.log`, so expanding it would double
+    every firewall event and halve the port-sweep threshold. There is a test asserting exactly that.
+- Fixtures: `tests/fixtures/logs/nginx/{access,error,shop.access}.log` plus `access.log.1` (which
+  must be skipped), and `ufw.log`/`kern.log` for the no-expansion rule.
+
+**Verification**
+- `tests/test_normalize.py`: 36 tests OK (+12: field mapping, severity per level, the missing-client
+  and malformed-client cases, the older nginx format without the `*connection` field, rejection of
+  non-error lines, redaction, and two tests pinning auto-detection to `nginx_error` rather than CSV).
+- `tests/test_agent.py`: 55 tests OK (+8: rotated/compressed detection, tree discovery, per-file
+  formats, stable source names, the firewall no-expansion rule, a missing tree reporting rather than
+  crashing, and an end-to-end run of the nginx tree through a real server).
+- No regressions: **294 tests**, the **same 25 pre-existing Windows-only failures** as the baseline,
+  with an empty diff of the failure sets. `test_shipper_cli_delivers_nginx_access_log_as_web_events`
+  was already failing before this change.
+- End to end against a real server: the nginx tree shipped as three distinct sources
+  (`web01-web`, `web01-web-error`, `web01-web-shop.access`); 3 `web_scan` (including a `nikto`
+  traversal probe found in the **per-vhost** log), 1 `web_request`, 3 `web_error` with severities
+  {high, critical} and client IPs {203.0.113.80, 198.51.100.9, 192.0.2.10}; `access.log.1` was not
+  shipped; all events `synthetic=0`. Uploading a whole six-line error.log with `format=auto` now
+  gives 6 accepted / 0 rejected (was 0 accepted / 5 rejected).
+
+**Not done / notes for the owner**
+- **`error.log` does not feed an alert rule yet.** Probes there are stored with `client` IP and
+  severity (high for `[error]`) and so are searchable, but no rule fires on them, deliberately, to
+  avoid the double-count above. Alerting on error-log-only probes needs either a dedicated rule
+  (for example an "nginx error probe burst") or a dedupe-aware `web_scanner` that counts a request
+  once when it appears in both logs. Worth doing; not done here.
+- Rotated logs are skipped, so probes from before the agent started are only visible via a manual
+  upload (`format=nginx_error` handles them).
+- `nginx_error` is not wired into the syslog listener, which tries `authlog` then `weblog` on a
+  forwarded frame. Forwarding `error_log syslog:...` would land those lines as generic `syslog`
+  events. Only matters for hosts that forward rather than tail.

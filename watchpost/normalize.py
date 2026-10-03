@@ -28,7 +28,7 @@ EVENT_TYPES = {
     "privilege_escalation",
 }
 SEVERITIES = ["info", "low", "medium", "high", "critical"]
-FORMATS = {"json", "jsonl", "csv", "authlog", "weblog"}
+FORMATS = {"json", "jsonl", "csv", "authlog", "weblog", "nginx_error"}
 
 DEFAULT_SEVERITY = {
     "auth_failure": "low",
@@ -380,6 +380,76 @@ def normalize_weblog_line(line, default_source, now=None):
     return event
 
 
+# --- nginx error logs ------------------------------------------------------------------
+
+# 2026/10/03 08:50:02 [error] 1234#1234: *5678 open() "/var/www/html/.env" failed (...)
+# Older builds omit the `*connection` field, hence the optional group.
+_NGINX_ERROR = re.compile(
+    r"^(?P<time>\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}) \[(?P<level>[a-z]+)\] "
+    r"(?P<pid>\d+)#(?P<tid>\d+): (?:\*(?P<conn>\d+) )?(?P<body>.*)$"
+)
+_NGINX_CLIENT = re.compile(r"\bclient: (?P<ip>\d{1,3}(?:\.\d{1,3}){3}|[0-9a-fA-F:]{2,45})")
+_NGINX_REQUEST = re.compile(r'\brequest: "(?P<method>[A-Z]{3,10}) (?P<path>\S+?)[ "]')
+
+# nginx states its own level. Deliberately the same shape as the syslog listener's PRI mapping,
+# so severity means the same thing whichever path a line arrived by.
+NGINX_LEVEL_SEVERITY = {"emerg": "critical", "alert": "critical", "crit": "critical",
+                        "error": "high", "warn": "medium", "notice": "low",
+                        "info": "info", "debug": "info"}
+
+
+def normalize_nginx_error_line(line, default_source, now=None):
+    """Parse one nginx error.log line.
+
+    Error lines are not in the combined access format, so before this they were rejected by the
+    weblog parser — or, worse, mistaken for CSV because they contain commas, which silently
+    produced no records at all.
+
+    Every line here becomes `web_error`. This parser deliberately does **not** emit `web_scan`:
+    a probe is commonly recorded in both access.log and error.log, and counting it twice would
+    make the `web_scanner` threshold (5 requests in 300 s) fire at half the real number of
+    requests. Probes are counted by the access-log parser, which sees every request.
+
+    nginx writes these timestamps in the server's local time with no zone. Like every other
+    naive timestamp in Watchpost, they are read as UTC.
+    """
+    match = _NGINX_ERROR.match(line.strip())
+    if match is None:
+        raise EventError("line is not in nginx error log format")
+    try:
+        stamp = datetime.strptime(match.group("time"), "%Y/%m/%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    except ValueError:
+        raise EventError("unparseable nginx error log timestamp")
+
+    body = match.group("body").strip()
+    level = match.group("level").lower()
+
+    # A malformed client value must not cost us the whole line, so validate before using it.
+    client = _NGINX_CLIENT.search(body)
+    src_ip = None
+    if client:
+        try:
+            src_ip = str(ipaddress.ip_address(client.group("ip")))
+        except ValueError:
+            src_ip = None
+
+    # Lead with "METHOD PATH" when the line carries a request, matching the access-log message
+    # shape so both kinds of web event read the same way in the UI and in reports.
+    request = _NGINX_REQUEST.search(body)
+    message = f"[{level}] {body}"
+    if request:
+        message = f"{request.group('method')} {request.group('path')} [{level}] {body}"
+
+    record = {
+        "ts": iso(stamp), "event_type": "web_error",
+        "severity": NGINX_LEVEL_SEVERITY.get(level, "info"),
+        "outcome": "failure", "src_ip": src_ip, "message": message,
+    }
+    event = normalize_record(record, default_source, now)
+    event["raw"] = redact(line.strip())[: MAX_LEN["raw"]]
+    return event
+
+
 # --- Batch parsing --------------------------------------------------------------
 
 def detect_format(text):
@@ -393,6 +463,10 @@ def detect_format(text):
         return "authlog"
     if _WEBLOG.match(first):
         return "weblog"
+    # Must be tried before the CSV fallback: nginx error lines contain commas, and CSV would
+    # swallow the first line as a header and yield nothing usable.
+    if _NGINX_ERROR.match(first):
+        return "nginx_error"
     if "," in first:
         return "csv"
     raise EventError("could not detect format; pass format=json|jsonl|csv|authlog|weblog")
@@ -442,6 +516,8 @@ def parse_payload(text, fmt, default_source, year=None, now=None, max_events=200
                 events.append(normalize_authlog_line(item, default_source, year, now))
             elif fmt == "weblog":
                 events.append(normalize_weblog_line(item, default_source, now))
+            elif fmt == "nginx_error":
+                events.append(normalize_nginx_error_line(item, default_source, now))
             else:
                 events.append(normalize_record(item, default_source, now))
         except EventError as exc:

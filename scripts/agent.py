@@ -22,9 +22,14 @@ Sources (`--source`, default: auth, firewall, web, audit — see SOURCES):
 
     auth      /var/log/auth.log          SSH logins and failures, sudo/su, account creation
     firewall  /var/log/ufw.log           UFW/iptables denials and allows -> fw_deny / fw_allow
-    web       /var/log/nginx/access.log  combined access log -> web_request / web_scan / web_error
+    web       /var/log/nginx/*.log       access and error logs -> web_request / web_scan / web_error
     audit     /var/log/audit/audit.log   auditd records -> process_start / file_access
     syslog    /var/log/syslog            everything else, as generic events (opt-in: see below)
+
+`web` takes every `*.log` under nginx/ and apache2/ (per-vhost files included) and skips rotated
+ones (`access.log.1`, `*.gz`). Each file gets its own source name — `access.log` keeps
+`<host>-web`, `error.log` becomes `<host>-web-error` — and its own server format: `weblog` for
+access logs, `nginx_error` for error logs, which are not in the combined access format.
 
 `syslog` is deliberately **not** part of `--source all`. On Ubuntu and Debian, rsyslog copies
 auth and firewall lines into `/var/log/syslog` as well, so shipping `auth` and `syslog`
@@ -43,6 +48,7 @@ is given, because the token would travel in clear text.
 
 import argparse
 import functools
+import glob
 import os
 import re
 import socket
@@ -78,10 +84,17 @@ SOURCES = [
     },
     {
         "name": "web",
-        "paths": ["nginx/access.log", "apache2/access.log"],
+        # Every log in these trees, not just access.log: error.log carries probes, TLS failures
+        # and upstream errors, and per-vhost configs write their own files here.
+        "scan": ["nginx/*.log", "apache2/*.log"],
+        # access.log keeps the plain <host>-web source name, so upgrading an existing install
+        # does not re-attribute its events to a new source.
+        "primary": ["nginx/access.log", "apache2/access.log"],
         "format": "weblog",
-        "description": "nginx/Apache combined access log (web_request, web_scan, web_error)",
-        "needs": "read access to the log (the 'adm' group); skipped when no web server is installed",
+        # error.log is not in the access format and needs its own parser.
+        "filename_formats": [("error", "nginx_error")],
+        "description": "nginx/Apache access and error logs (web_request, web_scan, web_error)",
+        "needs": "read access to /var/log/nginx (the 'adm' group); skipped when no web server is installed",
     },
     {
         "name": "audit",
@@ -129,6 +142,72 @@ def find_path(source, log_dir=DEFAULT_LOG_DIR):
     return None, "not present on this host (" + " or ".join(candidates) + ")"
 
 
+# access.log.1, error.log.2.gz, ... : history, not a live stream.
+_ROTATED = re.compile(r"\.(?:gz|bz2|xz|zst|[0-9]+)$", re.IGNORECASE)
+
+
+def _patterns(source):
+    """The globs or paths a source looks for."""
+    return source.get("scan") or source.get("paths") or []
+
+
+def _is_rotated(path):
+    return bool(_ROTATED.search(os.path.basename(path)))
+
+
+def discover(source, log_dir=DEFAULT_LOG_DIR):
+    """Every file this source should tail right now, plus a reason when there are none.
+
+    Sources with `scan` take every matching log (nginx writes per-vhost files next to access.log);
+    the rest take the first existing of their `paths`, which matters for the firewall: UFW logs
+    to ufw.log *and* kern.log, so taking both would double every firewall event.
+    """
+    patterns = source.get("scan")
+    if not patterns:
+        path, reason = find_path(source, log_dir)
+        return ([path] if path else []), reason
+
+    found = []
+    for pattern in patterns:
+        for candidate in glob.glob(os.path.join(log_dir, pattern)):
+            if os.path.isfile(candidate) and not _is_rotated(candidate) and candidate not in found:
+                found.append(candidate)
+    if not found:
+        return [], "no files matched " + " or ".join(
+            os.path.join(log_dir, pattern) for pattern in patterns)
+    unreadable = sorted(path for path in found if not os.access(path, os.R_OK))
+    if unreadable:
+        return [], f"{unreadable[0]} is not readable (add the agent's user to the 'adm' group)"
+    return sorted(os.path.abspath(path) for path in found), None
+
+
+def _format_for(source, path):
+    """The server format for one file: filename rules first, then the source default."""
+    name = os.path.basename(path).lower()
+    for needle, fmt in source.get("filename_formats", ()):
+        if needle in name:
+            return fmt
+    return source["format"]
+
+
+def _source_name(source, path, host, log_dir):
+    """A stable source name: <host>-<source>, or <host>-<source>-<file> for the extra files.
+
+    Only a source that declares `primary` can produce more than one file, and only then do the
+    extra files get a suffix — so a single-file source such as `auth` keeps the plain
+    `<host>-auth` name it has always had.
+    """
+    base = f"{sanitize_source(host)}-{source['name']}"
+    primary = source.get("primary")
+    if not primary:
+        return sanitize_source(base)
+    for relative in primary:
+        if path == os.path.abspath(os.path.join(log_dir, relative)):
+            return sanitize_source(base)
+    stem = os.path.splitext(os.path.basename(path))[0]
+    return sanitize_source(f"{base}-{stem}")
+
+
 def sanitize_source(value):
     """Watchpost requires 1-64 chars of letters, digits, and _ . : - (normalize.validate_source)."""
     return "".join(c if c.isalnum() or c in "_.:-" else "-" for c in value)[:64]
@@ -147,15 +226,16 @@ def resolve_sources(selected, hostname, prefix="", log_dir=DEFAULT_LOG_DIR):
     chosen = []
     for name in selected:
         source = _BY_NAME[name]
-        path, reason = find_path(source, log_dir)
-        if path is None:
+        paths, reason = discover(source, log_dir)
+        if not paths:
             skipped.append((name, reason))
             continue
-        source_name = sanitize_source(f"{prefix or hostname}-{name}")
-        files.append((path, source["format"], source_name))
-        if source.get("transform"):
-            # Bind the hostname now: the shipper calls a transform with the line only.
-            transforms[path] = functools.partial(TRANSFORMS[source["transform"]], hostname=hostname)
+        for path in paths:
+            files.append((path, _format_for(source, path),
+                          _source_name(source, path, prefix or hostname, log_dir)))
+            if source.get("transform"):
+                # Bind the hostname now: the shipper calls a transform with the line only.
+                transforms[path] = functools.partial(TRANSFORMS[source["transform"]], hostname=hostname)
         chosen.append(name)
 
     for name in chosen:
@@ -254,17 +334,21 @@ def check_token(url, token, cafile=None, timeout=30):
 
 
 def list_sources(hostname, prefix="", log_dir=DEFAULT_LOG_DIR):
-    """Print the catalogue with this host's availability."""
+    """Print the catalogue with this host's availability, one line per file that would be tailed."""
     print(f"Watchpost agent sources (host prefix: {prefix or hostname}, log root: {log_dir})\n")
-    print(f"  {'source':<9} {'status':<8} {'path':<34} {'format':<9} events")
-    print(f"  {'-' * 9} {'-' * 8} {'-' * 34} {'-' * 9} {'-' * 50}")
+    print(f"  {'source':<9} {'path':<38} {'format':<12} events")
+    print(f"  {'-' * 9} {'-' * 38} {'-' * 12} {'-' * 50}")
     for source in SOURCES:
-        path, reason = find_path(source, log_dir)
-        status = "ok" if path else "missing"
-        shown = path or os.path.join(log_dir, source["paths"][0])
-        print(f"  {source['name']:<9} {status:<8} {shown:<34} {source['format']:<9} {source['description']}")
-        if path is None:
-            print(f"  {'':<9} {'':<8} -> {reason}")
+        paths, reason = discover(source, log_dir)
+        if not paths:
+            shown = os.path.join(log_dir, _patterns(source)[0])
+            print(f"  {source['name']:<9} {shown:<38} {'-':<12} {source['description']}")
+            print(f"  {'':<9} -> {reason}")
+            continue
+        for index, path in enumerate(paths):
+            name = source["name"] if index == 0 else ""
+            description = source["description"] if index == 0 else ""
+            print(f"  {name:<9} {path:<38} {_format_for(source, path):<12} {description}")
     print("\n  Default (--source all): " + ", ".join(DEFAULT_SOURCES))
     print("  Opt-in only:             syslog  (overlaps auth/firewall — see the module docstring)")
     print("\n  Read access usually comes from the 'adm' group:")

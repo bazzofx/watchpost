@@ -1,0 +1,2 @@
+2025-10-09T08:00:02.000Z testhost kernel: [12345.678901] [UFW BLOCK] IN=eth0 OUT= MAC=aa:bb SRC=192.168.8.50 DST=192.168.8.178 LEN=60 PROTO=TCP SPT=44321 DPT=22
+2025-10-09T08:00:03.000Z testhost kernel: [12345.678902] usb 1-1: new high-speed USB device number 4

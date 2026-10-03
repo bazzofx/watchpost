@@ -11,6 +11,7 @@ every line the agent produces must be accepted by watchpost.normalize.
 
 import importlib.util
 import io
+import os
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -42,12 +43,13 @@ class CatalogueTests(unittest.TestCase):
         for source in agent.SOURCES:
             with self.subTest(source=source["name"]):
                 self.assertTrue(source["name"])
-                self.assertTrue(source["paths"])
+                patterns = agent._patterns(source)
+                self.assertTrue(patterns, "a source must say what to look for")
                 self.assertTrue(source["description"])
                 self.assertTrue(source["needs"])
-                for relative in source["paths"]:
+                for relative in patterns:
                     self.assertFalse(relative.startswith("/"),
-                                     "paths must be relative to --log-dir, not absolute")
+                                     "patterns must be relative to --log-dir, not absolute")
 
     def test_source_names_are_unique(self):
         names = [source["name"] for source in agent.SOURCES]
@@ -58,6 +60,9 @@ class CatalogueTests(unittest.TestCase):
         for source in agent.SOURCES:
             with self.subTest(source=source["name"]):
                 self.assertIn(source["format"], FORMATS)
+                for needle, fmt in source.get("filename_formats", ()):
+                    self.assertIn(fmt, FORMATS, f"filename rule {needle!r}")
+                    self.assertTrue(needle, "a filename rule needs a substring to match")
 
     def test_every_transform_is_registered(self):
         for source in agent.SOURCES:
@@ -162,6 +167,54 @@ class WrapAuditdTests(unittest.TestCase):
         self.assertEqual(events[0]["event_type"], "process_start")
 
 
+class DiscoveryTests(unittest.TestCase):
+    """Sources with `scan` take every log in a tree; the rest take the first match only."""
+
+    def test_rotated_and_compressed_logs_are_not_live_sources(self):
+        for name in ("access.log.1", "error.log.2.gz", "access.log.10", "error.log.1.bz2",
+                     "access.log.2.xz", "error.log.1.zst"):
+            with self.subTest(name=name):
+                self.assertTrue(agent._is_rotated(name))
+        for name in ("access.log", "error.log", "shop.access.log", "auth.log"):
+            with self.subTest(name=name):
+                self.assertFalse(agent._is_rotated(name))
+
+    def test_web_source_takes_every_log_in_the_tree(self):
+        paths, reason = agent.discover(agent._BY_NAME["web"], LOGS)
+        self.assertIsNone(reason)
+        self.assertEqual([os.path.basename(path) for path in paths],
+                         ["access.log", "error.log", "shop.access.log"],
+                         "per-vhost logs are included, rotated access.log.1 is not")
+
+    def test_error_logs_get_the_nginx_error_format(self):
+        source = agent._BY_NAME["web"]
+        self.assertEqual(agent._format_for(source, "/var/log/nginx/error.log"), "nginx_error")
+        self.assertEqual(agent._format_for(source, "/var/log/nginx/shop.error.log"), "nginx_error")
+        self.assertEqual(agent._format_for(source, "/var/log/nginx/access.log"), "weblog")
+        self.assertEqual(agent._format_for(source, "/var/log/nginx/shop.access.log"), "weblog")
+
+    def test_source_names_are_stable_and_specific(self):
+        source = agent._BY_NAME["web"]
+        paths, _ = agent.discover(source, LOGS)
+        names = {os.path.basename(path): agent._source_name(source, path, "web01", LOGS)
+                 for path in paths}
+        self.assertEqual(names, {"access.log": "web01-web",
+                                 "error.log": "web01-web-error",
+                                 "shop.access.log": "web01-web-shop.access"})
+
+    def test_firewall_takes_only_the_first_existing_log(self):
+        """UFW writes the same lines to ufw.log and kern.log: taking both would double every
+        firewall event and halve the port-sweep threshold."""
+        paths, reason = agent.discover(agent._BY_NAME["firewall"], LOGS)
+        self.assertIsNone(reason)
+        self.assertEqual([os.path.basename(path) for path in paths], ["ufw.log"])
+
+    def test_a_missing_scan_tree_is_reported_not_crashed(self):
+        paths, reason = agent.discover(agent._BY_NAME["web"], ROOT / "docs")
+        self.assertEqual(paths, [])
+        self.assertIn("nginx", reason)
+
+
 class ResolveSourcesTests(unittest.TestCase):
     def test_missing_sources_are_skipped_with_a_reason(self):
         files, transforms, skipped, warnings = agent.resolve_sources(
@@ -179,6 +232,19 @@ class ResolveSourcesTests(unittest.TestCase):
         files, _, _, _ = agent.resolve_sources(["auth"], "host01", prefix="web01",
                                               log_dir=ROOT / "samples")
         self.assertEqual(files[0][2], "web01-auth")
+
+    def test_the_web_source_expands_to_one_entry_per_file(self):
+        """The ask was to watch /var/log/nginx/*, so one source becomes several files, each with
+        the right format and its own stable source name."""
+        files, transforms, skipped, warnings = agent.resolve_sources(["web"], "web01", log_dir=LOGS)
+        self.assertEqual(skipped, [])
+        self.assertEqual(warnings, [])
+        self.assertEqual(transforms, {})
+        self.assertEqual([os.path.basename(f[0]) for f in files],
+                         ["access.log", "error.log", "shop.access.log"])
+        self.assertEqual([f[1] for f in files], ["weblog", "nginx_error", "weblog"])
+        self.assertEqual([f[2] for f in files],
+                         ["web01-web", "web01-web-error", "web01-web-shop.access"])
 
     def test_selecting_both_overlapping_sources_warns(self):
         """auth and syslog both carry the same sshd lines under rsyslog."""
@@ -319,10 +385,11 @@ class CliTests(unittest.TestCase):
 class EndToEndAgentTests(ServerTestCase):
     """The agent ships real lines to a real server, which stores them as non-synthetic."""
 
-    def _run_agent(self, tmp, token_path, extra=()):
+    def _run_agent(self, tmp, token_path, extra=(), sources="auth,audit"):
         state = str(Path(tmp) / "positions.json")
         argv = ["--url", self.base, "--log-dir", str(LOGS), "--hostname", "testhost",
-                "--token-file", str(token_path), "--state", state, "--from-start", "--once"]
+                "--source", sources, "--token-file", str(token_path), "--state", state,
+                "--from-start", "--once"]
         with redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
             return agent.main(argv + list(extra))
 
@@ -395,6 +462,28 @@ class EndToEndAgentTests(ServerTestCase):
         viewer = self.client("viewer")
         _, events, _ = viewer.get("/api/events?limit=50")
         self.assertEqual(events["total"], 2)
+
+    def test_the_nginx_tree_ships_as_separate_sources(self):
+        """End to end for the /var/log/nginx/* ask: access and error logs arrive as real events
+        with their own source names and event types."""
+        code = self._run_agent(self.tmp.name, self.token_path, sources="web")
+        self.assertEqual(code, 0)
+        viewer = self.client("viewer")
+        _, events, _ = viewer.get("/api/events?limit=50")
+
+        by_source = {}
+        for event in events["events"]:
+            by_source.setdefault(event["source"], []).append(event)
+        self.assertEqual(sorted(by_source), ["testhost-web", "testhost-web-error",
+                                            "testhost-web-shop.access"])
+        self.assertEqual(len(by_source["testhost-web-error"]), 3)
+        self.assertEqual({e["event_type"] for e in by_source["testhost-web-error"]}, {"web_error"})
+        self.assertEqual({e["severity"] for e in by_source["testhost-web-error"]},
+                         {"high", "critical"}, "severity comes from the nginx level")
+        self.assertEqual({e["src_ip"] for e in by_source["testhost-web-error"]},
+                         {"203.0.113.80", "198.51.100.9", "192.0.2.10"}, "client IP is extracted")
+        self.assertIn("web_scan", {e["event_type"] for e in by_source["testhost-web"]})
+        self.assertEqual({e["synthetic"] for e in events["events"]}, {0})
 
 
 if __name__ == "__main__":

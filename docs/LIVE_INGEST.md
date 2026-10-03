@@ -205,7 +205,7 @@ journalctl -u watchpost-shipper -f
 | `--cafile` | CA bundle, e.g. for a self-signed HTTPS certificate on the demo VM |
 | `--interval`, `--batch-lines` | Poll interval (default 2 s) and lines per request (default 500) |
 
-**nginx access logs:** `--file /var/log/nginx/access.log:weblog` ships nginx/Apache combined access lines as `web_request`, `web_scan`, and `web_error` events (`auto` detects the format too). The combined format has no host field, so give the file a `SOURCE` that names the box, e.g. `--file /var/log/nginx/access.log:weblog:web01-nginx`. **Firewall logs:** UFW and iptables write to syslog (`/var/log/ufw.log` or `kern.log`), so ship them as `authlog`; firewall CSV exports go as `csv`.
+**nginx access logs:** `--file /var/log/nginx/access.log:weblog` ships nginx/Apache combined access lines as `web_request`, `web_scan`, and `web_error` events (`auto` detects the format too). The combined format has no host field, so give the file a `SOURCE` that names the box, e.g. `--file /var/log/nginx/access.log:weblog:web01-nginx`. **nginx error logs** need `format=nginx_error`, not `weblog`: error lines are not in the combined format, and because they contain commas `auto` used to read them as CSV and silently store nothing. With the agent, both are picked up automatically from `nginx/*.log`. **Firewall logs:** UFW and iptables write to syslog (`/var/log/ufw.log` or `kern.log`), so ship them as `authlog`; firewall CSV exports go as `csv`.
 
 ---
 
