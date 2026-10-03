@@ -34,6 +34,7 @@ same file from the UI. That keeps one implementation of every parser (`watchpost
    ```bash
    git clone <this repo> && cd watchpost
    sudo ./deploy/agent/install-agent.sh --url http://192.168.8.178:8080
+   sudo ./deploy/agent/install-agent.sh --url http://192.168.8.178:8080 --allow-insecure-http
    ```
 
    It prompts for the token with input hidden (or take it from a file with
