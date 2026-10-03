@@ -15,6 +15,16 @@ same file from the UI. That keeps one implementation of every parser (`watchpost
 
 ## Quick start
 
+0. **See what this host has to offer** before configuring anything. This needs no URL and no
+   token, because it only reads the local filesystem:
+
+   ```bash
+   python3 scripts/agent.py --list-sources
+   ```
+
+   If a source shows `missing`, that log is not on this host (or not readable); if it shows a
+   different path is used, set `--log-dir`. Sources that are missing are simply skipped later.
+
 1. **Create an ingest token** on the Watchpost server: sign in as admin, open **Admin > API
    tokens**, name it after the host (for example `web01-agent`), and copy the `wp_...` value.
    It is shown once. It can only ingest; it cannot read data.
@@ -104,7 +114,7 @@ otherwise they arrive with no `user` and no `src_ip`.
 
 | Option | Meaning |
 |---|---|
-| `--url` | Watchpost base URL. Use `https://` for anything that is not loopback |
+| `--url` | Watchpost base URL, passed as an option (`--url URL`). Required to ship and for `--check`; not needed for `--list-sources` or `--dry-run`. Use `https://` for anything that is not loopback |
 | `--source NAME` | Source to collect; repeatable, comma-separated, or `all`. Default: `all` = `auth,firewall,web,audit` |
 | `--log-dir` | Root the source paths resolve against (default `/var/log`) |
 | `--hostname` / `--source-prefix` | Override the host prefix used in source names (default: the short hostname) |

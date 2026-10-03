@@ -254,12 +254,33 @@ class CliTests(unittest.TestCase):
             code = agent.main(argv)
         return code, out.getvalue()
 
+    def _run_both(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = agent.main(argv)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_list_sources_needs_no_url_and_no_token(self):
+        """Regression: --url was an argparse-required option, so argparse rejected
+        `--list-sources` before the code that returns early for it could run."""
+        code, out, _ = self._run_both(["--log-dir", str(LOGS), "--hostname", "testhost",
+                                       "--list-sources"])
+        self.assertEqual(code, 0)
+        self.assertIn("testhost", out)
+        self.assertIn("auth", out)
+
     def test_list_sources_needs_no_token_and_exits_zero(self):
         code, out = self._run(["--url", "http://127.0.0.1:1", "--log-dir", str(ROOT / "samples"),
                                "--list-sources"])
         self.assertEqual(code, 0)
         self.assertIn("auth", out)
         self.assertIn("samples", out.replace("\\", "/"))
+
+    def test_dry_run_needs_no_url(self):
+        code, out, _ = self._run_both(["--log-dir", str(LOGS), "--hostname", "testhost",
+                                       "--source", "auth", "--dry-run"])
+        self.assertEqual(code, 0)
+        self.assertIn("no --url given", out)
 
     def test_dry_run_resolves_the_catalogue_without_a_token(self):
         code, out = self._run(["--url", "http://127.0.0.1:1", "--log-dir", str(LOGS),
@@ -268,6 +289,17 @@ class CliTests(unittest.TestCase):
         self.assertIn("testhost-auth", out)
         self.assertIn("format=authlog", out)
         self.assertIn("audit", out)
+
+    def test_shipping_without_a_url_says_so(self):
+        code, _, err = self._run_both(["--log-dir", str(LOGS), "--hostname", "testhost",
+                                       "--source", "auth", "--once"])
+        self.assertEqual(code, 2)
+        self.assertIn("--url is required", err)
+
+    def test_check_without_a_url_says_so(self):
+        code, _, err = self._run_both(["--log-dir", str(LOGS), "--hostname", "testhost", "--check"])
+        self.assertEqual(code, 2)
+        self.assertIn("--url is required", err)
 
     def test_unknown_source_exits_two(self):
         code, _ = self._run(["--url", "http://127.0.0.1:1", "--source", "bogus", "--dry-run"])

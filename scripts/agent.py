@@ -10,9 +10,13 @@ re-implemented here. The agent decides *what* to send, in which of the server's 
 formats, and under which source name.
 
     export WATCHPOST_AGENT_TOKEN=wp_...        # ingest-only token, created by an admin
-    ./agent.py --url http://192.168.8.178:8080 --list-sources
+    ./agent.py --list-sources                  # no --url needed: this reads only this host
+    ./agent.py --url http://192.168.8.178:8080 --dry-run
     ./agent.py --url http://192.168.8.178:8080 --check
     ./agent.py --url http://192.168.8.178:8080 --state /var/lib/watchpost-agent/positions.json
+
+`--url` is passed as an option (`--url URL`), not as a bare argument. It is required to ship and
+to run `--check`, and not needed for `--list-sources` or `--dry-run`, which only read this host.
 
 Sources (`--source`, default: auth, firewall, web, audit — see SOURCES):
 
@@ -267,8 +271,8 @@ def list_sources(hostname, prefix="", log_dir=DEFAULT_LOG_DIR):
     print("    sudo usermod -aG adm watchpost-agent")
 
 
-def describe_plan(files, skipped, warnings, hostname, url):
-    print(f"agent on {hostname} -> {url}")
+def describe_plan(files, skipped, warnings, hostname, url=None):
+    print(f"agent on {hostname} -> {url or '(no --url given)'}")
     if not files:
         print("  no sources available: nothing would be shipped")
     for path, fmt, name in files:
@@ -287,7 +291,9 @@ def build_parser():
         description="Collect this Linux host's logs and ship them to a Watchpost server.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Sources: " + ", ".join(SOURCE_NAMES) + "  (or 'all' for the default set)")
-    parser.add_argument("--url", required=True, help="Watchpost base URL, e.g. http://192.168.8.178:8080")
+    parser.add_argument("--url", help="Watchpost base URL, e.g. http://192.168.8.178:8080 "
+                                      "(required to ship, or to run --check; not needed for "
+                                      "--list-sources or --dry-run)")
     parser.add_argument("--source", action="append", metavar="NAME",
                         help="source to collect; repeatable, or 'all' (default: all)")
     parser.add_argument("--hostname", help="override the detected hostname used in source names")
@@ -348,6 +354,13 @@ def main(argv=None):
         if args.dry_run:
             describe_plan(files, skipped, warnings, hostname, args.url)
             return 0
+
+        # Everything below talks to the server, so a URL is required from here on.
+        if not args.url:
+            log("--url is required to ship or to run --check, for example "
+                "--url http://192.168.8.178:8080 . Pass it as an option, not on its own: "
+                "--list-sources works without it.")
+            return 2
 
         shipper.check_url(args.url, args.allow_insecure_http)
 

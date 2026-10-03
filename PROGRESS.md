@@ -293,11 +293,11 @@ demo data. First step of a larger "deployable agent" effort; a Windows collector
 - `docs/AGENT.md`: sources, quick start, CLI reference, the syslog overlap and auditd caveats,
   security posture, a troubleshooting table, and honest limits. `README.md` and
   `docs/LIVE_INGEST.md` now list the agent as the recommended third ingestion path.
-- `tests/test_agent.py`: 43 tests. The load-bearing ones assert **agreement with the server**: every
+- `tests/test_agent.py`: 47 tests. The load-bearing ones assert **agreement with the server**: every
   source's `format` is in `normalize.FORMATS`, and every line the agent produces is accepted by
   `normalize.parse_payload` with the expected `event_type`. `tests/fixtures/logs/` holds committed
-  fixtures so these tests need no runtime temporary directory. Includes regressions for three real
-  bugs found while building (below).
+  fixtures so these tests need no runtime temporary directory. Includes regressions for four real
+  bugs found while building and installing (below).
 
 **Bugs found and fixed before shipping**
 - The transform map was keyed by host-scoped source name (`host01-audit`) while the catalogue is
@@ -311,9 +311,15 @@ demo data. First step of a larger "deployable agent" effort; a Windows collector
 - `--check` sat *after* the "no sources available" guard, so on a host with no readable logs the
   token was never probed and setup could not tell "wrong token" apart from "no sources". It now runs
   before that guard, which is correct because it ships nothing.
+- `--url` was declared `required=True` to argparse, so `agent.py --list-sources` was rejected by
+  argparse before the early-return path for that mode could run. The mode was implemented but
+  unreachable, and it is the first command a new user tries. Reported by the owner during the first
+  real install. `--url` is now optional at the parser level and validated in `main()` only for the
+  modes that transmit, with a message that also says the URL is an option rather than a bare
+  argument. Four tests cover the no-`--url` paths.
 
 **Verification**
-- `python -m unittest tests.test_agent` → 43 tests OK (36 need no server; the 7 server-backed ones
+- `python -m unittest tests.test_agent` → 47 tests OK (40 need no server; the 7 server-backed ones
   need real temporary directories).
 - Verified against the owner's live server: `agent.py --check --allow-insecure-http` on
   `http://192.168.8.178:8080` exited 0 with "token accepted by http://192.168.8.178:8080 (nothing
