@@ -12,8 +12,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from . import (__version__, agents, auth, engine, geo, improve, incidents, queries, report, simulate,
-               storyline, stream)
+from . import (__version__, agents, auth, engine, geo, improve, incidents, maintenance, queries, report,
+               simulate, storyline, stream)
 from .ratelimit import TokenBucketLimiter
 from .config import Config
 from .db import audit, connect, init_schema, now_iso, row_to_dict
@@ -492,6 +492,25 @@ def token_revoke(req, token_id):
 @route("GET", "/api/audit", role="admin")
 def audit_log(req):
     return [dict(r) for r in req.conn.execute("SELECT * FROM audit_log ORDER BY id DESC LIMIT 200")]
+
+
+# Destructive maintenance (admin only, and never a GET) ----------------------------------
+
+@route("GET", "/api/admin/log-data", role="admin")
+def log_data_preview(req):
+    """What a reset would delete, and which tables it would keep. Read-only."""
+    return maintenance.preview(req.conn)
+
+
+@route("POST", "/api/admin/log-data/reset", role="admin")
+def log_data_reset(req):
+    """Delete every ingested event and derived row. Rules, accounts, and tokens are kept.
+
+    The body must carry `{"confirm": "RESET"}` so a stray or replayed POST cannot wipe the store.
+    """
+    if body_json(req).get("confirm") != "RESET":
+        raise ApiError(400, 'refusing to delete data without {"confirm": "RESET"} in the body')
+    return maintenance.reset_logs(req.conn, req.user["username"])
 
 
 # The only non-GET routes a read-only viewer may call.

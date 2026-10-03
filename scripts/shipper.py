@@ -17,6 +17,10 @@ Network and 5xx errors retry the same batch with exponential backoff. A batch th
 server refuses as invalid (400, 413, 415, 422) is logged and skipped so one bad
 line cannot block a file forever. The token is read from an environment variable or
 a file, never from the command line, and is never logged.
+
+`--max-batches-per-pass N` bounds how much one pass drains, so a large `--from-start`
+backlog is sent over several passes instead of one burst. This matters because the
+server runs a detection pass on every batch.
 """
 
 import argparse
@@ -125,11 +129,15 @@ class TailedFile:
 
 class Shipper:
     def __init__(self, url, token, files, state_path, batch_lines=500, batch_bytes=1024 * 1024,
-                 year=None, from_start=False, cafile=None, timeout=30, sleep=time.sleep):
+                 year=None, from_start=False, cafile=None, timeout=30, sleep=time.sleep,
+                 max_batches_per_pass=None):
         self.url, self.token = url.rstrip("/"), token
         self.state_path = Path(state_path)
         self.batch_lines, self.batch_bytes, self.year = batch_lines, batch_bytes, year
         self.timeout, self.sleep = timeout, sleep
+        # Caps how many batches one pass may send, so a large backlog drains over several passes
+        # instead of in one uninterrupted burst. None means "send everything available".
+        self.max_batches_per_pass = max_batches_per_pass
         self.context = ssl.create_default_context(cafile=cafile) if url.startswith("https:") else None
         state = self._load_state()
         self.files = [TailedFile(path, fmt, source, state, from_start) for path, fmt, source in files]
@@ -180,10 +188,16 @@ class Shipper:
         return status
 
     def ship_once(self, max_retries=None):
-        """Send everything currently available. Returns the number of lines sent or skipped."""
-        total = 0
+        """Send everything currently available, or as much as max_batches_per_pass allows.
+
+        Returns the number of lines sent or skipped. Stopping between batches is safe: each batch
+        commits its offset first, so the next pass resumes exactly where this one stopped.
+        """
+        total = batches = 0
         for tailed in self.files:
             while True:
+                if self.max_batches_per_pass and batches >= self.max_batches_per_pass:
+                    return total
                 lines, end = tailed.read_lines(self.batch_lines, self.batch_bytes)
                 if not lines:
                     if end != tailed.offset:  # only blank lines: just advance
@@ -194,6 +208,7 @@ class Shipper:
                 tailed.commit(end)
                 self.save_state()
                 total += len(lines)
+                batches += 1
         return total
 
     def _send_with_backoff(self, tailed, lines, max_retries):
@@ -275,7 +290,11 @@ def main(argv=None):
     parser.add_argument("--token-env", default="WATCHPOST_TOKEN", help="env var holding the token")
     parser.add_argument("--token-file", help="file holding the token (mode 0600 recommended)")
     parser.add_argument("--interval", type=float, default=2.0, help="seconds between polls")
-    parser.add_argument("--batch-lines", type=int, default=500)
+    parser.add_argument("--batch-lines", type=int, default=500,
+                        help="lines per request; a bigger batch means fewer detection runs server-side")
+    parser.add_argument("--max-batches-per-pass", type=int, default=0, metavar="N",
+                        help="send at most N batches per pass, then wait --interval (0 = no limit). "
+                             "Use it to trickle a large --from-start backlog instead of flooding")
     parser.add_argument("--year", type=int, help="year for BSD syslog lines (default: server decides)")
     parser.add_argument("--from-start", action="store_true",
                         help="ship existing content of files seen for the first time (default: only new lines)")
@@ -290,7 +309,8 @@ def main(argv=None):
         token = read_token(args)
         files = [parse_file_spec(spec) for spec in args.file]
         shipper = Shipper(args.url, token, files, args.state, batch_lines=args.batch_lines, year=args.year,
-                          from_start=args.from_start, cafile=args.cafile)
+                          from_start=args.from_start, cafile=args.cafile,
+                          max_batches_per_pass=args.max_batches_per_pass or None)
         try:
             if args.once:
                 sent = shipper.ship_once(max_retries=args.max_retries)

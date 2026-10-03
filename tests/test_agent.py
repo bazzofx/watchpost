@@ -167,6 +167,31 @@ class WrapAuditdTests(unittest.TestCase):
         self.assertEqual(events[0]["event_type"], "process_start")
 
 
+class BackfillWarningTests(unittest.TestCase):
+    """A big --from-start replay is expensive, so it must announce itself before it runs."""
+
+    def warning(self, warn_bytes, batch_lines=500, cap=0):
+        err = io.StringIO()
+        with redirect_stderr(err):
+            agent.warn_about_backfill([(str(LOGS / "auth.log"), "authlog", "host-auth")],
+                                      batch_lines, cap, warn_bytes=warn_bytes)
+        return err.getvalue()
+
+    def test_a_small_replay_is_silent(self):
+        self.assertEqual(self.warning(warn_bytes=10 * 1024 * 1024), "")
+
+    def test_a_large_replay_warns_and_names_the_way_out(self):
+        text = self.warning(warn_bytes=1)
+        self.assertIn("--from-start", text)
+        self.assertIn("drop --from-start", text, "must say how to skip history")
+        self.assertIn("--max-batches-per-pass", text, "must say how to throttle")
+        self.assertIn("detection pass per batch", text, "must explain why it is expensive")
+
+    def test_the_warning_reports_the_current_cap(self):
+        self.assertIn("currently unlimited", self.warning(warn_bytes=1))
+        self.assertIn("currently 25", self.warning(warn_bytes=1, cap=25))
+
+
 class DiscoveryTests(unittest.TestCase):
     """Sources with `scan` take every log in a tree; the rest take the first match only."""
 
@@ -462,6 +487,23 @@ class EndToEndAgentTests(ServerTestCase):
         viewer = self.client("viewer")
         _, events, _ = viewer.get("/api/events?limit=50")
         self.assertEqual(events["total"], 2)
+
+    def test_max_batches_per_pass_stops_a_run_after_one_batch(self):
+        """The knob exists so a backlog can drip instead of hammering the database."""
+        code = self._run_agent(self.tmp.name, self.token_path, sources="web",
+                               extra=["--batch-lines", "1", "--max-batches-per-pass", "1"])
+        self.assertEqual(code, 0)
+        viewer = self.client("viewer")
+        _, events, _ = viewer.get("/api/events?limit=50")
+        self.assertEqual(events["total"], 1, "one line from one batch, then the pass ends")
+
+    def test_without_the_cap_the_same_run_ships_everything(self):
+        code = self._run_agent(self.tmp.name, self.token_path, sources="web",
+                               extra=["--batch-lines", "1"])
+        self.assertEqual(code, 0)
+        viewer = self.client("viewer")
+        _, events, _ = viewer.get("/api/events?limit=50")
+        self.assertGreater(events["total"], 1, "uncapped, one pass drains the whole backlog")
 
     def test_the_nginx_tree_ships_as_separate_sources(self):
         """End to end for the /var/log/nginx/* ask: access and error logs arrive as real events

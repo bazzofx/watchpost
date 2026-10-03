@@ -540,3 +540,102 @@ for — brute-force path discovery and rapid request sequences — plus a plan f
   incident narrative.
 - `web_request_burst` is the rule most likely to need tuning on a busy site; it is medium severity
   and reviewed-change only, like every other threshold.
+
+## Ingest backpressure: the `--from-start` flood (2026-10-03)
+
+**Reported by the owner:** the agent was re-shipping 500-line batches of
+`cybersamurai_security.log` back to back, and the database was overloaded. This was the
+`--from-start` replay recommended two days earlier, running against a file with a real backlog.
+
+**Root cause, measured rather than guessed.** `engine.ingest` calls `run_detection` **once per
+batch**, and each run loads every event in `[batch start − lookback − history, batch end + lookback]`
+— 6 h of lookback plus 24 h of history, so about **30 hours of events per batch**. Total work grows
+with the square of the backfill. On a 20,000-event, 40-batch replay: 40 detection runs, each scanning
+a mean of 5,102 events, **204,100 event-rule evaluations for 20,000 events** (10× amplification), and
+`ship_once()` drained the whole backlog with no pause between batches.
+
+**Shipped**
+- `shipper.Shipper(max_batches_per_pass=N)`: `ship_once` stops after N batches and returns, so the
+  existing `run()` loop's `--interval` sleep throttles the drain. `None` (default) keeps the old
+  behaviour. Stopping between batches is safe because each batch commits its offset first.
+- `scripts/agent.py` and `scripts/shipper.py` both expose `--max-batches-per-pass N` (0 = no limit),
+  so the two CLIs stay aligned.
+- The agent now **warns before it starts** when `--from-start` would replay more than 32 MB, quoting
+  the size, an estimated line count and batch count, and printing both ways out: skip history (drop
+  `--from-start`, delete the position file) or trickle it (`--max-batches-per-pass`).
+
+**Verification**
+- `tests/test_live_ingest.py`: the cap is asserted to bound one pass and resume exactly where it
+  stopped (4/4/2 lines across three passes), and the uncapped path is asserted to still send
+  everything in one pass.
+- `tests/test_agent.py`: `BackfillWarningTests` (silent below the threshold, names both remedies
+  above it, reports the cap in force) plus two end-to-end tests proving `--max-batches-per-pass 1`
+  stops a run after a single batch while the same command without the cap drains everything.
+- Measured against a real server: 4,000 lines at `--batch-lines 500` = 8 batches / 8 detection passes
+  / 18,000 events scanned; at `--batch-lines 2000` = 2 passes / 6,000 scanned. **Bigger batches are
+  the single biggest lever**, because each batch costs one ~30 h scan.
+- No regressions: 312 tests, and the failure set is unchanged apart from the two new shipper tests,
+  which error only under this machine's Windows limitation (it cannot rename an open file, and
+  `tempfile` cleanup fails) and pass when run with a writable temporary directory.
+
+**Not done / notes for the owner**
+- **The per-batch detection pass is the underlying inefficiency and is unchanged.** A proper fix is
+  for a backfill to skip detection per batch and run it once at the end (an opt-out on the ingest
+  path), which would make large historical loads linear. Not implemented; it changes the ingest
+  contract, so it wants a decision first.
+- No retention or rollup exists, so events shipped by a backfill stay in SQLite forever. If a
+  backfill is ever wanted, retention matters more than ingest speed.
+- `--max-batches-per-pass` throttles by POST, not by bytes or events; with a large `--batch-lines`
+  the effective rate is correspondingly higher.
+
+## Admin UI: reset the log data (2026-10-03)
+
+Goal: recover from the backfill without hand-run SQL. The owner had 25 MB of ingested data from an
+accidental historical replay and asked for a control in the Admin view that clears the logs but not
+the rules.
+
+**Shipped**
+- `watchpost/maintenance.py`: `preview(conn)` and `reset_logs(conn, actor)`. `LOG_TABLES` (10) and
+  `KEPT_TABLES` (11) partition the schema explicitly, and a test asserts the two together cover every
+  table, so a future table cannot be added without deciding which side it belongs on.
+  - **Kept deliberately:** `users` and `sessions` (a reset must not sign anyone out), `api_tokens` (an
+    agent must not start failing with 401), `rules` and `rule_history` (tuned thresholds survive),
+    `settings`, `change_requests`, `evaluation_runs`, `audit_log`, and internal bookkeeping.
+  - Held under the engine's detection lock — renamed from `_detection_lock` to public
+    `detection_lock` for this — because a detection run reads events before writing the alerts it
+    derives from them, and deleting those events mid-run would leave alerts with no evidence.
+  - The deletes and the audit entry share one transaction, so a reset happens completely or not at
+    all. `AUTOINCREMENT` counters are reset so a fresh store starts at id 1.
+  - `VACUUM` afterwards returns the space to the filesystem. If it fails (no room for the rewrite)
+    the deletion still stands and the result reports `vacuumed: false` with a note, rather than
+    failing the request after the data is already gone.
+- Routes: `GET /api/admin/log-data` (preview, read-only) and `POST /api/admin/log-data/reset`
+  (admin only). The POST body must be exactly `{"confirm": "RESET"}`; anything else is a 400, so a
+  stray or replayed request cannot wipe the store.
+- Admin view: a **Reset log data** card showing the per-table row counts and exactly which tables are
+  kept, and a dialog that requires the word `RESET` to be typed rather than clicked. The success
+  toast states what was removed and whether the file was compacted.
+
+**Verification**
+- `tests/test_maintenance.py`: 16 tests OK — 9 against an in-memory schema seeded through the real
+  ingest path (so alerts, evidence, activity **and** an incident come from genuine correlation), and
+  7 through a real server.
+  - The narrowness is what is tested: after a reset the rules count is still 13, `/api/auth/me` still
+    answers 200, the token list is intact, and **the same ingest token still ships events (201)**.
+  - Also covered: wrong or missing confirmation words delete nothing, only admins may reset
+    (analyst/viewer 403, anonymous 401), a second reset removes 0, ids restart at 1, the preview
+    changes nothing, and health is `ok` on an empty store.
+  - One test asserts the reset is audited with per-table counts, because the data it removed is gone.
+- No regressions: **328 tests**, the **same 27 pre-existing Windows-only failures**, empty diff of
+  the failure sets — which matters here because `tests/test_viewer.py` sweeps every registered route
+  and now covers both new ones.
+
+**Not done / notes for the owner**
+- **No undo.** The UI says so and recommends copying the database file first; there is no automatic
+  backup before a reset. A `--keep-backup` style pre-reset copy would be a reasonable addition.
+- Resetting does not reduce the *cost* of future ingestion, and there is still **no retention
+  policy**, so an instance will grow unbounded from live logs alone. Retention (delete events older
+  than N days, as a reviewed setting) remains the more useful follow-up.
+- The reset is logs-only by design; a "factory reset" that also clears rules, tokens and accounts is
+  not offered, because deleting the database file (documented in `docs/AGENT.md`) already does that
+  and is the operation that should require shell access.

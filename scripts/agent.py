@@ -208,6 +208,10 @@ def _source_name(source, path, host, log_dir):
     return sanitize_source(f"{base}-{stem}")
 
 
+BACKFILL_WARN_BYTES = 32 * 1024 * 1024
+LOG_LINE_BYTES = 200          # only used to turn a byte count into a rough line estimate
+
+
 def sanitize_source(value):
     """Watchpost requires 1-64 chars of letters, digits, and _ . : - (normalize.validate_source)."""
     return "".join(c if c.isalnum() or c in "_.:-" else "-" for c in value)[:64]
@@ -333,6 +337,29 @@ def check_token(url, token, cafile=None, timeout=30):
 # --- Reporting --------------------------------------------------------------------------
 
 
+def warn_about_backfill(files, batch_lines, max_batches_per_pass, warn_bytes=BACKFILL_WARN_BYTES):
+    """Say how big a first --from-start replay is, before it starts.
+
+    Watchpost runs a full detection pass on every batch, and each pass rescans a window padded by
+    the longest rule lookback plus history — about 30 hours. The cost of a backfill therefore grows
+    with the square of its size, so replaying a large log can keep a single SQLite database busy for
+    a long time. Worth warning about rather than discovering from a support ticket.
+    """
+    total = sum(os.path.getsize(path) for path, _, _ in files if os.path.exists(path))
+    if total < warn_bytes:
+        return
+    lines = total // LOG_LINE_BYTES
+    batches = max(1, lines // max(batch_lines, 1))
+    log(f"WARNING: --from-start replays about {total / 1048576:.0f} MB of existing logs, roughly "
+        f"{lines:,} lines in {batches:,} batches.")
+    log("         Watchpost runs a detection pass per batch and each one rescans ~30 h of events, so "
+        "a large replay is heavy work for one SQLite database.")
+    log("         To skip history: drop --from-start and delete the position file, so every file "
+        "starts at its end.")
+    log(f"         To replay gently: --max-batches-per-pass 20 (currently "
+        f"{max_batches_per_pass or 'unlimited'}) and a larger --batch-lines.")
+
+
 def list_sources(hostname, prefix="", log_dir=DEFAULT_LOG_DIR):
     """Print the catalogue with this host's availability, one line per file that would be tailed."""
     print(f"Watchpost agent sources (host prefix: {prefix or hostname}, log root: {log_dir})\n")
@@ -389,7 +416,12 @@ def build_parser():
     parser.add_argument("--token-env", default="WATCHPOST_AGENT_TOKEN", help="env var holding the token")
     parser.add_argument("--token-file", help="file holding the token (mode 0600 recommended)")
     parser.add_argument("--interval", type=float, default=2.0, help="seconds between polls")
-    parser.add_argument("--batch-lines", type=int, default=500)
+    parser.add_argument("--batch-lines", type=int, default=500,
+                        help="lines per request (default: %(default)s); a bigger batch means fewer "
+                             "detection runs on the server")
+    parser.add_argument("--max-batches-per-pass", type=int, default=0, metavar="N",
+                        help="send at most N batches per pass, then wait --interval (0 = no limit). "
+                             "Use it to trickle a large --from-start backlog instead of flooding")
     parser.add_argument("--year", type=int, help="year for BSD syslog lines (default: the server decides)")
     parser.add_argument("--from-start", action="store_true",
                         help="ship existing content of files seen for the first time (default: new lines only)")
@@ -478,8 +510,12 @@ def main(argv=None):
                 "Run with --list-sources to see what was expected.")
             return 2
 
+        if args.from_start:
+            warn_about_backfill(files, args.batch_lines, args.max_batches_per_pass)
+
         agent = AgentShipper(args.url, token, files, args.state, batch_lines=args.batch_lines,
                              year=args.year, from_start=args.from_start, cafile=args.cafile,
+                             max_batches_per_pass=args.max_batches_per_pass or None,
                              transforms=transforms)
         try:
             if args.once:

@@ -350,6 +350,31 @@ class ShipperTests(unittest.TestCase):
         self.assertEqual(restarted.ship_once(), 0)
         self.assertEqual(len(fake.requests), 2)
 
+    def test_max_batches_per_pass_bounds_a_pass_and_resumes(self):
+        """A backlog drains over several passes so a big replay cannot flood the server."""
+        fake = self.fake()
+        self.append("".join(f"line {i}\n" for i in range(10)))
+        tail = shipper.Shipper(fake.url, self.TOKEN, [(str(self.log), "authlog", "box-auth")], self.state,
+                               batch_lines=4, from_start=True, max_batches_per_pass=1,
+                               sleep=self.sleeps.append)
+        self.addCleanup(tail.close)
+        self.assertEqual(tail.ship_once(), 4)          # one batch, then the pass ends
+        self.assertEqual(len(fake.requests), 1)
+        self.assertEqual(tail.ship_once(), 4)          # the next pass continues where this stopped
+        self.assertEqual(tail.ship_once(), 2)
+        self.assertEqual(tail.ship_once(), 0)
+        self.assertEqual(len(fake.requests), 3)
+        self.assertEqual([r["body"].count(b"\n") for r in fake.requests], [4, 4, 2])
+
+    def test_without_a_cap_one_pass_sends_everything(self):
+        fake = self.fake()
+        self.append("".join(f"line {i}\n" for i in range(10)))
+        tail = shipper.Shipper(fake.url, self.TOKEN, [(str(self.log), "authlog", "box-auth")], self.state,
+                               batch_lines=4, from_start=True, sleep=self.sleeps.append)
+        self.addCleanup(tail.close)
+        self.assertEqual(tail.ship_once(), 10)
+        self.assertEqual(len(fake.requests), 3)
+
     def test_batches_respect_line_limit(self):
         fake = self.fake()
         self.append("".join(f"l{i}\n" for i in range(7)))

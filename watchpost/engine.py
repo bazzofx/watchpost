@@ -16,8 +16,9 @@ EVENT_COLUMNS = ["ts", "source", "host", "event_type", "outcome", "severity",
 # Fields detection rules can read.
 RULE_EVENT_FIELDS = "id, ts, event_type, user, src_ip, host, dest_ip, dest_port, bytes, message, synthetic"
 
-# Detection runs are serialized so concurrent ingests cannot create duplicate alerts.
-_detection_lock = threading.Lock()
+# Detection runs are serialized so concurrent ingests cannot create duplicate alerts. Also held by
+# maintenance.reset_logs, so events cannot be deleted underneath a run that is reading them.
+detection_lock = threading.Lock()
 
 
 def seed_rules(conn, actor="system"):
@@ -162,7 +163,7 @@ def run_detection(conn, trigger="manual", start=None, end=None):
     Failures are recorded in detection_runs and error_log and returned honestly;
     the ingested events stay stored so the run can be retried.
     """
-    with _detection_lock:
+    with detection_lock:
         started = now_iso()
         run_id = conn.execute(
             "INSERT INTO detection_runs(started_at, trigger, status) VALUES (?,?,'running')",

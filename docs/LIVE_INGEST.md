@@ -130,7 +130,7 @@ hand, use the agent instead — `sudo ./deploy/agent/install-agent.sh --url ...`
 
 `scripts/shipper.py` is one file with no dependencies. It tails one or more files and posts complete new lines to `POST /api/ingest/upload` with an ingest token.
 
-- **Batching:** up to 500 lines or 1 MB per request, polled every 2 seconds.
+- **Batching:** up to 500 lines or 1 MB per request, polled every 2 seconds. **Watchpost runs a detection pass on every batch, and each pass rescans about 30 hours of events** (the longest rule lookback plus history). A large `--from-start` backfill is therefore quadratic in cost — raise `--batch-lines` to cut the number of passes, and see [AGENT.md](AGENT.md#backfilling-an-existing-log-is-expensive--read-this-first) before replaying an existing log.
 - **Position file:** after each accepted batch, the byte offset and inode of every file are written atomically. A restart resumes where it stopped.
 - **Rotation:** when the file is renamed and a new one created, the shipper drains the old file and then switches. It also handles truncation in place (`copytruncate`).
 - **Backoff:** network errors, 5xx responses, and 401/403 retry the same batch with exponential backoff, from 1 s up to 60 s, with jitter. Nothing is skipped.
@@ -203,7 +203,8 @@ journalctl -u watchpost-shipper -f
 | `--year` | Year for BSD syslog lines, which carry none |
 | `--once` / `--max-retries N` | Ship what is there and exit, giving up after N retries. Useful for cron and for tests |
 | `--cafile` | CA bundle, e.g. for a self-signed HTTPS certificate on the demo VM |
-| `--interval`, `--batch-lines` | Poll interval (default 2 s) and lines per request (default 500) |
+| `--interval`, `--batch-lines` | Poll interval (default 2 s) and lines per request (default 500). A bigger batch means fewer detection passes server-side, so it is cheaper overall |
+| `--max-batches-per-pass N` | Send at most N batches per pass, then wait `--interval` (0 = no limit). Use it to trickle a large `--from-start` backlog instead of flooding the server |
 
 **nginx access logs:** `--file /var/log/nginx/access.log:weblog` ships nginx/Apache combined access lines as `web_request`, `web_scan`, and `web_error` events (`auto` detects the format too). The combined format has no host field, so give the file a `SOURCE` that names the box, e.g. `--file /var/log/nginx/access.log:weblog:web01-nginx`. **nginx error logs** need `format=nginx_error`, not `weblog`: error lines are not in the combined format, and because they contain commas `auto` used to read them as CSV and silently store nothing. With the agent, both are picked up automatically from `nginx/*.log`. **Firewall logs:** UFW and iptables write to syslog (`/var/log/ufw.log` or `kern.log`), so ship them as `authlog`; firewall CSV exports go as `csv`.
 

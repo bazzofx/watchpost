@@ -677,6 +677,40 @@ async function historyDialog(rule) {
   $("#modal").showModal();
 }
 
+// Deleting the log store is irreversible, so it asks for the word to be typed rather than clicked.
+function resetDialog(logData) {
+  const total = (logData.total ?? 0).toLocaleString();
+  const counts = Object.entries(logData.counts || {}).filter(([, n]) => n > 0);
+  const form = el("form", {},
+    el("h2", {}, "Reset log data"),
+    el("p", {}, `This permanently deletes ${total} row(s) and cannot be undone.`),
+    counts.length ? el("ul", { class: "muted" }, counts.map(([name, n]) => el("li", {}, el("code", {}, name), `: ${n.toLocaleString()}`))) : null,
+    el("p", { class: "muted" }, "Kept, so nothing breaks: rules and their tuned thresholds, accounts, sessions, API tokens, security settings, change requests, evaluation history, and the audit log. This action is recorded there."),
+    el("p", { class: "muted" }, "If an agent is replaying a backlog, stop it first, or it will refill the store."),
+    el("label", {}, "Type RESET to confirm", el("input", { name: "confirm", required: true, autocomplete: "off", placeholder: "RESET" })),
+    el("p", { class: "error", id: "reset-error" }),
+    el("div", { class: "row" },
+      el("button", { type: "submit", class: "danger" }, "Delete log data"),
+      el("button", { type: "button", class: "ghost", onclick: () => $("#modal").close() }, "Cancel")));
+  form.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    if (String(new FormData(form).get("confirm") || "").trim() !== "RESET") {
+      $("#reset-error").textContent = "Type RESET exactly to confirm.";
+      return;
+    }
+    try {
+      const r = await api("/api/admin/log-data/reset", { method: "POST", body: { confirm: "RESET" } });
+      $("#modal").close();
+      toast(`Removed ${r.removed_total.toLocaleString()} row(s); rules, accounts and tokens kept.`
+        + (r.vacuumed ? "" : " The file was not compacted, so its size on disk is unchanged."));
+      refreshBanner();
+      admin();
+    } catch (e) { $("#reset-error").textContent = e.message; }
+  });
+  $("#modal-body").replaceChildren(form);
+  $("#modal").showModal();
+}
+
 // ---------- health ----------
 async function health() {
   const h = await api("/api/health/details");
@@ -706,7 +740,8 @@ async function health() {
 // ---------- admin ----------
 async function admin() {
   if (!can("admin")) return render(el("p", {}, "Admins only."));
-  const [tokens, audit] = await Promise.all([api("/api/tokens"), api("/api/audit")]);
+  const [tokens, audit, logData] = await Promise.all([api("/api/tokens"), api("/api/audit"),
+    api("/api/admin/log-data")]);
   const tokenOut = el("div");
   const tokenForm = el("form", { class: "row" },
     el("label", {}, "Token name", el("input", { name: "name", required: true, maxlength: 64, placeholder: "e.g. web01-forwarder" })),
@@ -741,6 +776,15 @@ async function admin() {
         t.revoked_at ? "" : el("button", { class: "danger", onclick: () => confirm(`Revoke token "${t.name}"?`) && guarded(async () => { await api(`/api/tokens/${t.id}/revoke`, { method: "POST" }); admin(); }) }, "Revoke")] })))),
     el("div", { class: "card" }, el("h2", {}, "Audit log"),
       table(["When", "Actor", "Action", "Target", "Detail"], audit.map((a) => ({ cells: [fmtTime(a.created_at), a.actor, a.action, a.target ?? "", el("code", {}, a.detail ?? "")] })))),
+    el("div", { class: "card" }, el("h2", {}, "Reset log data"),
+      el("p", { class: "muted" }, "Deletes every ingested event and everything derived from it: alerts, evidence, notes, incidents, ingest batches, detection runs and the error log. "
+        + "Rules, thresholds, accounts, API tokens, security settings, change requests and the audit log are kept, so nobody is signed out and no ingest token stops working. "
+        + "This cannot be undone, so take a copy of the database file first if you might want the data back."),
+      table(["Table", "Rows"], Object.entries(logData.counts || {}).map(([name, n]) => ({ cells: [el("code", {}, name), { num: n }] }))),
+      el("p", {}, el("strong", {}, `${(logData.total ?? 0).toLocaleString()} row(s) would be removed.`),
+        " Kept: " + (logData.kept_tables || []).join(", ") + "."),
+      el("div", { class: "row" },
+        el("button", { class: "danger", onclick: () => resetDialog(logData) }, "Reset log data…"))),
   );
 }
 

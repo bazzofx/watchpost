@@ -130,6 +130,52 @@ Lines that are not auditd records are dropped and counted in the log, rather tha
 batch. To get a username on these events, set `log_format = ENRICHED` in `/etc/audit/auditd.conf`;
 otherwise they arrive with no `user` and no `src_ip`.
 
+## Backfilling an existing log is expensive — read this first
+
+`--from-start` makes the agent replay a file from its beginning. That looks harmless and is not:
+**Watchpost runs a full detection pass on every batch**, and each pass rescans a window padded by the
+longest rule lookback (6 h) plus the longest history requirement (24 h) — about **30 hours of
+events**. Every batch is therefore one POST *and* one ~30-hour scan, so the total work grows with the
+square of the backlog.
+
+Measured on a 4,000-line, 0.4 MB fixture (20 hours of access log):
+
+| Configuration | Batches | Detection passes | Events scanned |
+|---|---|---|---|
+| `--batch-lines 500` | 8 | 8 | 18,000 |
+| `--batch-lines 2000` | 2 | 2 | 6,000 |
+
+Two consequences worth acting on:
+
+1. **Do not replay a large historical file** into this SIEM unless you mean to. A few hundred MB of
+   access log is hundreds of thousands of events and thousands of detection passes, which will keep a
+   single SQLite database busy for a long time and make the UI sluggish. Watchpost is sized for
+   thousands to low millions of events, not for ingesting a year of logs.
+2. **Bigger batches are strictly cheaper.** Four times the batch size means four times fewer
+   detection passes for the same data. Raise `--batch-lines` (2000–4000) before reaching for a faster
+   machine.
+
+The agent warns before it starts if `--from-start` would replay more than 32 MB, and prints both ways
+out. To control the pace anyway:
+
+```bash
+# Trickle: at most 20 batches per pass, then wait --interval (2 s).
+python3 agent.py --url http://127.0.0.1:8080 --from-start --batch-lines 2000 --max-batches-per-pass 20
+```
+
+To **skip history** instead — the usual right answer, and what most installs want:
+
+```bash
+# Stop the agent, then let every file start at its own end.
+sudo systemctl stop watchpost-agent
+sudo sed -i 's/^WATCHPOST_AGENT_EXTRA_ARGS=.*/WATCHPOST_AGENT_EXTRA_ARGS=/' /etc/watchpost-agent/agent.env
+sudo rm -f /var/lib/watchpost-agent/positions.json
+sudo systemctl start watchpost-agent
+```
+
+Deleting the position file only removes the saved offsets; with `--from-start` gone, every file is
+read from its current end and live tailing resumes with nothing replayed.
+
 ## Command line
 
 | Option | Meaning |
@@ -141,6 +187,7 @@ otherwise they arrive with no `user` and no `src_ip`.
 | `--token-env` / `--token-file` | Where the token comes from (default env `WATCHPOST_AGENT_TOKEN`) |
 | `--state` | Position file (default `./watchpost-agent-positions.json`) |
 | `--interval`, `--batch-lines` | Poll interval (default 2 s) and lines per request (default 500) |
+| `--max-batches-per-pass N` | Send at most N batches in one pass, then wait `--interval` (0 = no limit). Use it to trickle a large backlog |
 | `--from-start` | Ship the existing content of a file seen for the first time. Default: only new lines |
 | `--year` | Year for BSD syslog lines, which carry none. Leave unset for live tailing |
 | `--cafile` | CA bundle, for a self-signed HTTPS certificate |

@@ -251,6 +251,31 @@ session (UI uploads, the demo loader) or by the syslog listener are not agents a
 | `GET /api/tokens` / `POST /api/tokens` | admin | `{name}` → `{token}` (shown once; only a SHA-256 hash is stored) |
 | `POST /api/tokens/{id}/revoke` | admin | |
 | `GET /api/audit` | admin | Last 200 audit entries |
+| `GET /api/admin/log-data` | admin | What a reset would delete, and which tables it keeps. Read-only; changes nothing |
+| `POST /api/admin/log-data/reset` | admin | Deletes all ingested data. Body **must** be `{"confirm": "RESET"}` |
+
+### Resetting the log data
+
+`POST /api/admin/log-data/reset` is the destructive one: it empties every table that ingestion
+populates and leaves all configuration alone. The body must carry `{"confirm": "RESET"}` — anything
+else is a `400` — so a stray or replayed request cannot wipe the store.
+
+| Removed | Kept |
+|---|---|
+| `events`, `alerts`, `alert_events`, `alert_notes`, `alert_activity`, `incidents`, `incident_alerts`, `ingest_batches`, `detection_runs`, `error_log` | `users`, `sessions`, `api_tokens`, `rules`, `rule_history`, `settings`, `change_requests`, `evaluation_runs`, `audit_log`, and internal bookkeeping |
+
+Keeping sessions means nobody is signed out; keeping API tokens means an agent does not start
+failing with `401`; keeping rules means tuned thresholds and their history survive. The response
+reports `removed` per table, `removed_total`, and `vacuumed` — `VACUUM` returns the file to the
+filesystem afterwards, and if it cannot run (no room for the rewrite) the deletion still stands and
+`vacuumed` is `false` with a `vacuum_note`.
+
+The action is written to the audit log as `logs_reset` with the per-table counts, because the data it
+removed is gone. `AUTOINCREMENT` counters are reset, so a fresh store starts again at id 1.
+
+`GET /api/admin/log-data` returns the same numbers without changing anything, which is what the
+Admin page shows before you are asked to confirm. There is no undo: take a copy of the database file
+first if the data might be wanted back.
 
 ## Attack storyline (synthetic demo)
 
