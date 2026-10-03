@@ -681,23 +681,31 @@ async function historyDialog(rule) {
 function resetDialog(logData) {
   const total = (logData.total ?? 0).toLocaleString();
   const counts = Object.entries(logData.counts || {}).filter(([, n]) => n > 0);
+  const error = el("p", { class: "error", id: "reset-error" });
+  const submit = el("button", { type: "submit", class: "danger" }, "Delete log data");
   const form = el("form", {},
     el("h2", {}, "Reset log data"),
     el("p", {}, `This permanently deletes ${total} row(s) and cannot be undone.`),
     counts.length ? el("ul", { class: "muted" }, counts.map(([name, n]) => el("li", {}, el("code", {}, name), `: ${n.toLocaleString()}`))) : null,
     el("p", { class: "muted" }, "Kept, so nothing breaks: rules and their tuned thresholds, accounts, sessions, API tokens, security settings, change requests, evaluation history, and the audit log. This action is recorded there."),
     el("p", { class: "muted" }, "If an agent is replaying a backlog, stop it first, or it will refill the store."),
-    el("label", {}, "Type RESET to confirm", el("input", { name: "confirm", required: true, autocomplete: "off", placeholder: "RESET" })),
-    el("p", { class: "error", id: "reset-error" }),
-    el("div", { class: "row" },
-      el("button", { type: "submit", class: "danger" }, "Delete log data"),
+    // Deliberately no `required` on this input: native validation would block the submit and show
+    // only a transient browser tooltip, so the button would look broken. The check below explains
+    // itself in the dialog instead.
+    el("label", {}, "Type RESET to confirm", el("input", { name: "confirm", autocomplete: "off", placeholder: "RESET" })),
+    error,
+    el("div", { class: "row" }, submit,
       el("button", { type: "button", class: "ghost", onclick: () => $("#modal").close() }, "Cancel")));
   form.addEventListener("submit", async (ev) => {
     ev.preventDefault();
-    if (String(new FormData(form).get("confirm") || "").trim() !== "RESET") {
-      $("#reset-error").textContent = "Type RESET exactly to confirm.";
+    error.textContent = "";
+    if (String(new FormData(form).get("confirm") || "").trim().toUpperCase() !== "RESET") {
+      error.textContent = "Type RESET in the box above first, then press Delete log data.";
       return;
     }
+    // VACUUM can take a moment on a large database, so show that the click registered.
+    submit.disabled = true;
+    submit.textContent = "Deleting…";
     try {
       const r = await api("/api/admin/log-data/reset", { method: "POST", body: { confirm: "RESET" } });
       $("#modal").close();
@@ -705,7 +713,13 @@ function resetDialog(logData) {
         + (r.vacuumed ? "" : " The file was not compacted, so its size on disk is unchanged."));
       refreshBanner();
       admin();
-    } catch (e) { $("#reset-error").textContent = e.message; }
+    } catch (e) {
+      submit.disabled = false;
+      submit.textContent = "Delete log data";
+      error.textContent = e.status === 403
+        ? `${e.message} — your session may have expired; sign in again.`
+        : e.message;
+    }
   });
   $("#modal-body").replaceChildren(form);
   $("#modal").showModal();
