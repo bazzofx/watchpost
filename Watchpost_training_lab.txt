@@ -1,0 +1,52 @@
+#Deploy SIEM
+
+export SIEM_ADMIN_PASSWORD='adminpass123'      # optional; otherwise generated
+export SIEM_ANALYST_PASSWORD='adminpass123'     # optional; otherwise generated
+export SIEM_VIEWER_PASSWORD='adminpass123'     # optional; creates a read-only 
+export SIEM_HOST=0.0.0.0
+
+cd ~/apps/watchpost
+./start.sh
+
+#Deploy Agent
+export WATCHPOST_AGENT_TOKEN=wp_hjgiVix_pVcQGMuuBIes8lM3Z_gwVZGG5Xcab4Zo8Ok
+cd ~/apps/watchpost/deploy/agent
+chmod +x install-agent.sh
+sudo ./install-agent.sh --url http://192.168.8.178:8080  --allow-insecure-http
+
+#################################################################################
+###################### F I R E    W A L L #######################################
+# Enable Firewall logggin
+sudo ufw logging on
+sudo ufw logging low
+
+
+# Create Firewall log
+sudo touch /var/log/ufw.log
+sudo chown syslog:adm /var/log/ufw.log
+sudo chmod 640 /var/log/ufw.log
+sudo systemctl restart rsyslog
+
+#Configure Firewall
+sudo ufw allow 22/tcp
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
+sudo ufw allow 8080/tcp
+sudo ufw enable
+
+# Watch Firewall log
+sudo tail -f /var/log/ufw.log
+
+
+#---------------------------------------------------------
+# WATCHPOST AGENT TROUBLESHOOT
+
+#View logs been send out
+sudo journalctl -u watchpost-agent
+
+#Individual logs location
+## view nginx logs
+alias viewLiveNginx="tail /var/log/nginx/cybersamurai_security.log -f"
+
+## List sources
+cd ~/apps/watchpost/scripts; python3 agent.py --list-sources
