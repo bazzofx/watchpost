@@ -4,8 +4,9 @@ import unittest
 from datetime import timedelta
 
 from tests.helpers import ADMIN_PW, ServerTestCase
-from watchpost import server
+from watchpost import attack, server
 from watchpost.db import iso, utcnow
+from watchpost.health import STATIC_DIR
 from watchpost.rules import DEFAULT_RULES
 
 # Kept as a set rather than a hard-coded number: the rule count changes when a rule is added,
@@ -142,6 +143,62 @@ class AuthTests(ServerTestCase):
         self.assertEqual(admin.post(f"/api/tokens/{token_id}/revoke")[0], 200)
         self.assertEqual(bot.post("/api/ingest", [{"ts": recent()}], headers=auth)[0], 401)
         self.assertEqual(bot.post("/api/ingest", [{"ts": recent()}], headers={"Authorization": "Bearer wp_x"})[0], 401)
+
+    def test_role_scoped_tokens_have_explicit_capabilities_and_expiry(self):
+        admin, bot = self.client("admin"), self.client()
+
+        def create(body):
+            status, data, _ = admin.post("/api/tokens", body)
+            self.assertEqual(status, 201, data)
+            return {"Authorization": f"Bearer {data['token']}"}
+
+        viewer = create({"name": "readonly", "role": "viewer", "capabilities": ["read"],
+                         "expires_in_days": 30})
+        self.assertEqual(bot.get("/api/alerts", headers=viewer)[0], 200)
+        self.assertEqual(bot.get("/api/auth/me", headers=viewer)[1]["user"]["role"], "viewer")
+        self.assertEqual(bot.post("/api/ingest", [{"ts": recent()}], headers=viewer)[0], 403)
+        self.assertEqual(bot.post("/api/alerts/1/notes", {"body": "x"}, headers=viewer)[0], 403)
+
+        triage = create({"name": "soc-bot", "role": "analyst", "capabilities": ["read", "triage"]})
+        alert = bot.get("/api/alerts", headers=triage)[1]
+        if not alert:
+            self.assertEqual(admin.post("/api/demo/load")[0], 200)
+            alert = bot.get("/api/alerts", headers=triage)[1]
+        alert_id = alert[0]["id"]
+        self.assertEqual(bot.post(f"/api/alerts/{alert_id}/notes", {"body": "checked by automation"},
+                                  headers=triage)[0], 201)
+        self.assertEqual(bot.post("/api/ingest", [{"ts": recent()}], headers=triage)[0], 403)
+        self.assertEqual(bot.post("/api/demo/load", {}, headers=triage)[0], 403)
+
+        listed = {row["name"]: row for row in admin.get("/api/tokens")[1]}
+        self.assertEqual((listed["readonly"]["role"], listed["readonly"]["capabilities"]),
+                         ("viewer", ["read"]))
+        self.assertIsNotNone(listed["readonly"]["expires_at"])
+        self.assertIsNotNone(listed["readonly"]["last_used_at"])
+        self.assertEqual((listed["soc-bot"]["role"], listed["soc-bot"]["capabilities"]),
+                         ("analyst", ["read", "triage"]))
+
+        with sqlite3.connect(self.db_path) as db:
+            db.execute("UPDATE api_tokens SET expires_at = '2000-01-01T00:00:00.000Z' WHERE name = 'readonly'")
+        self.assertEqual(bot.get("/api/alerts", headers=viewer)[0], 401)
+        with sqlite3.connect(self.db_path) as db:
+            db.execute("UPDATE api_tokens SET role = 'admin', expires_at = NULL WHERE name = 'readonly'")
+        self.assertEqual(bot.get("/api/tokens", headers=viewer)[0], 401)
+
+    def test_api_token_scope_validation(self):
+        admin = self.client("admin")
+        bad = [
+            {"name": "x", "role": "admin", "capabilities": ["read"]},
+            {"name": "x", "role": "viewer", "capabilities": ["ingest"]},
+            {"name": "x", "role": "analyst", "capabilities": ["admin"]},
+            {"name": "x", "role": "analyst", "capabilities": []},
+            {"name": "x", "role": "analyst", "capabilities": ["read", "read"]},
+            {"name": "x", "role": "analyst", "capabilities": ["read"], "expires_in_days": 0},
+            {"name": "x", "role": "analyst", "capabilities": ["read"], "expires_in_days": 366},
+        ]
+        for body in bad:
+            with self.subTest(body=body):
+                self.assertEqual(admin.post("/api/tokens", body)[0], 400)
 
     def test_static_files_and_traversal(self):
         import urllib.request
@@ -302,19 +359,87 @@ class IncidentApiTests(ServerTestCase):
         self.assertEqual(status, 200)
         self.assertEqual(coverage["tactics"][0]["name"], "Reconnaissance")
         by_id = {t["id"]: t for t in coverage["techniques"]}
-        self.assertEqual(coverage["summary"]["covered"], len(by_id))
+        # Covered means validated on a labeled scenario; T1190 and T1048 are only mapped.
+        self.assertEqual(coverage["summary"]["covered"], len(by_id) - 3)  # T1190, T1048, T1595.001 are only mapped
         self.assertEqual(by_id["T1548.003"]["hits"], 1)
         self.assertEqual(by_id["T1110.003"]["hits"], 0)
         self.assertEqual([r["id"] for r in by_id["T1046"]["rules"]], ["firewall_port_sweep"])
 
+    def test_attack_coverage_evidence_levels(self):
+        viewer = self.client("viewer")
+        self.assertEqual(self.client().get("/api/attack/coverage")[0], 401)
+        status, coverage, _ = viewer.get("/api/attack/coverage")
+        self.assertEqual(status, 200)
+        # The 2.x shape the dashboard and the Navigator export read is still there.
+        self.assertLessEqual({"tactics", "techniques", "summary"}, set(coverage))
+        self.assertLessEqual({"techniques", "covered", "with_hits"}, set(coverage["summary"]))
+        self.assertEqual(coverage["levels"], ["validated", "mapped", "disabled", "gap"])
+        by_id = {t["id"]: t for t in coverage["techniques"]}
+        for t in by_id.values():
+            with self.subTest(technique=t["id"]):
+                self.assertLessEqual({"id", "name", "tactic", "rules", "hits", "covered", "level", "scenarios"}, set(t))
+                self.assertEqual(t["covered"], t["level"] == "validated")
+                for r in t["rules"]:
+                    self.assertLessEqual({"id", "name", "enabled", "hits", "verdict", "lookalikes_fired", "proves"},
+                                         set(r))
+        self.assertEqual({i for i, t in by_id.items() if t["level"] == "mapped"}, {"T1190", "T1048", "T1595.001"})
+        self.assertEqual(by_id["T1110.003"]["scenarios"], ["password_spray"])
+        web = by_id["T1190"]["rules"][0]
+        self.assertEqual((web["id"], web["verdict"], web["proves"]), ("web_scanner", "quiet", []))
+        summary = coverage["summary"]
+        self.assertEqual(summary["levels"], {"validated": len(by_id) - 3, "mapped": 3, "disabled": 0, "gap": 0})
+        self.assertEqual(summary["covered"], summary["levels"]["validated"])
+
+    def test_disabling_a_rule_moves_its_techniques_off_validated(self):
+        analyst, admin = self.client("analyst"), self.client("admin")
+        change = analyst.post("/api/rules/web_scanner/proposals", {"enabled": False, "reason": "coverage test"})[1]
+        self.assertEqual(admin.post(f"/api/changes/{change['id']}/review",
+                                    {"decision": "approve", "evidence_digest": change["evidence_digest"],
+                                     "acknowledge_detection_loss": True})[0], 200)
+        by_id = {t["id"]: t for t in self.client("viewer").get("/api/attack/coverage")[1]["techniques"]}
+        self.assertEqual([by_id[i]["level"] for i in ("T1595.002", "T1595.003", "T1190")], ["disabled"] * 3)
+        self.assertEqual(by_id["T1595.002"]["rules"][0]["verdict"], "disabled")
+
+    def test_navigator_layer_export(self):
+        viewer = self.client("viewer")
+        self.assertEqual(self.client().get("/api/attack/navigator.json")[0], 401)
+        self.load_intrusion(self.client("analyst"))
+        status, layer, headers = viewer.get("/api/attack/navigator.json")
+        self.assertEqual((status, headers["Content-Type"].split(";")[0]), (200, "application/json"))
+        self.assertEqual((layer["domain"], layer["versions"]), ("enterprise-attack", {"layer": "4.5"}))
+        self.assertIn("synthetic", layer["description"].lower())
+        coverage = {t["id"]: t for t in viewer.get("/api/attack/coverage")[1]["techniques"]}
+        # Every technique, scored by hits and colored by the same level the Coverage view shows.
+        self.assertEqual({t["techniqueID"]: t["score"] for t in layer["techniques"]},
+                         {i: t["hits"] for i, t in coverage.items()})
+        self.assertEqual({t["techniqueID"]: t["color"] for t in layer["techniques"]},
+                         {i: attack.LEVEL_COLORS[t["level"]] for i, t in coverage.items()})
+        for t in layer["techniques"]:
+            self.assertTrue(t["comment"].startswith(coverage[t["techniqueID"]]["level"].capitalize()))
+        self.assertIn("firewall_port_sweep", {t["techniqueID"]: t for t in layer["techniques"]}["T1046"]["comment"])
+        self.assertEqual(layer["gradient"]["maxValue"], max(t["hits"] for t in coverage.values()))
+        self.assertIn('href: "/api/attack/navigator.json"', (STATIC_DIR / "dashboard.js").read_text())
+
     def test_existing_database_upgrades_in_place(self):
         # A 1.0 database: no techniques column, no new event columns, no incidents tables.
         with sqlite3.connect(self.db_path) as db:
+            db.execute("INSERT INTO api_tokens(name, token_hash, prefix, created_by, created_at)"
+                       " VALUES ('legacy collector', 'legacy-hash', 'wp_old', 'admin', '2020-01-01T00:00:00.000Z')")
+            db.execute("ALTER TABLE api_tokens DROP COLUMN role")
+            db.execute("ALTER TABLE api_tokens DROP COLUMN capabilities")
+            db.execute("ALTER TABLE api_tokens DROP COLUMN expires_at")
             db.execute("DROP TABLE incidents")
             db.execute("DROP TABLE incident_alerts")
             db.execute("ALTER TABLE rules DROP COLUMN techniques")
             db.execute("ALTER TABLE events DROP COLUMN bytes")
             db.execute("DELETE FROM rules WHERE id = 'web_scanner'")
+            # A 2.0 database: no asset inventory and no asset weighting on alerts.
+            db.execute("DROP TABLE assets")
+            db.execute("ALTER TABLE alerts DROP COLUMN base_severity")
+            # A 3.x database: an audit log with no hash chain.
+            db.execute("ALTER TABLE audit_log DROP COLUMN prev_hash")
+            db.execute("ALTER TABLE audit_log DROP COLUMN hash")
+            old_entries = db.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0]
         from watchpost.server import App
         App(self.config)
         with sqlite3.connect(self.db_path) as db:
@@ -324,7 +449,20 @@ class IncidentApiTests(ServerTestCase):
             self.assertIn("web_scanner", techniques)
             self.assertTrue(all(json.loads(t) for t in techniques.values()))
             self.assertEqual(db.execute("SELECT COUNT(*) FROM incidents").fetchone()[0], 0)
-            self.assertEqual(db.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()[0], "2")
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM assets").fetchone()[0], 0)
+            self.assertIn("base_severity", {r[1] for r in db.execute("PRAGMA table_info(alerts)")})
+            legacy = db.execute("SELECT role, capabilities, expires_at FROM api_tokens"
+                                " WHERE name = 'legacy collector'").fetchone()
+            self.assertEqual(legacy, ("analyst", '["ingest"]', None))
+            self.assertEqual(db.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()[0], "15")
+            actions = [r[0] for r in db.execute("SELECT action FROM audit_log ORDER BY id")]
+            self.assertGreater(old_entries, 0)
+            self.assertEqual(actions[old_entries], "audit_chain_started")
+        verified = self.client("admin").get("/api/audit/verify")[1]
+        # Pre-4.0 entries are counted but not vouched for, so an upgraded log is "partial", never "ok".
+        self.assertEqual((verified["ok"], verified["status"]), (False, "partial"), verified["first_break"])
+        self.assertEqual(verified["legacy"]["entries"], old_entries)
+        self.assertEqual(verified["chain_started"]["id"], verified["legacy"]["last_id"] + 1)
 
 
 class SearchTests(ServerTestCase):

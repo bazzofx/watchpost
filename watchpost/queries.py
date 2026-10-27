@@ -3,8 +3,12 @@
 import sqlite3
 from datetime import timedelta
 
+import json
+import sqlite3
+from datetime import timedelta
+
 from . import archive
-from .db import iso, now_iso, parse_iso, row_to_dict, transaction, utcnow
+from .db import audit, iso, now_iso, parse_iso, row_to_dict, transaction, utcnow
 from .normalize import EVENT_TYPES, SEVERITIES, EventError, parse_timestamp
 
 ALERT_STATUSES = ("open", "investigating", "resolved")
@@ -88,14 +92,18 @@ def search_events(conn, params):
     if since_id is not None:
         where.append("id > ?")
         args.append(since_id)
+    return page_events(conn, where, args, params, newest_stored_first=since_id is not None)
 
+
+def page_events(conn, where, args, params, newest_stored_first=False):
+    """One page of events matching parameterized WHERE fragments (shared by event search and hunting)."""
     limit = _int(params.get("limit"), "limit", 100, 1, 1000)
     offset = _int(params.get("offset"), "offset", 0, 0, 10_000_000)
     clause = (" WHERE " + " AND ".join(where)) if where else ""
     total = conn.execute(f"SELECT COUNT(*) FROM events{clause}", args).fetchone()[0]
     rows = conn.execute(
         f"SELECT {EVENT_FIELDS} FROM events{clause} ORDER BY "
-        f"{'id DESC' if since_id is not None else 'ts DESC, id DESC'} LIMIT ? OFFSET ?",
+        f"{'id DESC' if newest_stored_first else 'ts DESC, id DESC'} LIMIT ? OFFSET ?",
         args + [limit, offset],
     )
     return {"total": total, "limit": limit, "offset": offset, "events": [dict(r) for r in rows]}
@@ -177,14 +185,21 @@ def list_alerts(conn, params):
              "WHEN 'low' THEN 3 ELSE 4 END, last_seen DESC")
     rows = conn.execute(f"SELECT * FROM alerts{clause} ORDER BY status = 'resolved', {order} LIMIT ?",
                         args + [limit])
-    return [dict(r) for r in rows]
+    return [alert_row(r) for r in rows]
+
+
+def alert_row(row):
+    """An alert with its matched assets decoded (alerts created before asset modeling have none)."""
+    alert = dict(row)
+    alert["assets"] = json.loads(alert["assets"]) if alert.get("assets") else []
+    return alert
 
 
 def get_alert(conn, alert_id):
     alert = conn.execute("SELECT * FROM alerts WHERE id = ?", (alert_id,)).fetchone()
     if alert is None:
         raise QueryError("alert not found", 404)
-    alert = dict(alert)
+    alert = alert_row(alert)
     alert["rule"] = row_to_dict(conn.execute("SELECT id, name, description, version, techniques FROM rules"
                                              " WHERE id = ?", (alert["rule_id"],)).fetchone(), ["techniques"])
     alert["evidence"] = [dict(r) for r in conn.execute(
@@ -256,20 +271,60 @@ def update_status(conn, alert_id, actor, status, disposition=None, note=None):
         if alert is None:
             raise QueryError("alert not found", 404)
         now = now_iso()
+        # Acknowledged = the first time the alert leaves `open`. COALESCE keeps the first value through reopens,
+        # and an alert that left `open` before the column existed (7.0) stays NULL instead of getting a guess.
+        ack = now if alert["status"] == "open" and status != "open" else None
         if status == "resolved":
-            conn.execute("UPDATE alerts SET status = ?, disposition = ?, resolved_at = ?, updated_at = ?"
-                         " WHERE id = ?", (status, disposition, now, now, alert_id))
+            conn.execute("UPDATE alerts SET status = ?, disposition = ?, resolved_at = ?, updated_at = ?,"
+                         " acknowledged_at = COALESCE(acknowledged_at, ?) WHERE id = ?",
+                         (status, disposition, now, now, ack, alert_id))
         else:
             # Reopening clears the previous verdict so feedback metrics stay accurate.
             conn.execute("UPDATE alerts SET status = ?, disposition = NULL, resolved_at = NULL,"
-                         " assignee = CASE WHEN ? = 'investigating' THEN ? ELSE assignee END, updated_at = ?"
-                         " WHERE id = ?", (status, status, actor, now, alert_id))
+                         " assignee = CASE WHEN ? = 'investigating' THEN ? ELSE assignee END, updated_at = ?,"
+                         " acknowledged_at = COALESCE(acknowledged_at, ?) WHERE id = ?",
+                         (status, status, actor, now, ack, alert_id))
         detail = f"{alert['status']} -> {status}" + (f" ({disposition})" if disposition else "")
         conn.execute("INSERT INTO alert_activity(alert_id, actor, action, detail, created_at) VALUES (?,?,?,?,?)",
                      (alert_id, actor, "status_changed", detail, now))
+        audit(conn, actor, "alert_status_changed", str(alert_id),
+              {"from": alert["status"], "to": status, "disposition": disposition})
     if note:
         add_note(conn, alert_id, actor, note)
     return dict(conn.execute("SELECT * FROM alerts WHERE id = ?", (alert_id,)).fetchone())
+
+
+def assign(conn, alert_id, actor, assignee):
+    """Hand an alert to an enabled analyst or admin account. Ownership only: the status does not change."""
+    if not isinstance(assignee, str) or not assignee.strip():
+        raise QueryError("assignee must be a username")
+    with transaction(conn):
+        alert = conn.execute("SELECT * FROM alerts WHERE id = ?", (alert_id,)).fetchone()
+        if alert is None:
+            raise QueryError("alert not found", 404)
+        user = conn.execute("SELECT username FROM users WHERE username = ? AND disabled = 0"
+                            " AND role IN ('analyst', 'admin')", (assignee.strip(),)).fetchone()
+        if user is None:
+            raise QueryError("assignee must be an enabled analyst or admin account")
+        now = now_iso()
+        conn.execute("UPDATE alerts SET assignee = ?, updated_at = ? WHERE id = ?", (user["username"], now, alert_id))
+        conn.execute("INSERT INTO alert_activity(alert_id, actor, action, detail, created_at) VALUES (?,?,?,?,?)",
+                     (alert_id, actor, "assigned", f"{alert['assignee'] or 'nobody'} -> {user['username']}", now))
+        audit(conn, actor, "alert_assigned", str(alert_id), {"from": alert["assignee"], "to": user["username"]})
+    return dict(conn.execute("SELECT * FROM alerts WHERE id = ?", (alert_id,)).fetchone())
+
+
+# Open-alert age buckets in minutes since the alert was created: (label, from, up to).
+AGING_BUCKETS = (("under 1h", 0, 60), ("1-4h", 60, 240), ("4-24h", 240, 1440), ("1-7d", 1440, 10080),
+                 ("over 7d", 10080, float("inf")))
+# Left out on purpose: they compare an event's own timestamp with this instance's clock, and demo
+# and simulated events are replayed with timestamps from the previous business day.
+OMITTED_METRICS = [
+    {"metric": "time_to_detect", "reason": "Event time to alert creation. Replayed synthetic events carry older"
+                                           " timestamps, so this would measure the replay offset, not detection."},
+    {"metric": "dwell_time", "reason": "First malicious event to resolution. It starts from the same replayed"
+                                       " event timestamps, so it would be inflated by the replay offset."},
+]
 
 
 def metrics(conn, hours=24):
@@ -297,6 +352,26 @@ def metrics(conn, hours=24):
 
     mttr = one("SELECT AVG((julianday(resolved_at) - julianday(created_at)) * 1440) FROM alerts"
                " WHERE resolved_at IS NOT NULL")
+    # SOC metrics (3.0). All three use created_at/resolved_at, which are wall-clock times of this
+    # instance, so they stay honest when the events themselves are replayed with older timestamps.
+    minutes = "(julianday(resolved_at) - julianday(created_at)) * 1440"
+    resolve_by_severity = [
+        {"severity": r["severity"], "resolved": r["resolved"], "mean_minutes": round(r["mean"], 1),
+         "max_minutes": round(r["longest"], 1)} for r in conn.execute(
+            f"SELECT severity, COUNT(*) AS resolved, AVG({minutes}) AS mean, MAX({minutes}) AS longest FROM alerts"
+            f" WHERE resolved_at IS NOT NULL GROUP BY severity ORDER BY {SEVERITY_RANK_SQL.format(col='severity')}"
+            " DESC")]
+    fp_by_rule = [
+        {**dict(r), "false_positive_rate": round(r["false_positive"] / r["reviewed"], 3)} for r in conn.execute(
+            "SELECT rule_id, COUNT(*) AS reviewed, SUM(disposition = 'false_positive') AS false_positive,"
+            " SUM(disposition = 'benign') AS benign FROM alerts WHERE disposition IS NOT NULL GROUP BY rule_id"
+            " ORDER BY SUM(disposition = 'false_positive') * 1.0 / COUNT(*) DESC, rule_id")]
+    now = utcnow()
+    ages = [(now - parse_iso(r["created_at"])).total_seconds() / 60 for r in conn.execute(
+        "SELECT created_at FROM alerts WHERE status != 'resolved'")]
+    aging = {"buckets": [{"label": label, "count": sum(low <= a < high for a in ages)}
+                         for label, low, high in AGING_BUCKETS],
+             "oldest_minutes": round(max(ages), 1) if ages else None}
     return {
         "window_hours": hours,
         "events_total": one("SELECT COUNT(*) FROM events"),
@@ -318,6 +393,10 @@ def metrics(conn, hours=24):
         "events_by_type": by("SELECT event_type, COUNT(*) AS count FROM events GROUP BY event_type"
                              " ORDER BY count DESC"),
         "activity_last_24h_of_data": histogram,
+        "time_to_resolve_by_severity": resolve_by_severity,
+        "false_positive_rate_by_rule": fp_by_rule,
+        "open_alert_aging": aging,
+        "omitted_metrics": OMITTED_METRICS,
     }
 
 

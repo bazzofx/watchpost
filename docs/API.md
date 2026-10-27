@@ -12,11 +12,12 @@ Base URL: `http://127.0.0.1:8080`. All request and response bodies are JSON unle
 Roles: `viewer` (read) < `analyst` (read, ingest, triage, propose rule changes) < `admin` (everything, plus approvals, tokens, demo data, and audit log).
 
 **Viewer is read-only.** A viewer can call every `GET` route whose role below is `viewer` or `public`: dashboard,
-stream, events, alerts, incidents, reports, ATT&CK coverage, metrics, rules, settings, change requests, evaluations,
-batches, and health details. Any other method is refused with 403 `viewer accounts are read-only`, except
+stream, events, hunting and saved searches, alerts, incidents, reports, ATT&CK coverage and the Navigator layer,
+entities, metrics, rules, the noise lab, tuning exceptions, settings, change requests, evaluations, the asset
+inventory, batches, and health details. Any other method is refused with 403 `viewer accounts are read-only`, except
 `POST /api/auth/logout`. The server enforces this in `_authorize`, on top of each route's minimum role, so a new
 write route is closed to viewers even if its role is left at the default. Admin-only reads (`/api/tokens`,
-`/api/audit`) are 403 for viewers. The `viewer` account is created on start from `SIEM_VIEWER_PASSWORD` when set and
+`/api/audit`, `/api/audit/verify`) are 403 for viewers. The `viewer` account is created on start from `SIEM_VIEWER_PASSWORD` when set and
 no user named `viewer` exists.
 
 Five failed logins lock an account for 15 minutes. Both values are security settings, changed only through reviewed proposals.
@@ -160,14 +161,22 @@ Setup and rsyslog configuration: [LIVE_INGEST.md](LIVE_INGEST.md).
 | Endpoint | Role | Notes |
 |---|---|---|
 | `GET /api/events/{id}` | viewer | Includes the redacted `raw` record and linked alerts |
+| `GET /api/events/{id}/ecs` | viewer | The event as an ECS-shaped document (field mapping for export; see the README, "ECS field mapping") |
+| `GET /api/hunt?q=&limit=&offset=` | viewer | Runs a hunt query (syntax in the README, "Hunting"). Returns the event-search page plus `query` and `terms` (`[{field, value, negate, text}]`, how each term was read). Bad syntax or an unknown field is 400 with the reason |
+| `GET /api/hunt/saved` | viewer | Saved searches: `[{id, name, query, description, owner, created_at}]` by name |
+| `POST /api/hunt/saved` | analyst | `{name (≤ 80), query, description? (≤ 300)}`; the query must parse. 409 on a duplicate name (case-insensitive). Audited as `saved_search_created` |
+| `POST /api/hunt/saved/{id}/delete` | analyst | Owner or admin only (403 otherwise). Audited as `saved_search_deleted` |
 | `GET /api/alerts?status=open,investigating&severity=&rule_id=&limit=` | viewer | Sorted by active first, then severity, then recency |
-| `GET /api/alerts/{id}` | viewer | Adds `rule`, `evidence`, `timeline` (events involving the same IPs or users, ±30 min), `notes`, `activity` |
+| `GET /api/alerts/{id}` | viewer | Adds `rule`, `evidence`, `timeline` (events involving the same IPs or users, ±30 min), `notes`, `activity`. Every alert also carries `base_severity` (the rule's), `assets` (matched inventory entries, see [Asset inventory](#asset-inventory)), and `severity_note` |
 | `POST /api/alerts/{id}/notes` | analyst | `{body}` (≤ 5000 chars) |
 | `POST /api/alerts/{id}/status` | analyst | `{status: open\|investigating\|resolved, disposition?, note?}`. `resolved` requires `disposition` (`true_positive`, `false_positive`, or `benign`); reopening clears it |
 | `GET /api/incidents?status=open,investigating&severity=&limit=` | viewer | Correlated incidents: `title`, `severity`, `status`, `first_seen`, `last_seen`, `entities` (`{src_ip, user, host}` lists), `stages` (ATT&CK tactics in kill-chain order), `alert_count`, `synthetic`. Active first, then severity, then recency |
-| `GET /api/incidents/{id}` | viewer | Adds `alerts` (each with `techniques`), `events` (evidence, each with `alert_ids`), `timeline` (one entry per alert with tactics and technique ids), `techniques`, `techniques_by_tactic`, `escalated`. 404 if missing |
+| `GET /api/incidents/{id}` | viewer | Adds `alerts` (each with `techniques`), `events` (evidence, each with `alert_ids`), `timeline` (one entry per alert with tactics and technique ids), `techniques`, `techniques_by_tactic`, `escalated`, `assets` (inventory entries behind the incident's hosts and addresses). 404 if missing |
 | `POST /api/incidents/{id}/status` | analyst | `{status: open\|investigating\|resolved, note?}`; audited as `incident_status_changed` |
-| `GET /api/attack/coverage` | viewer | `{tactics, techniques: [{id, name, tactic, rules: [{id, name, enabled}], hits, covered}], summary}` over the built-in ATT&CK subset; `hits` counts alerts from the covering rules |
+| `GET /api/attack/coverage` | viewer | `{tactics, techniques: [{id, name, tactic, level, scenarios, rules: [{id, name, enabled, hits, verdict, lookalikes_fired, proves}], hits, covered}], summary, levels, level_meaning}` over the built-in ATT&CK subset. `level` is `validated`, `mapped`, `disabled`, or `gap` (see the README, "ATT&CK coverage"); `covered` is true only for `validated`. `hits` counts alerts from the mapped rules; `summary.levels` counts techniques per level |
+| `GET /api/attack/navigator.json` | viewer | The same coverage as a MITRE ATT&CK Navigator layer, colored by level and scored by alert count |
+| `GET /api/entities?kind=&limit=` | viewer | Riskiest entities (`kind` is `user`, `src_ip`, or `host`; `limit` 1–100, default 10), each with its score and the alerts that contribute to it |
+| `GET /api/entities/{kind}/{value}` | viewer | One entity (value percent-encoded): score breakdown, alerts, incidents, and recent events |
 | `GET /api/metrics?hours=24` | viewer | Counts, severity/rule breakdowns, MTTR, top failing IPs/users, and a 24-hour histogram ending at the newest event |
 
 ## Reports
@@ -184,7 +193,8 @@ viewers included (since 2.0 / F; before that, analyst and admin only). Each down
 | `GET /api/incidents/{id}/report.pdf` | viewer | The same report as PDF 1.4 |
 
 Both formats carry the same sections: header (id, severity, status, first/last seen, generation time), summary,
-kill-chain stages (incidents only), entities (IPs, accounts, hosts), MITRE ATT&CK techniques grouped
+kill-chain stages (incidents only), entities (IPs, accounts, hosts), assets (inventory entries with criticality and
+sensitive-data tags; each alert also shows its asset weighting when it changed the severity), MITRE ATT&CK techniques grouped
 by tactic, a merged timeline (evidence events marked), each alert with its explanation and up to 25 evidence events,
 analyst notes, and recommended actions keyed by technique (generic actions when no technique is mapped).
 Reports built from synthetic data open with a "SYNTHETIC DATA" banner and repeat it in the PDF page footer.
@@ -197,18 +207,68 @@ to it. Incidents that span three or more tactics are marked escalated.
 
 Errors are JSON: unknown alert → 404 `alert not found`; unknown incident → 404 `incident not found`.
 
+## Asset inventory
+
+Assets give hosts a weight of importance and tag the systems that process sensitive data. Detection matches each
+alert's evidence events to the inventory by `host` name (case-insensitive) and by `dest_ip`/`src_ip` against an
+asset's `addresses`, then raises the alert's severity:
+
+| Matched asset | Levels added |
+|---|---|
+| criticality `high` | +1 |
+| criticality `critical` | +2 |
+| any sensitive-data tag (`pii`, `pci`, `phi`, `credentials`, `financial`, `confidential`) | +1 |
+
+The total is capped at two levels and never passes `critical`. The rule's own severity is kept in the alert's
+`base_severity`, the matched assets in `assets`, and the reason in `severity_note`; a `severity_changed` entry is
+written to the alert's activity. Incident severity follows the weighted alert severities, so one alert on a critical
+asset is enough to open an incident. Changing the inventory re-weighs every unresolved alert at once and refreshes
+incident severities; resolved alerts keep the severity they were closed with. **Admin → Load synthetic demo data**
+seeds a fictional inventory (marked `synthetic`) for the demo hosts; existing names are never overwritten.
+
+| Endpoint | Role | Notes |
+|---|---|---|
+| `GET /api/assets` | viewer | `{assets: [...], criticalities, kinds, data_tags: {tag: description}}`, most critical first |
+| `POST /api/assets` | admin | `{name, kind?, criticality?, data_tags?, addresses?, owner?, description?}` → 201 `{asset, alerts_rescored}`. `name` is unique ignoring case (409 on a clash); `data_tags` and `addresses` accept a list or a comma-separated string. Audited as `asset_created` |
+| `POST /api/assets/{id}` | admin | Same body; replaces the asset. Audited as `asset_updated` |
+| `POST /api/assets/{id}/delete` | admin | Always 409 `review_required`: a delete needs a second admin, through the proposal route below |
+| `POST /api/assets/{id}/proposals` | admin | `{...asset, reason}` for an edit, or `{"delete": true, reason}` → 201 change request, approved through `POST /api/changes/{id}/review` |
+| `POST /api/assets/proposals` | admin | `{...asset, reason}`: propose an add for review instead of applying it at once |
+
+`POST /api/assets` and `POST /api/assets/{id}` apply an edit only when it cannot lower alert severity. An edit that
+lowers criticality, removes a sensitive-data tag or an address, renames the host, or claims an address another asset
+has changes nothing and answers 409 with `{error, review_required: true, reasons, proposal_route}`. The full rules
+are in the README, "Asset inventory review".
+
+Asset fields: `id`, `name`, `kind` (`server`, `workstation`, `network`, `cloud`, `database`, `other`), `criticality`
+(`low`, `medium`, `high`, `critical`), `data_tags`, `addresses`, `owner`, `description`, `synthetic`, `created_at`,
+`updated_at`, `updated_by`.
+
 ## Rules, feedback, and reviewed changes
 
 | Endpoint | Role | Notes |
 |---|---|---|
 | `GET /api/rules` | viewer | Params, version, `techniques` (`[{id, name, tactic}]`), `performance` (from verdicts), latest `evaluation` |
 | `GET /api/rules/{id}/history` | viewer | Every version, with who proposed and who approved it |
+| `GET /api/rules/export` | viewer | Download `watchpost-rules.json`: `{format: "watchpost-rules", format_version: 1, watchpost_version, exported_at, note, rules: [{id, name, version, enabled, severity, params, techniques, description}]}`, sorted. Tuning only; detection logic is code and is not exported |
+| `POST /api/rules/import` | analyst | Body: an exported document (max 256 KB). `?dry_run=1` proposes nothing; `?label=` names the file in each reason. Applies nothing: each changed rule becomes a `rule_update` change request. Returns `{dry_run, label, summary, rules: [{id, outcome: proposed\|would_propose\|unchanged\|refused, change_id?, changes?, reason?}]}`. 400 on a bad format, 413 when too large, 429 when the backtest quota cannot cover every changed rule |
+| `POST /api/rules/sigma` | analyst | Body: `{source, sample?, reason?}` (max 256 KB). Imports a Sigma rule in the supported subset (README, "Sigma rule import"). `?dry_run=1` returns `{dry_run, ok, refused, compiled: {rule_id, title, severity, techniques, conditions, warnings, sha256, params, logsource}, sample, backtest}` and creates nothing (one preview backtest). Otherwise 201 with a pending `sigma_add` change request; approval adds the rule disabled. 400 with the refusal reason, 409 when the rule id exists, 413 when too large, 429 when the backtest quota is spent |
+| `POST /api/rules/<id>/sigma-sample` | analyst | Body: `{sample: {malicious: [events], benign: [events]}, reason}`. 201 with a pending `sigma_sample` change request. A Sigma rule can be enabled only while its sample passes |
+| `POST /api/hunt/saved/<id>/promote` | analyst | Body: `{group_by, threshold, window_minutes, severity, techniques?, name?, sample?, reason?}` (max 64 KB). Promotes the saved search's filter to a threshold rule `search_<slug>` (README, "Saved searches as detections"). `?dry_run=1` returns `{dry_run, ok, refused, compiled: {rule_id, title, severity, techniques, conditions, query, params}, sample, backtest}` and creates nothing. Otherwise 201 with a pending `search_add` change request; approval adds the rule disabled. Either spends one rule-proposal backtest. 400 with the refusal reason (time terms, `\|` stages, fields detection does not load), 404 unknown saved search, 409 when the rule id exists, 429 when the quota is spent |
+| `POST /api/rules/<id>/search-sample` | analyst | Body: `{sample: {malicious: [events], benign: [events]}, reason}`. 201 with a pending `search_sample` change request. A search rule can be enabled only while its sample passes (the malicious events raise a finding, the benign ones none) |
 | `POST /api/rules/{id}/proposals` | analyst | `{params?: {...partial}, enabled?: bool, reason}`; validated, then scored against scenarios |
 | `POST /api/rules/suggestions` | analyst | Generates proposals from false-positive feedback (deduplicated) |
+| `POST /api/rules/{id}/suppressions` | analyst | `{group_key, days (1–90), reason}`: proposes a tuning exception; nothing is suppressed until an admin approves it |
+| `GET /api/suppressions` | viewer | Approved tuning exceptions, newest first, with `active` false once expired or revoked |
+| `POST /api/suppressions/{id}/revoke` | admin | Ends an exception early; audited as `suppression_revoked` |
+| `POST /api/rules/{id}/suppression-windows` | analyst | `{starts_at, expires_at, reason}` proposes a reviewed, rule-wide pause of at most 30 days; approval must acknowledge labeled detection loss |
+| `GET /api/rule-suppression-windows` | viewer | Approved rule-wide windows, including `upcoming`, `active`, `expired`, and `ended` history |
+| `POST /api/rule-suppression-windows/{id}/end` | admin | Ends an active or upcoming rule-wide window early; the approved interval remains in history |
+| `GET /api/noise-lab` | viewer | Each rule against the labeled scenarios and its benign look-alikes: recall, precision, tp/fn/fp, look-alikes tested and fired, and a `verdict` (`quiet`, `noisy`, `blind`, `untested`, `disabled`) |
 | `GET /api/settings` | viewer | Security settings with allowed ranges |
 | `POST /api/settings/{key}/proposals` | admin | `{value, reason}` |
 | `GET /api/changes?status=pending` | viewer | Change requests |
-| `POST /api/changes/{id}/review` | admin | `{decision: approve\|reject, note}`. Self-review → 403; already reviewed → 409 |
+| `POST /api/changes/{id}/review` | admin | `{decision: approve\|reject, note, evidence_digest?, acknowledge_detection_loss?}`. Approval must send the `evidence_digest` of the evidence the reviewer was shown; if the evidence changed, nothing is applied and the answer is 409. A rule change that loses a labeled detection also needs `acknowledge_detection_loss: true`. Self-review → 403; already reviewed → 409 |
 | `GET /api/evaluations` / `POST /api/evaluations` | viewer / analyst | Evaluation history / run one now |
 
 ## SOC dashboard and live stream
@@ -278,6 +338,12 @@ session (UI uploads, the demo loader) or by the syslog listener are not agents a
 | `GET /api/audit` | admin | Last 200 audit entries |
 | `GET /api/admin/log-data` | admin | What a reset would delete, and which tables it keeps. Read-only; changes nothing |
 | `POST /api/admin/log-data/reset` | admin | Deletes all ingested data. Body **must** be `{"confirm": "RESET"}` |
+| `GET /api/admin/retention` | admin | Dry run: what a retention pass would archive, by day and tier. Changes nothing |
+| `POST /api/admin/retention/run` | admin | Archives and deletes expired events. Body **must** be `{"confirm": "ARCHIVE"}` |
+| `GET /api/admin/quarantine` | admin | Rejected-record bounds and the newest entries (content only when kept) |
+| `GET /api/pipeline` | viewer | Stage counters: observed / accepted / rejected / stored / aggregated / detected / quarantined |
+| `GET /api/rollups` | viewer | Rolled-up routine traffic, hourly buckets (`?hours=`, `?limit=`) |
+| `GET /api/audit/verify` | admin | Walks the audit hash chain: `{ok, status (verified\|partial\|broken), entries, keyed, head, chain_started, legacy, first_break}` (README, "Tamper-evident audit log") |
 
 ### Resetting the log data
 
@@ -287,7 +353,7 @@ else is a `400` — so a stray or replayed request cannot wipe the store.
 
 | Removed | Kept |
 |---|---|
-| `events`, `alerts`, `alert_events`, `alert_notes`, `alert_activity`, `incidents`, `incident_alerts`, `ingest_batches`, `detection_runs`, `error_log` | `users`, `sessions`, `api_tokens`, `rules`, `rule_history`, `settings`, `change_requests`, `evaluation_runs`, `audit_log`, and internal bookkeeping |
+| `events`, `alerts`, `alert_events`, `alert_notes`, `alert_activity`, `incidents`, `incident_alerts`, `ingest_batches`, `detection_runs`, `event_rollups`, `quarantine`, `error_log` | `users`, `sessions`, `api_tokens`, `rules`, `rule_history`, `settings`, `change_requests`, `evaluation_runs`, `audit_log`, and internal bookkeeping |
 
 Keeping sessions means nobody is signed out; keeping API tokens means an agent does not start
 failing with `401`; keeping rules means tuned thresholds and their history survive. The response
@@ -296,7 +362,9 @@ filesystem afterwards, and if it cannot run (no room for the rewrite) the deleti
 `vacuumed` is `false` with a `vacuum_note`.
 
 The action is written to the audit log as `logs_reset` with the per-table counts, because the data it
-removed is gone. `AUTOINCREMENT` counters are reset, so a fresh store starts again at id 1.
+removed is gone. `AUTOINCREMENT` counters are reset, so a fresh store starts again at id 1. With
+retention enabled, a reset also makes any existing archive partitions look orphaned — ids restart, so
+treat a reset as "and its archives" (see `Documentation/retention/archive.md`).
 
 `GET /api/admin/log-data` returns the same numbers without changing anything, which is what the
 Admin page shows before you are asked to confirm. There is no undo: take a copy of the database file

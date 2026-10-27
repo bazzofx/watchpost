@@ -36,6 +36,8 @@ TECHNIQUES = {
     "T1098.001": ("Account Manipulation: Additional Cloud Credentials", "Persistence"),
     "T1136.003": ("Create Account: Cloud Account", "Persistence"),
     "T1548.003": ("Abuse Elevation Control Mechanism: Sudo and Sudo Caching", "Privilege Escalation"),
+    "T1562.006": ("Impair Defenses: Indicator Blocking", "Defense Evasion"),
+    "T1562.008": ("Impair Defenses: Disable or Modify Cloud Logs", "Defense Evasion"),
     "T1110": ("Brute Force", "Credential Access"),
     "T1110.001": ("Brute Force: Password Guessing", "Credential Access"),
     "T1110.003": ("Brute Force: Password Spraying", "Credential Access"),
@@ -45,6 +47,7 @@ TECHNIQUES = {
     "T1530": ("Data from Cloud Storage", "Collection"),
     "T1048": ("Exfiltration Over Alternative Protocol", "Exfiltration"),
     "T1499": ("Endpoint Denial of Service", "Impact"),
+    "T1567": ("Exfiltration Over Web Service", "Exfiltration"),
 }
 
 _TACTIC_ORDER = {name: i for i, (_, name) in enumerate(TACTICS)}
@@ -92,7 +95,8 @@ def coverage(rules, hits_by_rule):
             entry = by_technique.get(t["id"])
             if entry is None:
                 continue
-            entry["rules"].append({"id": rule["id"], "name": rule["name"], "enabled": bool(rule["enabled"])})
+            entry["rules"].append({"id": rule["id"], "name": rule["name"], "enabled": bool(rule["enabled"]),
+                                   "hits": hits_by_rule.get(rule["id"], 0)})
             entry["hits"] += hits_by_rule.get(rule["id"], 0)
     items = list(by_technique.values())
     for item in items:
@@ -102,4 +106,84 @@ def coverage(rules, hits_by_rule):
         "techniques": items,
         "summary": {"techniques": len(items), "covered": sum(i["covered"] for i in items),
                     "with_hits": sum(1 for i in items if i["hits"])},
+    }
+
+
+# Evidence levels, strongest first. Only "validated" counts as covered.
+LEVELS = ("validated", "mapped", "disabled", "gap")
+LEVEL_MEANING = {
+    "validated": "An enabled rule detects a labeled synthetic attack that exercises this technique.",
+    "mapped": "An enabled rule maps here, but no labeled scenario proves it detects this technique. "
+              "Not counted as covered.",
+    "disabled": "Only disabled rules map here, so nothing is watching for it.",
+    "gap": "No rule maps here.",
+}
+
+
+def evidence(cov, lab_rules, scenarios):
+    """Grade each technique in `coverage()` output by what the labeled scenarios prove.
+
+    `lab_rules`: the noise-lab rows ({"rule_id", "verdict", "detected", "lookalikes_*", ...});
+    `scenarios`: {name: {"malicious", "techniques"}} as in simulate.SCENARIOS. A scenario proves a
+    technique for a rule when the rule is enabled, detected that malicious scenario, and the scenario
+    is tagged with the technique. Inputs are not modified. `covered` now means validated.
+    """
+    lab = {r["rule_id"]: r for r in lab_rules}
+    items = []
+    for t in cov["techniques"]:
+        rules, proving = [], set()
+        for r in t["rules"]:
+            row = lab.get(r["id"], {})
+            proves = sorted(n for n in row.get("detected", []) if r["enabled"] and n in scenarios
+                            and scenarios[n]["malicious"] and t["id"] in scenarios[n].get("techniques", ()))
+            proving.update(proves)
+            rules.append({**r, "verdict": row.get("verdict"), "lookalikes_tested": row.get("lookalikes_tested", []),
+                          "lookalikes_fired": row.get("lookalikes_fired", []) + row.get("other_benign_fired", []),
+                          "proves": proves})
+        if proving:
+            level = "validated"
+        elif any(r["enabled"] for r in t["rules"]):
+            level = "mapped"
+        else:
+            level = "disabled" if t["rules"] else "gap"
+        items.append({**t, "rules": rules, "level": level, "covered": level == "validated",
+                      "scenarios": sorted(proving)})
+    levels = {lvl: sum(i["level"] == lvl for i in items) for lvl in LEVELS}
+    return {**cov, "techniques": items, "levels": list(LEVELS), "level_meaning": LEVEL_MEANING,
+            "summary": {**cov["summary"], "covered": levels["validated"], "levels": levels}}
+
+
+NAVIGATOR_LAYER_VERSION = "4.5"  # the layer file format; this module states no ATT&CK release, so none is claimed
+LEVEL_COLORS = {"validated": "#2e9e6b", "mapped": "#e6b422", "disabled": "#9aa5b1", "gap": "#d9534f"}
+
+
+def navigator_layer(cov):
+    """An ATT&CK Navigator layer from `evidence()` output: every catalog technique, colored by level.
+
+    The score is the number of alerts raised by the rules mapped to the technique; the comment
+    starts with the level, so the layer reads the same as the Coverage view.
+    """
+    def comment(t):
+        rules = ", ".join(r["id"] + ("" if r["enabled"] else " (disabled)") for r in t["rules"]) or "none"
+        proof = f" Detected on synthetic scenario(s): {', '.join(t['scenarios'])}." if t["scenarios"] else ""
+        return f"{t['level'].capitalize()}: {LEVEL_MEANING[t['level']]}{proof} Rules: {rules}"
+
+    return {
+        "name": "Watchpost rule coverage",
+        "versions": {"layer": NAVIGATOR_LAYER_VERSION},
+        "domain": "enterprise-attack",
+        "description": "Watchpost's technique catalog colored by evidence level. Validated means an enabled rule "
+                       "detects a labeled scenario from the project's own synthetic data, not real-world coverage; "
+                       "mapped is not counted as covered. Scores count alerts raised from synthetic demo data; "
+                       "they are not observations of real attacks.",
+        "techniques": [{
+            "techniqueID": t["id"],
+            "tactic": t["tactic"].lower().replace(" ", "-"),
+            "score": t["hits"],
+            "color": LEVEL_COLORS[t["level"]],
+            "comment": comment(t),
+        } for t in cov["techniques"]],
+        "gradient": {"colors": ["#cfe2f3", "#1f4e79"], "minValue": 0,
+                     "maxValue": max([t["hits"] for t in cov["techniques"]] + [1])},
+        "legendItems": [{"label": lvl.capitalize(), "color": LEVEL_COLORS[lvl]} for lvl in LEVELS],
     }

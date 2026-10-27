@@ -4,7 +4,7 @@
 // client polls every 3 seconds and retries the stream every 30. Routes that other
 // workstreams add (/api/incidents, /api/attack/coverage, /api/storyline/status) are
 // optional: a 404 renders a "pending" panel and the rest keeps working.
-// Uses el(), api(), can(), go(), render(), fmtTime() from app.js (loaded after this file,
+// Uses el(), api(), can(), go(), render(), fmtTime(), entityLink() from app.js (loaded after this file,
 // called only at runtime).
 
 const SEV_ORDER = ["critical", "high", "medium", "low", "info"];
@@ -18,6 +18,17 @@ const TACTICS = [
 ];
 const HQ_DEFAULT = { city: "Watchpost HQ (internal)", lat: 39.1, lon: -94.6, internal: true, synthetic: true };
 const FEED_MAX = 140;
+const DASH_PANELS = ["p-map", "p-feed", "p-timeline", "p-attackers", "p-attack", "p-board", "p-rules", "p-health", "p-entities"];
+const DASH_LAYOUTS = {
+  full: DASH_PANELS,
+  triage: ["p-board", "p-timeline", "p-feed", "p-entities"],
+  telemetry: ["p-map", "p-feed", "p-attackers", "p-health"],
+};
+const DASH_FILTERS = {
+  all: ["critical", "high", "medium", "low"],
+  elevated: ["critical", "high"],
+  critical: ["critical"],
+};
 
 // ---------- small helpers ----------
 function svgNode(markup) {
@@ -90,7 +101,8 @@ function normCoverage(payload) {
     tactics: asList(t.tactics ?? t.tactic).map((x) => (typeof x === "string" ? x : x.name)).filter(Boolean),
     rules: asList(t.rules ?? t.rule_ids).map((r) => (typeof r === "string" ? r : r.id || r.rule_id)).filter(Boolean),
     hits: Number(t.hits ?? t.hit_count ?? t.alerts ?? t.alert_count ?? 0) || 0,
-    covered: t.covered,  // A: true only when an enabled rule covers the technique
+    covered: t.covered,  // true only when the technique is validated on a labeled scenario; "mapped" is not covered
+    level: t.level,
   }));
 }
 const tacticKey = (name) => String(name).toLowerCase().replace(/[^a-z]/g, "");
@@ -271,7 +283,8 @@ const Live = {
   },
   renderSpark() {
     const vals = this.epm.slice(-30).map((m) => m.count);
-    mountSvg($("#k-epm-spark"), WPCharts.sparkline(vals, { w: 84, h: 22, cls: "accent", label: "events per minute, last 30 minutes" }));
+    const summary = vals.length ? `: latest ${vals[vals.length - 1]}, peak ${Math.max(...vals)}` : ": no data yet";
+    mountSvg($("#k-epm-spark"), WPCharts.sparkline(vals, { w: 84, h: 22, cls: "accent", label: `events per minute, last 30 minutes${summary}` }));
   },
   renderStrip() {
     const d = this.summary;
@@ -290,7 +303,8 @@ const Live = {
     this.renderSpark();
     const checks = Object.entries(this.health);
     $("#k-health").replaceChildren(...(checks.length ? checks.map(([name, s]) =>
-      el("span", { class: `hc st-${s}`, title: `${name}: ${s}` }, el("i"), { storage: "store", ingestion: "ingest", detection: "detect", dependencies: "deps" }[name] || name)) : [el("span", { class: "muted" }, "…")]));
+      el("span", { class: `hc st-${s}`, title: `${name}: ${s}` }, el("i"), { storage: "store", ingestion: "ingest", detection: "detect", dependencies: "deps" }[name] || name,
+        el("span", { class: "sr-only" }, ` ${s}`))) : [el("span", { class: "muted" }, "…")]));
   },
 
   async pollStory() {
@@ -313,6 +327,7 @@ const Live = {
 const Dash = {
   mounted: false, data: null, coverage: { state: "loading" }, details: null,
   queue: [], feedCount: 0, paused: false, live: new Map(), mapSize: null, timers: {}, observer: null,
+  views: [], currentView: null, severities: DASH_FILTERS.all, layout: DASH_LAYOUTS.full,
 
   mount() {
     this.unmount();
@@ -320,7 +335,8 @@ const Dash = {
     this.mapSize = null;
     this.feedCount = 0;
     const pause = el("button", { class: "mini ghost", id: "feed-pause", onclick: () => this.togglePause() }, "Pause");
-    render(el("div", { class: "soc", id: "soc" },
+    render(el("div", { class: "card", id: "dashboard-view-bar" }, el("p", { class: "muted" }, "Loading saved dashboard views…")),
+      el("div", { class: "soc", id: "soc" },
       panel("p-map", "Attack map", [chip("SYNTHETIC GEO", "synthetic"), el("span", { class: "muted", id: "map-count" })],
         el("div", { class: "mapwrap", id: "map" }),
         el("div", { class: "map-side", id: "map-side" }),
@@ -333,10 +349,11 @@ const Dash = {
         el("div", { class: "legend" }, ...["critical", "high", "medium", "low"].map((s) => el("span", {}, el("i", { class: `dot sev-${s}` }), s)),
           el("span", {}, el("i", { class: "dot volume" }), "event volume"))),
       panel("p-attackers", "Top attacker IPs", [el("span", { class: "muted" }, "by evidence events")], el("div", { class: "chartbox", id: "atk-chart" })),
-      panel("p-attack", "MITRE ATT&CK coverage", [el("span", { class: "muted", id: "attack-meta" })], el("div", { class: "chartbox", id: "attack-chart" })),
+      panel("p-attack", "MITRE ATT&CK coverage", [el("span", { class: "muted", id: "attack-meta" }), el("a", { href: "/api/attack/navigator.json", download: "watchpost-navigator-layer.json", title: "MITRE ATT&CK Navigator layer (JSON) colored by evidence level; scores come from synthetic demo data" }, "Export Navigator layer")], el("div", { class: "chartbox", id: "attack-chart" })),
       panel("p-board", "Incident board", [el("span", { id: "board-meta" })], el("div", { class: "board", id: "board" })),
       panel("p-rules", "Top rules", [el("span", { class: "muted" }, "alerts all time")], el("div", { class: "chartbox", id: "rules-chart" })),
       panel("p-health", "Health", [el("a", { href: "#health", class: "muted" }, "details →")], el("div", { id: "health-body" })),
+      panel("p-entities", "Riskiest entities", [el("span", { class: "muted" }, "alert weight, decayed by age")], el("div", { id: "ent-list" })),
     ));
     this.timers.drip = setInterval(() => this.drip(), 110);
     this.timers.details = setInterval(() => this.loadHealthDetails(), 30000);
@@ -346,6 +363,7 @@ const Dash = {
       this.observer = new ResizeObserver(onResize);
       this.observer.observe(soc);
     }
+    this.loadViews();
   },
   unmount() {
     if (!this.mounted) return;
@@ -373,7 +391,72 @@ const Dash = {
   },
   redraw() {
     if (!this.mounted || !this.data) return;
-    this.renderMap(); this.renderTimeline(); this.renderAttackers(); this.renderRules(); this.renderMatrix(); this.renderBoard(); this.renderHealth();
+    this.renderMap(); this.renderTimeline(); this.renderAttackers(); this.renderRules(); this.renderEntities(); this.renderMatrix(); this.renderBoard(); this.renderHealth();
+    this.applyView();
+  },
+  async loadViews() {
+    if (!this.mounted) return;
+    try { this.views = await api("/api/dashboard/views"); }
+    catch (e) { return $("#dashboard-view-bar")?.replaceChildren(el("p", { class: "error" }, e.message)); }
+    this.renderViewBar();
+  },
+  viewPayload(form) {
+    const f = new FormData(form);
+    return { name: f.get("name").trim(), visibility: f.get("visibility"),
+      filters: { severities: DASH_FILTERS[f.get("filter")] }, layout: DASH_LAYOUTS[f.get("layout")] };
+  },
+  renderViewBar() {
+    const bar = $("#dashboard-view-bar");
+    if (!bar) return;
+    const picker = el("select", { name: "saved_view", "aria-label": "Saved dashboard view" },
+      el("option", { value: "" }, "Default view"),
+      ...this.views.map((v) => el("option", { value: v.id }, `${v.name} · ${v.visibility}${v.owner === state.user.username ? " · mine" : ""}`)));
+    const apply = () => {
+      const selected = this.views.find((v) => String(v.id) === picker.value);
+      this.currentView = selected || null;
+      this.severities = selected ? selected.filters.severities : DASH_FILTERS.all;
+      this.layout = selected ? selected.layout : DASH_LAYOUTS.full;
+      this.applyView(); this.renderViewBar();
+    };
+    picker.value = this.currentView ? String(this.currentView.id) : "";
+    const controls = [el("label", {}, "Saved view", picker), el("button", { type: "button", onclick: apply }, "Apply")];
+    if (can("analyst")) {
+      const form = el("form", { class: "row" },
+        el("label", {}, "Name", el("input", { name: "name", required: true, maxlength: 80 })),
+        el("label", {}, "Severity", el("select", { name: "filter" },
+          el("option", { value: "all" }, "All severities"), el("option", { value: "elevated" }, "Critical + high"), el("option", { value: "critical" }, "Critical only"))),
+        el("label", {}, "Panels", el("select", { name: "layout" },
+          el("option", { value: "full" }, "Full dashboard"), el("option", { value: "triage" }, "Triage focus"), el("option", { value: "telemetry" }, "Telemetry focus"))),
+        el("label", {}, "Visibility", el("select", { name: "visibility" },
+          el("option", { value: "private" }, "Private"), el("option", { value: "shared" }, "Shared"))),
+        el("button", { type: "submit" }, "Save new"));
+      form.addEventListener("submit", (ev) => { ev.preventDefault(); guarded(async () => {
+        this.currentView = await api("/api/dashboard/views", { method: "POST", body: this.viewPayload(form) });
+        this.severities = this.currentView.filters.severities; this.layout = this.currentView.layout;
+        await this.loadViews(); this.applyView(); toast(`Saved dashboard view "${this.currentView.name}"`);
+      }); });
+      controls.push(form);
+      if (this.currentView?.owner === state.user.username) controls.push(
+        el("button", { type: "button", class: "danger", onclick: () => confirm(`Delete dashboard view "${this.currentView.name}"?`) && guarded(async () => {
+          await api(`/api/dashboard/views/${this.currentView.id}/delete`, { method: "POST" });
+          this.currentView = null; this.severities = DASH_FILTERS.all; this.layout = DASH_LAYOUTS.full;
+          await this.loadViews(); this.applyView();
+        }) }, "Delete mine"));
+    }
+    bar.replaceChildren(el("h2", {}, this.currentView ? this.currentView.name : "Dashboard view"), el("div", { class: "row" }, ...controls));
+  },
+  applyView() {
+    const soc = $("#soc");
+    if (!soc) return;
+    for (const id of DASH_PANELS) {
+      const panelNode = $(`#${id}`);
+      if (!panelNode) continue;
+      panelNode.hidden = !this.layout.includes(id);
+      if (!panelNode.hidden) soc.append(panelNode);
+    }
+    for (const severity of SEV_ORDER) {
+      for (const node of soc.querySelectorAll(`.sev-${severity}`)) node.hidden = !this.severities.includes(severity);
+    }
   },
   width(id, fallback = 300) { const n = $(id); return n ? Math.max(120, n.clientWidth) : fallback; },
 
@@ -551,7 +634,7 @@ const Dash = {
     mountSvg(box, WPCharts.stackedBars(t.bins, keys, {
       w, h, overlay: t.bins.map((b) => b.events), labels: t.bins.map((b) => shortTime(b.start)),
       title: (b) => `${fmtTime(b.start)}\n${keys.slice().reverse().map((k) => `${k}: ${b[k]}`).join("  ")}\nevents: ${b.events}`,
-      label: "alerts over time by severity",
+      label: `alerts over time by severity, ${t.bins.length} buckets: ${keys.slice().reverse().map((k) => `${k} ${t.bins.reduce((n, b) => n + (b[k] || 0), 0)}`).join(", ")}`,
     }));
   },
   renderAttackers() {
@@ -564,14 +647,23 @@ const Dash = {
         subCls: loc === null ? "unknown" : "", title: `${a.ip}: ${a.events} evidence events in ${a.alerts} alerts (${a.open_alerts} open)` };
     });
     if (!rows.length) { box.replaceChildren(el("p", { class: "empty-note" }, "No attacker IPs in alert evidence yet.")); return; }
-    mountSvg(box, WPCharts.hbars(rows, { w: this.width("#atk-chart"), rowH: 25, labelW: 136, label: "top attacker IPs" }));
+    mountSvg(box, WPCharts.hbars(rows, { w: this.width("#atk-chart"), rowH: 25, labelW: 136, label: `top attacker IPs by evidence events: ${rows.map((r) => `${r.label} ${r.value}`).join(", ")}` }));
   },
   renderRules() {
     const box = $("#rules-chart");
     if (!box) return;
     const rows = this.data.top_rules.map((r) => ({ label: r.name || r.rule_id, sub: `${r.rule_id} · ${r.open} open`, value: r.alerts, cls: sevOf(r.severity) }));
     if (!rows.length) { box.replaceChildren(el("p", { class: "empty-note" }, "No rule has fired yet.")); return; }
-    mountSvg(box, WPCharts.hbars(rows.slice(0, 7), { w: this.width("#rules-chart"), rowH: 25, labelW: 150, label: "alerts by rule" }));
+    mountSvg(box, WPCharts.hbars(rows.slice(0, 7), { w: this.width("#rules-chart"), rowH: 25, labelW: 150, label: `alerts by rule: ${rows.slice(0, 7).map((r) => `${r.label} ${r.value}`).join(", ")}` }));
+  },
+  renderEntities() {
+    const box = $("#ent-list");
+    if (!box) return;
+    const rows = this.data.risky_entities || [];
+    if (!rows.length) { box.replaceChildren(el("p", { class: "empty-note" }, "No entity has a counted alert yet.")); return; }
+    box.replaceChildren(...rows.map((r) => el("div", { class: "erow", title: `${r.alerts} counted alert(s), ${r.open_alerts} open` },
+      sevTag(r.max_severity), el("span", { class: "tag" }, ENTITY_KINDS[r.kind] || r.kind), entityLink(r.kind, r.value),
+      el("b", {}, r.score))));
   },
 
   // --- ATT&CK matrix ---
@@ -591,7 +683,7 @@ const Dash = {
         for (const tac of t.tactics.length ? t.tactics : ["Unmapped"]) {
           const key = tacticKey(tac);
           if (!byTactic.has(key)) byTactic.set(key, { name: tac, short: tac, cells: [] });
-          byTactic.get(key).cells.push({ id: t.id, name: t.name, value: t.hits, covered: t.covered ?? t.rules.length > 0, rules: t.rules });
+          byTactic.get(key).cells.push({ id: t.id, name: t.name, value: t.hits, covered: t.covered ?? t.rules.length > 0, level: t.level, rules: t.rules });
         }
       }
       for (const col of byTactic.values()) col.cells.sort((a, b) => b.value - a.value || a.id.localeCompare(b.id));
@@ -600,10 +692,11 @@ const Dash = {
     if (w < 900 && cov.state === "ok") columns = columns.filter((c) => c.cells.length);
     const meta = $("#attack-meta");
     if (cov.state === "ok") {
-      const covered = cov.list.filter((t) => t.covered ?? t.rules.length > 0).length;
+      const validated = cov.list.filter((t) => t.covered ?? t.rules.length > 0).length;
       const hot = cov.list.filter((t) => t.hits > 0).length;
-      meta.textContent = `${covered}/${cov.list.length} techniques covered · ${hot} observed`;
-      mountSvg(box, WPCharts.heatMatrix(columns, { w, cellH: 21, maxRows: Math.max(3, Math.min(7, ...[Math.max(...columns.map((c) => c.cells.length))])), label: "ATT&CK coverage heat matrix" }));
+      meta.textContent = `${validated}/${cov.list.length} techniques validated on synthetic scenarios · ${hot} observed · `;
+      meta.append(el("a", { href: "#coverage" }, "details"));
+      mountSvg(box, WPCharts.heatMatrix(columns, { w, cellH: 21, maxRows: Math.max(3, Math.min(7, ...[Math.max(...columns.map((c) => c.cells.length))])), label: `ATT&CK coverage heat matrix: ${validated} of ${cov.list.length} techniques validated, ${hot} seen in alerts. The Coverage view lists every technique as text.` }));
       return;
     }
     meta.textContent = cov.state === "pending" ? "" : cov.state === "error" ? cov.error : "loading…";
@@ -637,11 +730,11 @@ const Dash = {
     const runs = d ? d.recent_detection_runs.slice().reverse() : [];
     box.replaceChildren(...[
       ...checks.map(([name, s, msg, ms]) => el("div", { class: "hrow2", title: msg || "" },
-        el("span", { class: `hc st-${s}` }, el("i")), el("b", {}, name), el("span", { class: "muted hmsg" }, msg), el("span", { class: "hms" }, ms === null ? "" : `${ms} ms`))),
+        el("span", { class: `hc st-${s}` }, el("i"), el("span", { class: "sr-only" }, `${s}: `)), el("b", {}, name), el("span", { class: "muted hmsg" }, msg), el("span", { class: "hms" }, ms === null ? "" : `${ms} ms`))),
       el("div", { class: "hrow2" }, el("span", { class: `hc st-${Live.mode === "live" ? "ok" : Live.mode === "poll" ? "degraded" : "failing"}` }, el("i")),
         el("b", {}, "stream"), el("span", { class: "muted hmsg" }, `${$("#k-live-text").textContent}${Live.subscribers ? ` · ${Live.subscribers} viewer(s)` : ""}`), el("span", { class: "hms" }, "")),
       runs.length ? el("div", { class: "runs" }, el("span", { class: "muted" }, "detection runs"),
-        el("span", { class: "rundots" }, ...runs.map((r) => el("i", { class: `st-${r.status === "ok" ? "ok" : r.status === "failed" ? "failing" : "degraded"}`, title: `#${r.id} ${r.trigger} · ${r.status} · ${r.events_scanned} scanned · +${r.alerts_created}` })))) : null].filter(Boolean));
+        el("span", { class: "rundots", role: "img", "aria-label": `${runs.length} recent runs: ${runs.filter((r) => r.status === "ok").length} ok, ${runs.filter((r) => r.status === "failed").length} failed` }, ...runs.map((r) => el("i", { class: `st-${r.status === "ok" ? "ok" : r.status === "failed" ? "failing" : "degraded"}`, title: `#${r.id} ${r.trigger} · ${r.status} · ${r.events_scanned} scanned · +${r.alerts_created}` })))) : null].filter(Boolean));
   },
 };
 
@@ -688,5 +781,6 @@ async function incidentsView() {
       inc.state === "ok" ? el("span", { class: "muted" }, `${inc.list.length} incidents`) : chip("INCIDENTS PENDING · SHOWING ALERTS", "pendingchip")),
     inc.state !== "ok" ? el("p", { class: "muted" }, inc.state === "error" ? inc.error
       : "Alerts become incidents once the correlation engine ships (GET /api/incidents). Until then this board groups alerts by status.") : null,
-    el("div", { class: "board big" }, ...incidentBoard(inc, alerts, 50)));
+    el("div", { class: "board big", "data-kbd-list": "incidents" }, ...incidentBoard(inc, alerts, 50)));
+  restoreSelection(`[data-kbd-list] a.bcard[href="#incidents/${state.restore}"]`);
 }

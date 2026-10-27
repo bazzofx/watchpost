@@ -6,10 +6,13 @@ import threading
 import uuid
 from datetime import timedelta
 
+from . import assets as assets_mod
 from . import classify
 from . import quarantine
 from . import correlate as correlate_mod
+from . import grouping
 from . import rules as rules_mod
+from . import sources as sources_mod
 from . import stream
 from .db import audit, iso, now_iso, parse_iso, row_to_dict, transaction
 from .diagnostics import describe_exception, record_error
@@ -17,6 +20,10 @@ from .diagnostics import describe_exception, record_error
 EVENT_COLUMNS = ["ts", "source", "host", "event_type", "outcome", "severity",
                  "user", "src_ip", "dest_ip", "dest_port", "bytes", "http_status", "tier", "message",
                  "raw"]
+# Fields detection rules can read. source and ingested_at let a backtest replay log_source_silent's gaps.
+# http_status is included because the web/WAF rules read it.
+RULE_EVENT_FIELDS = ("id, ts, event_type, user, src_ip, host, dest_ip, dest_port, bytes, http_status,"
+                     " message, synthetic, source, ingested_at")
 
 # SQLite caps bound parameters (999 on older builds, 32766 on modern ones). Any query built from an
 # unbounded list of ids must be chunked or it fails at scale — see _count_present.
@@ -62,7 +69,7 @@ def seed_rules(conn, actor="system"):
 
 def load_rules(conn, enabled_only=True):
     sql = "SELECT * FROM rules" + (" WHERE enabled = 1" if enabled_only else "") + " ORDER BY id"
-    rules = [row_to_dict(r, ["params", "techniques"]) for r in conn.execute(sql)]
+    rules = [row_to_dict(r, ["params", "techniques", "grouping"]) for r in conn.execute(sql)]
     for rule in rules:
         rule["techniques"] = rule.get("techniques") or []
     return rules
@@ -213,7 +220,17 @@ def _evidence_has(conn, rule_id, group_key, event_id):
         (rule_id, group_key, event_id)).fetchone() is not None
 
 
-def _apply_finding(conn, rule, finding, synthetic):
+def _weigh(conn, rule, alert_id, assets_idx):
+    """Severity after asset weighting, from every evidence event now on the alert."""
+    events = [dict(r) for r in conn.execute(
+        "SELECT e.host, e.src_ip, e.dest_ip FROM events e JOIN alert_events ae ON ae.event_id = e.id"
+        " WHERE ae.alert_id = ?", (alert_id,))]
+    weighed = assets_mod.weigh(rule["severity"], assets_mod.match(assets_idx, events))
+    weighed["assets"] = json.dumps(weighed["assets"])
+    return weighed
+
+
+def _apply_finding(conn, rule, finding, synthetic, assets_idx):
     """Create or extend an alert. Returns 'created', 'updated', or 'unchanged'."""
     ids = finding["event_ids"]
     if not ids:
@@ -235,16 +252,25 @@ def _apply_finding(conn, rule, finding, synthetic):
                          [(existing["id"], i) for i in ids])
         count = conn.execute("SELECT COUNT(*) FROM alert_events WHERE alert_id = ?",
                              (existing["id"],)).fetchone()[0]
+        weighed = _weigh(conn, rule, existing["id"], assets_idx)
         conn.execute(
             "UPDATE alerts SET last_seen = MAX(last_seen, ?), first_seen = MIN(first_seen, ?),"
-            " event_count = ?, explanation = ?, title = ?, updated_at = ? WHERE id = ?",
+            " event_count = ?, explanation = ?, title = ?, updated_at = ?, severity = ?, base_severity = ?,"
+            " assets = ?, severity_note = ? WHERE id = ?",
             (finding["last_seen"], finding["first_seen"], count, finding["explanation"],
-             finding["title"], now, existing["id"]),
+             finding["title"], now, weighed["severity"], weighed["base_severity"], weighed["assets"],
+             weighed["severity_note"], existing["id"]),
         )
         conn.execute(
             "INSERT INTO alert_activity(alert_id, actor, action, detail, created_at) VALUES (?,?,?,?,?)",
             (existing["id"], "detection", "evidence_added", f"now {count} related events", now),
         )
+        if weighed["severity"] != existing["severity"]:
+            conn.execute(
+                "INSERT INTO alert_activity(alert_id, actor, action, detail, created_at) VALUES (?,?,?,?,?)",
+                (existing["id"], "assets", "severity_changed",
+                 f"{existing['severity']} -> {weighed['severity']} ({weighed['severity_note']})", now),
+            )
         return "updated"
 
     cur = conn.execute(
@@ -262,27 +288,87 @@ def _apply_finding(conn, rule, finding, synthetic):
         "INSERT INTO alert_activity(alert_id, actor, action, detail, created_at) VALUES (?,?,?,?,?)",
         (alert_id, "detection", "created", f"rule {rule['id']} v{rule['version']}", now),
     )
+    weighed = _weigh(conn, rule, alert_id, assets_idx)
+    conn.execute("UPDATE alerts SET severity = ?, base_severity = ?, assets = ?, severity_note = ? WHERE id = ?",
+                 (weighed["severity"], weighed["base_severity"], weighed["assets"], weighed["severity_note"],
+                  alert_id))
+    if weighed["severity"] != rule["severity"]:
+        conn.execute(
+            "INSERT INTO alert_activity(alert_id, actor, action, detail, created_at) VALUES (?,?,?,?,?)",
+            (alert_id, "assets", "severity_changed",
+             f"{rule['severity']} -> {weighed['severity']} ({weighed['severity_note']})", now),
+        )
     return "created"
 
 
-def _rule_scan(conn, rule, max_id, start, end):
-    """The events one rule needs for a range, and the time before which its findings are context only.
+def active_suppressions(conn):
+    """Approved tuning exceptions that are neither expired nor revoked, as a set of (rule_id, group_key)."""
+    return {(r["rule_id"], r["group_key"]) for r in conn.execute(
+        "SELECT rule_id, group_key FROM suppressions WHERE expires_at > ? AND revoked_at IS NULL", (now_iso(),))}
 
-    Each rule gets its own window. Using one global window — the longest lookback plus the longest
-    history, about 30 hours — made every rule re-read all of it on every batch, so the cost of an
-    ingest grew with the whole store instead of with the batch. A 300-second rule now reads 300
-    seconds of events.
+
+def active_rule_suppressions(conn):
+    """Rule ids whose reviewed suppression window contains the current time."""
+    now = now_iso()
+    return {r["rule_id"] for r in conn.execute(
+        "SELECT rule_id FROM rule_suppression_windows"
+        " WHERE starts_at <= ? AND expires_at > ? AND ended_at IS NULL", (now, now))}
+
+
+def scan_events(conn, rules, max_id, start=None, end=None):
+    """The stored events a detection run of `rules` over [start, end] reads (default: all events).
+
+    Returns (events, history_events, scan_start). The range is widened by the longest rule window;
+    rules that compare with earlier activity also get the span before it as history context.
+    Shared by run_detection and the rule backtest, so a backtest reads what detection reads.
     """
-    sql = f"SELECT {RULE_EVENT_FIELDS} FROM events WHERE id <= ?"
-    args = [max_id]
-    scan_start = None
-    if start and end:
-        pad = timedelta(seconds=rules_mod.rule_span(rule))
-        history = timedelta(seconds=rules_mod.rule_history(rule))
-        scan_start = iso(parse_iso(start) - pad)
-        sql += " AND ts >= ? AND ts <= ?"
-        args += [iso(parse_iso(start) - pad - history), iso(parse_iso(end) + pad)]
-    return [dict(r) for r in conn.execute(sql, args)], scan_start
+    sql, args = f"SELECT {RULE_EVENT_FIELDS} FROM events WHERE id <= ?", [max_id]
+    if not (start and end):
+        return [dict(r) for r in conn.execute(sql, args)], [], None
+    pad = timedelta(seconds=rules_mod.lookback_seconds(rules))
+    scan_start = iso(parse_iso(start) - pad)
+    events = [dict(r) for r in conn.execute(sql + " AND ts >= ? AND ts <= ?",
+                                            args + [scan_start, iso(parse_iso(end) + pad)])]
+    # Rules that compare with earlier activity also get the span before the scan window, but only
+    # the event types they read: a week of every event per batch was most of the ingest time.
+    history_events = []
+    history = timedelta(seconds=rules_mod.history_seconds(rules))
+    types = sorted({t for r in rules if r["params"].get("history_seconds")
+                    for t in rules_mod.HISTORY_EVENT_TYPES[r["id"]]})
+    if history and types:
+        history_events = [dict(r) for r in conn.execute(
+            sql + f" AND ts >= ? AND ts < ? AND event_type IN ({','.join('?' for _ in types)})",
+            args + [iso(parse_iso(scan_start) - history), scan_start, *types])]
+    return events, history_events, scan_start
+
+
+def rule_findings(rule, events, history_events, scan_start, suppressed, suppress_rule=False):
+    """One rule's findings over scanned events, as detection alerts on them.
+
+    Returns (findings, skipped): findings built only from history context are dropped, and those a
+    reviewed tuning exception covers are skipped and counted.
+    """
+    # For the exfil rule an exception is passed in as a baseline principal, not skipped here.
+    params = rules_mod.exception_params(rule["id"], rule["params"], suppressed)
+    skips = rule["id"] not in rules_mod.EXCEPTION_ENABLES_BASELINE
+    rule_events = events
+    if history_events and params.get("history_seconds"):
+        since = iso(parse_iso(scan_start) - timedelta(seconds=params["history_seconds"]))
+        wanted = rules_mod.HISTORY_EVENT_TYPES[rule["id"]]
+        rule_events = [e for e in history_events
+                       if e["event_type"] in wanted and e["ts"] >= since] + events
+    findings, skipped = [], 0
+    raw_findings = rules_mod.rule_function(rule["id"])(rule_events, params)
+    for finding in grouping.apply(raw_findings, rule_events, rule.get("grouping") or []):
+        if scan_start and finding["last_seen"] < scan_start:
+            continue  # built only from history context; outside this scan
+        if skips and (rule["id"], finding["group_key"]) in suppressed:
+            skipped += 1
+            continue
+        findings.append(finding)
+    if suppress_rule:
+        return [], skipped + len(findings)
+    return findings, skipped
 
 
 def run_detection(conn, trigger="manual", start=None, end=None):
@@ -303,55 +389,48 @@ def run_detection(conn, trigger="manual", start=None, end=None):
             (started, trigger),
         ).lastrowid
         summary = {"run_id": run_id, "status": "running", "events_scanned": 0,
-                   "alerts_created": 0, "alerts_updated": 0}
+                   "alerts_created": 0, "alerts_updated": 0, "alerts_suppressed": 0}
         try:
             active = load_rules(conn)
             for rule in active:
-                if rule["id"] not in rules_mod.RULE_FUNCTIONS:
+                if rules_mod.rule_function(rule["id"]) is None:
                     raise rules_mod.RuleConfigError(f"no implementation for rule {rule['id']}")
                 rule["params"] = rules_mod.validate_params(rule["id"], rule["params"])
 
             max_id = conn.execute("SELECT COALESCE(MAX(id), 0) FROM events").fetchone()[0]
-            full_scan = not (start and end)
-            everything = None
-            if full_scan:
-                # An explicit full scan means every event, and reading them once for all rules is
-                # cheaper than one read per rule.
-                everything = [dict(r) for r in conn.execute(
-                    f"SELECT {RULE_EVENT_FIELDS} FROM events WHERE id <= ?", (max_id,))]
-
-            planned = []
-            scanned = set()
-            for rule in active:
-                if full_scan:
-                    events, scan_start = everything, None
-                else:
-                    events, scan_start = _rule_scan(conn, rule, max_id, start, end)
-                # Distinct events, not the sum of what each rule read: the number stays comparable
-                # with the single-window scans it replaces, and "how much history did this run look
-                # at" is the useful figure. Work per rule is what went down, not this.
-                scanned.update(e["id"] for e in events)
-                synthetic_ids = {e["id"] for e in events if e["synthetic"]}
-                for finding in rules_mod.RULE_FUNCTIONS[rule["id"]](events, rule["params"]):
-                    if scan_start and finding["last_seen"] < scan_start:
-                        continue  # built only from history context; outside this scan
-                    planned.append((rule, finding,
-                                    all(i in synthetic_ids for i in finding["event_ids"])))
-            summary["events_scanned"] = len(scanned)
-
+            events, history_events, scan_start = scan_events(conn, active, max_id, start, end)
+            synthetic_ids = {e["id"] for e in events + history_events if e["synthetic"]}
+            summary["events_scanned"] = len(events) + len(history_events)
+            assets_idx = assets_mod.load_index(conn)
+            suppressed = active_suppressions(conn)
+            suppressed_rules = active_rule_suppressions(conn)
             with transaction(conn):
-                for rule, finding, synthetic in planned:
-                    outcome = _apply_finding(conn, rule, finding, synthetic)
-                    if outcome == "created":
-                        summary["alerts_created"] += 1
-                    elif outcome == "updated":
-                        summary["alerts_updated"] += 1
+                for rule in active:
+                    if rule["id"] == sources_mod.RULE_ID:
+                        # Silence is an absence: the rule reads each source's recent arrivals and the wall
+                        # clock, not the events of the scanned time range.
+                        arrivals = sources_mod.arrival_events(conn, max_id)
+                        synthetic_ids.update(e["id"] for e in arrivals if e["synthetic"])
+                        rule = {**rule, "params": sources_mod.clock_params(conn, rule["params"])}
+                        findings, skipped = rule_findings(rule, arrivals, [], None, suppressed,
+                                                          rule["id"] in suppressed_rules)
+                    else:
+                        findings, skipped = rule_findings(rule, events, history_events, scan_start, suppressed,
+                                                          rule["id"] in suppressed_rules)
+                    summary["alerts_suppressed"] += skipped  # a reviewed exception or rule window covers them
+                    for finding in findings:
+                        synthetic = all(i in synthetic_ids for i in finding["event_ids"])
+                        outcome = _apply_finding(conn, rule, finding, synthetic, assets_idx)
+                        if outcome == "created":
+                            summary["alerts_created"] += 1
+                        elif outcome == "updated":
+                            summary["alerts_updated"] += 1
             summary["status"] = "ok"
             conn.execute(
                 "UPDATE detection_runs SET status='ok', finished_at=?, events_scanned=?, alerts_created=?,"
-                " alerts_updated=?, max_event_id=? WHERE id=?",
+                " alerts_updated=?, alerts_suppressed=?, max_event_id=? WHERE id=?",
                 (now_iso(), summary["events_scanned"], summary["alerts_created"],
-                 summary["alerts_updated"], max_id, run_id),
+                 summary["alerts_updated"], summary["alerts_suppressed"], max_id, run_id),
             )
             if full_scan:
                 # A full scan covers every stored event, including batches whose detection failed.
@@ -505,17 +584,22 @@ def apply_rule_change(conn, rule_id, payload, changed_by, approved_by, change_re
     params = json.loads(rule["params"])
     if "params" in payload:
         params = rules_mod.validate_params(rule_id, {**params, **payload["params"]})
+    grouping_fields = json.loads(rule["grouping"] or "[]")
+    if "grouping" in payload:
+        grouping_fields = grouping.validate(payload["grouping"])
     enabled = int(payload.get("enabled", rule["enabled"]))
     version = rule["version"] + 1
     now = now_iso()
     conn.execute(
-        "UPDATE rules SET params = ?, enabled = ?, version = ?, updated_at = ?, updated_by = ? WHERE id = ?",
-        (json.dumps(params), enabled, version, now, approved_by, rule_id),
+        "UPDATE rules SET params = ?, grouping = ?, enabled = ?, version = ?, updated_at = ?, updated_by = ?"
+        " WHERE id = ?",
+        (json.dumps(params), json.dumps(grouping_fields), enabled, version, now, approved_by, rule_id),
     )
     conn.execute(
-        "INSERT INTO rule_history(rule_id, version, enabled, params, changed_at, changed_by, approved_by,"
-        " change_request_id, note) VALUES (?,?,?,?,?,?,?,?,?)",
-        (rule_id, version, enabled, json.dumps(params), now, changed_by, approved_by, change_request_id, note),
+        "INSERT INTO rule_history(rule_id, version, enabled, params, grouping, changed_at, changed_by, approved_by,"
+        " change_request_id, note) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (rule_id, version, enabled, json.dumps(params), json.dumps(grouping_fields), now, changed_by, approved_by,
+         change_request_id, note),
     )
     audit(conn, approved_by, "rule_changed", rule_id, {"version": version, "change_request": change_request_id})
     return version

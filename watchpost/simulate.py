@@ -385,6 +385,221 @@ def exfiltration(day, rng):
     return events
 
 
+def shadow_it(day, rng):
+    """judy uploads customer exports to a personal file-sharing service nobody approved."""
+    ip, start = "10.0.1.40", _at(day, 13, 30)
+    events = [_event(start + timedelta(seconds=i * 40 + rng.randint(0, 5)), "shadow_it", "cloud_data_access",
+                     "judy", ip, host="proxy01", bytes=4_000_000,
+                     message="[SYNTHETIC] UploadFile on personal-drive.example (customer-exports)")
+              for i in range(6)]
+    # The sanctioned corporate drive alongside. Must not alert.
+    events += [_event(_at(day, 10, i * 7), "shadow_it", "cloud_data_access", "judy", ip, host="proxy01",
+                      bytes=2_000_000, message="[SYNTHETIC] UploadFile on corp-drive.example (team-share)")
+               for i in range(3)]
+    return events
+
+
+def logging_disabled(day, rng):
+    """The rogue principal checks the audit trail, stops it, then deletes it before reading storage."""
+    ip, start = "203.0.113.150", _at(day, 17, 50)
+    return [_event(start + timedelta(seconds=i * 40), "logging_disabled", "cloud_api_call", "svc-deploy-tmp", ip,
+                   host=None, message=f"[SYNTHETIC] {action} on cloudtrail.amazonaws.com")
+            for i, action in enumerate(["DescribeTrails", "StopLogging", "DeleteTrail"])]
+
+
+def admin_new_source(day, rng):
+    """ops-admin changes IAM from the office every morning; tonight its keys are used from an outside address.
+
+    The two earlier mornings are history context (dated before the scenario day). Each morning starts with
+    a read so the IAM change is not also a 'new principal' change.
+    """
+    ip, events = "10.0.1.30", []
+    for back in (2, 1, 0):
+        morning = _at(day - timedelta(days=back), 9, 30)
+        events.append(_event(morning, "admin_new_source", "cloud_api_call", "ops-admin", ip, host=None,
+                             message="[SYNTHETIC] ListUsers on iam.amazonaws.com"))
+        events.append(_event(morning + timedelta(minutes=10), "admin_new_source", "cloud_iam_change", "ops-admin",
+                             ip, host=None, message="[SYNTHETIC] AttachUserPolicy on iam.amazonaws.com"))
+    for i, action in enumerate(["CreateAccessKey", "AttachUserPolicy"]):
+        events.append(_event(_at(day, 19, 10) + timedelta(seconds=i * 45), "admin_new_source", "cloud_iam_change",
+                             "ops-admin", "198.51.100.77", host=None,
+                             message=f"[SYNTHETIC] {action} on iam.amazonaws.com"))
+    return events
+
+
+def log_source_stops(day, rng):
+    """dc01's endpoint telemetry arrives every five minutes from midnight; at 13:40 its forwarder is stopped.
+
+    Silence is judged by arrival: in the noise lab each event arrives at its timestamp and the scenario is
+    judged at the end of its day. Loaded as demo data it arrives as one upload, so it stays "learning".
+    """
+    start, events = _at(day, 0, 0), []
+    for i in range(165):
+        events.append(_event(start + timedelta(minutes=5 * i), "log_source_stops", "process_start", None, "10.0.0.5",
+                             host="dc01", message="[SYNTHETIC] process start: scheduled health probe"))
+    events[-1]["message"] = "[SYNTHETIC] service stop: the log forwarder service entered the stopped state"
+    return events
+
+
+# --- Benign look-alikes (noise lab) ------------------------------------------------------
+# Each one is ordinary activity that resembles what one rule looks for. Whether the rule
+# fires on it is measured, not assumed: several of these do trip their rule.
+
+def password_typo(day, rng):
+    ip, start = "10.0.1.22", _at(day, 8, 50)
+    events = [_event(start + timedelta(seconds=i * 9), "password_typo", "auth_failure", "carol", ip,
+                     message="[SYNTHETIC] Failed password for carol (mistyped)") for i in range(3)]
+    events.append(_event(start + timedelta(seconds=40), "password_typo", "auth_success", "carol", ip))
+    return events
+
+
+def stale_password_device(day, rng):
+    """A phone mail client keeps retrying an old password until its owner fixes it."""
+    ip, start = "10.0.1.27", _at(day, 9, 30)
+    events = [_event(start + timedelta(seconds=i * 60), "stale_password_device", "auth_failure", "heidi", ip,
+                     host="mail01", message="[SYNTHETIC] Failed password for heidi (phone retrying an old password)")
+              for i in range(10)]
+    events.append(_event(start + timedelta(seconds=630), "stale_password_device", "auth_success", "heidi", ip,
+                         host="mail01", message="[SYNTHETIC] Accepted password for heidi (password updated on phone)"))
+    return events
+
+
+def password_expiry_nat(day, rng):
+    """The morning after a password-expiry day: a whole branch office behind one NAT address."""
+    ip, start = "172.16.4.1", _at(day, 8, 50)
+    events = []
+    for i, user in enumerate(EMPLOYEES):
+        t = start + timedelta(seconds=i * 110)
+        for attempt in range(2 if i % 3 == 0 else 1):
+            events.append(_event(t + timedelta(seconds=attempt * 12), "password_expiry_nat", "auth_failure", user,
+                                 ip, message=f"[SYNTHETIC] Failed password for {user} (expired password)"))
+        events.append(_event(t + timedelta(seconds=75), "password_expiry_nat", "auth_success", user, ip,
+                             message=f"[SYNTHETIC] Accepted password for {user} (after reset)"))
+    return events
+
+
+def oncall_admin(day, rng):
+    return [_event(_at(day, 3, 0), "oncall_admin", "auth_success", "admin", "10.0.1.26", host="db01",
+                   message="[SYNTHETIC] Accepted publickey for admin at 03:00 UTC (on-call, paged for a disk alert)")]
+
+
+MONITOR_PATHS = ["/", "/health", "/login", "/app/dashboard", "/api/v1/status", "/static/app.css",
+                 "/robots.txt", "/server-status"]
+
+
+def uptime_monitor(day, rng):
+    """An uptime monitor walks eight paths every five minutes for an hour.
+
+    /server-status is on the scanner path list, so that request is a web_scan event just as
+    the web log parser would classify it. At this pace the rule stays quiet; a monitor
+    polling every minute would trip it.
+    """
+    ip, start = "10.0.60.7", _at(day, 10, 0)
+    events = []
+    for walk in range(12):
+        for i, path in enumerate(MONITOR_PATHS):
+            kind = "web_scan" if path == "/server-status" else "web_request"
+            events.append(_event(start + timedelta(seconds=walk * 300 + i), "uptime_monitor", kind, None, ip,
+                                 message=f"GET {path} -> 200 [SYNTHETIC uptime monitor]", bytes=512))
+    return events
+
+
+def authorized_port_scan(day, rng):
+    """The authorized internal scanner's weekly port sweep, denied by the firewall like any other."""
+    ip, start = "10.0.50.5", _at(day, 2, 0)
+    ports = [21, 22, 23, 25, 80, 110, 139, 443, 445, 1433, 3306, 3389, 5432, 5900, 8080]
+    return [_event(start + timedelta(seconds=i * 3), "authorized_port_scan", "fw_deny", None, ip, host="fw01",
+                   message=f"[SYNTHETIC] firewall deny {ip} -> 10.0.0.10:{port}/tcp (authorized scan)",
+                   dest_port=port) for i, port in enumerate(ports)]
+
+
+def vpn_traveler(day, rng):
+    """grace logs in at HQ, flies to the remote site, and connects over VPN four and a half hours later."""
+    return [
+        _event(_at(day, 8, 0), "vpn_traveler", "auth_success", "grace", "10.0.1.26", host="mail01",
+               message="[SYNTHETIC] Accepted password for grace (office, Riverton HQ)"),
+        _event(_at(day, 12, 30), "vpn_traveler", "vpn_login", "grace", "192.168.40.12", host="vpn01",
+               message="[SYNTHETIC] VPN session for grace from Hillcrest remote site after a morning flight"),
+    ]
+
+
+def typo_then_sudo(day, rng):
+    """An administrator mistypes a password three times, logs in, and restarts a service."""
+    ip, start = "10.0.1.26", _at(day, 14, 30)
+    events = [_event(start + timedelta(seconds=i * 8), "typo_then_sudo", "auth_failure", "grace", ip,
+                     message="[SYNTHETIC] Failed password for grace (mistyped)") for i in range(3)]
+    events.append(_event(start + timedelta(seconds=35), "typo_then_sudo", "auth_success", "grace", ip))
+    events.append(_event(start + timedelta(minutes=2), "typo_then_sudo", "privilege_escalation", "grace", ip,
+                         message="[SYNTHETIC] grace : TTY=pts/1 ; PWD=/home/grace ; USER=root ; "
+                                 "COMMAND=/usr/bin/systemctl restart nginx"))
+    return events
+
+
+def ci_key_rotation(day, rng):
+    """The CI role deploys every night, then rotates its own access key in the morning."""
+    events = [_event(_at(day, 2, i * 3), "ci_key_rotation", "cloud_api_call", "ci-deploy", "10.0.7.20", host=None,
+                     message=f"[SYNTHETIC] {action} on {service}")
+              for i, (action, service) in enumerate([("DescribeInstances", "ec2.amazonaws.com"),
+                                                     ("UpdateFunctionCode", "lambda.amazonaws.com"),
+                                                     ("ListBuckets", "s3.amazonaws.com")])]
+    for i, action in enumerate(["CreateAccessKey", "DeleteAccessKey"]):
+        events.append(_event(_at(day, 10, 0) + timedelta(seconds=i * 20), "ci_key_rotation", "cloud_iam_change",
+                             "ci-deploy", "10.0.7.20", host=None,
+                             message=f"[SYNTHETIC] {action} on iam.amazonaws.com (scheduled key rotation)"))
+    return events
+
+
+def nightly_backup(day, rng):
+    """The backup server ships about 5 GB off site at 01:00, as it did on each of the three nights before."""
+    ip, events = "10.0.5.10", []
+    for back in (3, 2, 1, 0):
+        start = _at(day - timedelta(days=back), 1, 0)
+        events += [_event(start + timedelta(seconds=i * 150), "nightly_backup", "fw_allow", None, ip, host="fw01",
+                          message=f"[SYNTHETIC] firewall allow {ip} -> 198.51.100.200:443/tcp (nightly backup)",
+                          dest_ip="198.51.100.200", dest_port=443, bytes=400_000_000 + rng.randint(0, 40_000_000))
+                   for i in range(12)]
+    return events
+
+
+def sanctioned_saas(day, rng):
+    """A team uses the sanctioned corporate drive through its regional endpoint."""
+    return [_event(_at(day, 11, i * 6), "sanctioned_saas", "cloud_data_access", "bob", "10.0.1.21", host="proxy01",
+                   bytes=3_000_000, message="[SYNTHETIC] UploadFile on eu.corp-drive.example (team-share)")
+            for i in range(6)]
+
+
+def trail_maintenance(day, rng):
+    """ops-admin replaces the audit trail: a new trail, new event selectors, logging started. Logging stays on."""
+    return [_event(_at(day, 14, 0) + timedelta(seconds=i * 30), "trail_maintenance", "cloud_api_call", "ops-admin",
+                   "10.0.1.30", host=None, message=f"[SYNTHETIC] {action} on cloudtrail.amazonaws.com (change ticket)")
+            for i, action in enumerate(["DescribeTrails", "CreateTrail", "PutEventSelectors", "UpdateTrail",
+                                        "StartLogging", "GetTrailStatus"])]
+
+
+def office_badge_reader(day, rng):
+    """A door controller logs badge swipes every half hour in office hours on three days, then the office empties.
+
+    Quiet every evening and night: its overnight gap is part of its cadence, so the evening is not a silence.
+    """
+    events = []
+    for back in (2, 1, 0):
+        opening = _at(day - timedelta(days=back), 8, 0)
+        events += [_event(opening + timedelta(minutes=30 * i), "office_badge_reader", "auth_success",
+                          EMPLOYEES[i % len(EMPLOYEES)], "10.0.70.4", host="door01",
+                          message="[SYNTHETIC] badge accepted at the front door") for i in range(20)]
+    return events
+
+
+def admin_known_source(day, rng):
+    """ops-admin's routine IAM change from the office, and a read-only check from the remote site."""
+    events = admin_new_source(day, rng)[:-2]  # the same three office mornings, without the outside use
+    events.append(_event(_at(day, 15, 30), "admin_known_source", "cloud_iam_change", "ops-admin", "10.0.1.30",
+                         host=None, message="[SYNTHETIC] DetachUserPolicy on iam.amazonaws.com"))
+    events.append(_event(_at(day, 20, 0), "admin_known_source", "cloud_api_call", "ops-admin", "192.168.40.12",
+                         host=None, message="[SYNTHETIC] ListUsers on iam.amazonaws.com (from the remote site)"))
+    return [{**e, "source": "demo:admin_known_source"} for e in events]
+
+
 # expected: rule_id -> group_key the alert should be keyed on. Anything else firing is a false positive.
 SCENARIOS = {
     "baseline": {"build": baseline, "malicious": False, "expected": {},
@@ -482,14 +697,121 @@ SCENARIOS = {
                         "description": "One client fires a wordlist of 40 distinct paths in under ten "
                                        "seconds, all 404. The short, fast window is what the rapid rule "
                                        "keys on; the breadth rule also fires because the walk is wide."},
+    "shadow_it": {"build": shadow_it, "malicious": True,
+                  "expected": {"unsanctioned_cloud_service": "judy|personal-drive.example"},
+                  "description": "judy uploads customer exports to a file-sharing service that is not sanctioned; "
+                                 "her uploads to the corporate drive do not alert."},
+    "logging_disabled": {"build": logging_disabled, "malicious": True,
+                         "expected": {"cloud_logging_disabled": "svc-deploy-tmp"},
+                         "description": "The rogue principal svc-deploy-tmp stops and then deletes the CloudTrail "
+                                        "trail."},
+    "log_source_stops": {"build": log_source_stops, "malicious": True,
+                         "expected": {"log_source_silent": "demo:log_source_stops|dc01"},
+                         "description": "dc01 has sent telemetry every five minutes since midnight; at 13:40 its log "
+                                        "forwarder is stopped and nothing more arrives."},
+    "admin_new_source": {"build": admin_new_source, "malicious": True,
+                         "expected": {"admin_action_from_new_source": "ops-admin|198.51.100.77"},
+                         "description": "ops-admin changes IAM from the office each morning; at 19:10 it creates an "
+                                        "access key from an outside address it has never used."},
 }
+
+# ATT&CK techniques each labeled attack's events actually exercise, for the coverage view. A rule that
+# maps a technique only "validates" it by detecting a scenario tagged here. Deliberately narrower than
+# the rules' own mappings: web_scan probes and injects but never exploits (no T1190), and exfiltration
+# reads cloud storage without showing an exfiltration channel (no T1048).
+SCENARIO_TECHNIQUES = {
+    "brute_force": ["T1110", "T1110.001"],
+    "password_spray": ["T1110.003"],
+    "compromise": ["T1110", "T1078"],
+    "off_hours_admin": ["T1078.003"],
+    "web_scan": ["T1595.002", "T1595.003"],
+    "port_sweep": ["T1046"],
+    "impossible_travel": ["T1078", "T1133"],
+    "privilege_escalation": ["T1078", "T1548.003"],
+    "cloud_new_principal": ["T1078.004", "T1098.001", "T1136.003"],
+    "exfiltration": ["T1530"],
+    "shadow_it": ["T1567"],
+    "logging_disabled": ["T1562.008"],
+    # Stopping a host's log forwarder blocks its events from reaching the SIEM.
+    "log_source_stops": ["T1562.006"],
+    # A valid cloud account used from new infrastructure. Its CreateAccessKey is also T1098.001, but the rule
+    # that detects it does not map T1098.001, so the tag would prove nothing.
+    "admin_new_source": ["T1078.004"],
+}
+for _name, _techniques in SCENARIO_TECHNIQUES.items():
+    SCENARIOS[_name]["techniques"] = _techniques
+
+# What "Load demo data" and `--scenario all` send. The look-alikes below are kept out of the demo
+# dataset: the noise lab evaluates them, and any one can be replayed by name.
+DEMO_SCENARIOS = list(SCENARIOS)
+
+# Benign look-alikes: `lookalike_of` names the rule each one is written to test.
+for _name in ("noisy_scanner", "noisy_scanner_repeat"):
+    SCENARIOS[_name]["lookalike_of"] = "brute_force_ip"
+
+SCENARIOS.update({
+    "password_typo": {
+        "build": password_typo, "malicious": False, "expected": {}, "lookalike_of": "success_after_failures",
+        "description": "carol mistypes her password three times, then logs in."},
+    "stale_password_device": {
+        "build": stale_password_device, "malicious": False, "expected": {},
+        "lookalike_of": "account_repeated_failures",
+        "description": "heidi's phone retries an old password ten times in ten minutes until she updates it."},
+    "password_expiry_nat": {
+        "build": password_expiry_nat, "malicious": False, "expected": {}, "lookalike_of": "password_spray",
+        "description": "The morning after a password-expiry day: eight users behind one branch NAT address "
+                       "each fail once or twice, then log in."},
+    "oncall_admin": {
+        "build": oncall_admin, "malicious": False, "expected": {}, "lookalike_of": "off_hours_privileged_login",
+        "description": "The on-call administrator answers a page and logs in as admin at 03:00 UTC."},
+    "uptime_monitor": {
+        "build": uptime_monitor, "malicious": False, "expected": {}, "lookalike_of": "web_scanner",
+        "description": "An uptime monitor walks eight paths, /server-status among them, every five minutes."},
+    "authorized_port_scan": {
+        "build": authorized_port_scan, "malicious": False, "expected": {}, "lookalike_of": "firewall_port_sweep",
+        "description": "The authorized internal scanner (10.0.50.5) sweeps 15 ports and the firewall denies them."},
+    "vpn_traveler": {
+        "build": vpn_traveler, "malicious": False, "expected": {}, "lookalike_of": "impossible_geo_login",
+        "description": "grace logs in at HQ, takes a morning flight, and connects over VPN from the remote site "
+                       "four and a half hours later."},
+    "typo_then_sudo": {
+        "build": typo_then_sudo, "malicious": False, "expected": {},
+        "lookalike_of": "privilege_escalation_after_login",
+        "description": "An administrator mistypes a password three times, logs in, and restarts a service with sudo."},
+    "ci_key_rotation": {
+        "build": ci_key_rotation, "malicious": False, "expected": {},
+        "lookalike_of": "cloud_iam_change_by_new_principal",
+        "description": "The CI role, active every night, rotates its own access key."},
+    "nightly_backup": {
+        "build": nightly_backup, "malicious": False, "expected": {}, "lookalike_of": "data_exfil_volume",
+        "description": "The backup server ships about 5 GB off site at 01:00, as on each of the three nights before. "
+                       "The flat threshold alerts on it every night. With an approved tuning exception for "
+                       "10.0.5.10 the rule compares it with its own history and stays quiet."},
+    "sanctioned_saas": {
+        "build": sanctioned_saas, "malicious": False, "expected": {}, "lookalike_of": "unsanctioned_cloud_service",
+        "description": "A team uploads to the sanctioned corporate drive through its regional endpoint."},
+    "trail_maintenance": {
+        "build": trail_maintenance, "malicious": False, "expected": {}, "lookalike_of": "cloud_logging_disabled",
+        "description": "An administrator replaces the audit trail under a change ticket: creates a trail, sets event "
+                       "selectors, updates it, and starts logging. Logging stays on."},
+    "office_badge_reader": {
+        "build": office_badge_reader, "malicious": False, "expected": {}, "lookalike_of": "log_source_silent",
+        "description": "A door controller logs badge swipes every half hour in office hours, three days running, and "
+                       "goes quiet each evening. Its overnight gap is part of its cadence, so the evening is not a "
+                       "silence."},
+    "admin_known_source": {
+        "build": admin_known_source, "malicious": False, "expected": {},
+        "lookalike_of": "admin_action_from_new_source",
+        "description": "ops-admin makes a routine IAM change from its usual office address, and a read-only call "
+                       "from the remote site. A real IAM change from a new laptop address would alert."},
+})
 
 
 def build(scenario_names=None, seed=7, now=None):
-    """Return {scenario: [events]} for the requested scenarios (default: all)."""
+    """Return {scenario: [events]} for the requested scenarios (default: the demo dataset)."""
     rng = random.Random(seed)
     day = demo_day(now)
-    names = scenario_names or list(SCENARIOS)
+    names = scenario_names or DEMO_SCENARIOS
     unknown = [n for n in names if n not in SCENARIOS]
     if unknown:
         raise ValueError(f"unknown scenario(s): {', '.join(unknown)}")
@@ -535,6 +857,8 @@ def main(argv=None):
     token = args.token or os.environ.get("SIEM_INGEST_TOKEN")
     if not token:
         parser.error("an ingest token is required (--token or SIEM_INGEST_TOKEN)")
+    if urllib.parse.urlparse(args.url).scheme not in ("http", "https"):
+        parser.error("--url must be an http(s) URL")
     if not _is_loopback(args.url) and not args.allow_remote:
         parser.error("refusing to send to a non-loopback URL without --allow-remote")
 

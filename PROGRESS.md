@@ -1074,3 +1074,42 @@ group_key. In-memory, so it needs no temporary directory and runs everywhere. Mu
 
 
 
+## Watchpost 2.1 / G: asset modeling (2026-10-04, branch `ws/g-asset-model`)
+
+**Shipped**
+- `watchpost/assets.py`: an asset inventory (`assets` table) where each host gets a `criticality` (`low`, `medium`,
+  `high`, `critical`), optional sensitive-data tags from a controlled vocabulary (`pii`, `pci`, `phi`, `credentials`,
+  `financial`, `confidential`), optional IP `addresses`, owner, and description. Pure helpers `index`, `match`,
+  `boost`, `weigh`; storage helpers with validation, case-insensitive unique names, and audit entries
+  (`asset_created/updated/deleted`).
+- Detection reads the inventory once per run. Each alert's evidence is matched by `host` name and by `dest_ip`/`src_ip`
+  against asset addresses. Severity rises +1 for a `high` asset, +2 for `critical`, +1 for any sensitive-data tag,
+  capped at two levels and at `critical`. New alert columns (added in place): `base_severity` (the rule's),
+  `assets` (JSON), `severity_note`. A `severity_changed` activity entry explains every change. Schema version 3.
+- Inventory changes call `rescore_open_alerts` and re-run correlation, so open alerts and incident severities update
+  immediately; resolved alerts are left alone.
+- Routes: `GET /api/assets` (viewer), `POST /api/assets`, `POST /api/assets/{id}`, `POST /api/assets/{id}/delete`
+  (admin). `POST /api/demo/load` seeds six fictional demo assets (`db01` critical with pii+pci, `files01`, `vpn01`,
+  `mail01`, `web01`, `fw01`), marked synthetic, never overwriting existing names.
+- UI: Admin → Asset inventory card (add, edit, delete via a dialog with criticality and data-tag checkboxes); asset
+  chips plus "rule severity X; raised N level(s): …" on alert detail; an "Assets involved" card on incident detail.
+- Reports (Markdown and PDF): an Assets table, the asset weighting line per alert, and an assets sentence in the
+  summary. Incident detail exposes `assets`.
+- Tests: `tests/test_assets.py` (10): validation, matching, boost math and caps, CRUD with roles and audit, severity
+  raised by host and by destination address, rescoring on inventory change with incident follow-through, reports,
+  demo seeding. The schema-upgrade test now covers the assets table and alert columns.
+
+**Decisions for the owner**
+- Asset edits are direct admin actions with audit entries, not two-person change requests like rule changes. They
+  change alert severity, so the owner may prefer to route them through `change_requests` later.
+- The boost table (+1 high, +2 critical, +1 sensitive, cap 2) is code, not a setting.
+- Matching is by exact host name and listed IPs only; no CIDR ranges or wildcards yet.
+
+## Watchpost 5.0.0 release (2026-10-08, branch `ws/5.0-release`)
+
+Entries after 2.1 were tracked in `docs/ROADMAP.md` and the PR descriptions instead of here. 5.0.0 collects PRs
+#21 to #34; see `CHANGELOG.md`.
+
+- `__version__` bumped from 4.0.0 to 5.0.0 (`/api/health` reports it).
+- `./run_tests.sh` on 2026-10-08: 569 tests OK, SMOKE OK (26 steps).
+- 15 built-in rules; ATT&CK coverage with the default rules: 17 of 20 catalog techniques validated, 3 mapped.

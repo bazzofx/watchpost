@@ -49,6 +49,8 @@ class Config:
     # 0 means "use hot_hours", i.e. no early expiry. It is clamped to never exceed hot_hours.
     routine_hours: int = 0
     archive_dir: str = ""
+    # HMAC key for the hash-chained audit log. Unset: plain SHA-256, which detects edits but not a full rewrite.
+    audit_key: str | None = None
 
     @classmethod
     def from_env(cls, **overrides):
@@ -80,6 +82,7 @@ class Config:
             hot_hours=int(os.environ.get("SIEM_HOT_HOURS", "0")),
             routine_hours=int(os.environ.get("SIEM_ROUTINE_HOURS", "0")),
             archive_dir=os.environ.get("SIEM_ARCHIVE_DIR", str(Path(db_path).parent / "archive")),
+            audit_key=os.environ.get("SIEM_AUDIT_KEY") or None,
         )
         values.update(overrides)
         return cls(**values)

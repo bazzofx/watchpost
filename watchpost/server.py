@@ -6,17 +6,21 @@ import json
 import queue
 import mimetypes
 import re
+import sqlite3
 from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
-from . import (__version__, agents, archive, auth, engine, geo, improve, incidents, maintenance,
-               pipeline, quarantine, queries, report, simulate, storyline, stream)
+from . import (__version__, agents, archive, assets, attack, auth, case_record, dashboard_views, ecs,
+               engine, entities, geo, hunt, improve, incidents, maintenance, masking, pipeline,
+               portability, quarantine, queries, report, search_rules, sigma, simulate, sources,
+               storyline, stream, triage)
+from . import backtest as backtest_mod
 from .ratelimit import TokenBucketLimiter
 from .config import Config
-from .db import audit, connect, init_schema, now_iso, row_to_dict
+from .db import audit, connect, init_schema, now_iso, row_to_dict, utcnow, verify_chain
 from .diagnostics import configure_logging, log, record_error
 from .health import STATIC_DIR, run_health_checks
 from .normalize import EventError, parse_payload, validate_source
@@ -31,31 +35,41 @@ class ApiError(Exception):
 
 
 class Download:
-    """A non-JSON response body sent as a file attachment."""
+    """A non-JSON response body sent as a file attachment.
 
-    def __init__(self, body, content_type, filename):
+    With `render`, the body is render(data) and is built in the response path, which masks `data` first for
+    a masked viewer (a PDF cannot be masked as text). See Handler._download_body.
+    """
+
+    def __init__(self, body, content_type, filename, data=None, render=None):
         self.body, self.content_type, self.filename = body, content_type, filename
+        self.data, self.render = data, render
 
 
 class App:
     def __init__(self, config: Config):
         self.config = config
-        conn = connect(config.db_path)
+        conn = connect(config.db_path, config.audit_key)
         try:
             init_schema(conn)
             engine.seed_rules(conn)
             improve.seed_settings(conn)
             self.credentials_file = auth.bootstrap_users(conn, config, Path(config.db_path).parent)
+            masking.key(conn)  # create the per-database pseudonym key now, not on a viewer's GET
         finally:
             conn.close()
-        self.login_limiter = self.request_limiter = None
+        self.login_limiter = self.request_limiter = self.backtest_limiter = self.change_backtest_limiter = None
         if config.rate_limit_enabled:
             self.login_limiter = TokenBucketLimiter(config.login_rate_burst, config.login_rate_per_minute)
             self.request_limiter = TokenBucketLimiter(config.rate_burst, config.rate_per_minute)
+            # Per account: each backtest replays up to backtest.MAX_EVENTS stored events twice. Previews are the
+            # cheap thing to repeat and get the tight bucket; rule proposals and approvals get their own.
+            self.backtest_limiter = TokenBucketLimiter(BACKTEST_BURST, BACKTEST_PER_MINUTE)
+            self.change_backtest_limiter = TokenBucketLimiter(CHANGE_BACKTEST_BURST, BACKTEST_PER_MINUTE)
         self.storyline = storyline.Runner(self.conn)
 
     def conn(self):
-        return connect(self.config.db_path)
+        return connect(self.config.db_path, self.config.audit_key)
 
 
 # --- Routing ---------------------------------------------------------------------------
@@ -88,10 +102,31 @@ def body_json(req):
 @route("POST", "/api/auth/login", role="public", csrf=False)
 def login(req):
     data = body_json(req)
-    token, csrf, user = auth.login(req.conn, data.get("username", ""), data.get("password", ""),
-                                   req.app.config.session_ttl_seconds)
+    result = auth.login(req.conn, data.get("username", ""), data.get("password", ""),
+                        req.app.config.session_ttl_seconds)
+    if isinstance(result, auth.MfaChallenge):
+        # Not a session: a short-lived, single-use token for POST /api/auth/mfa.
+        return {"mfa_required": True, "mfa_token": result.mfa_token,
+                "expires_in": auth.MFA_TOKEN_TTL_SECONDS}
+    token, csrf, user = result
     req.set_cookie = token
-    return {"user": user, "csrf_token": csrf}
+    return _masked_flag(req.conn, user, {"user": user, "csrf_token": csrf})
+
+
+@route("POST", "/api/auth/mfa", role="public", csrf=False)
+def login_mfa(req):
+    data = body_json(req)
+    token, csrf, user = auth.complete_mfa(req.conn, data.get("mfa_token"), data.get("code"),
+                                          req.app.config.session_ttl_seconds)
+    req.set_cookie = token
+    return _masked_flag(req.conn, user, {"user": user, "csrf_token": csrf})
+
+
+def _masked_flag(conn, user, payload):
+    """Tell a viewer that masking is on (the UI shows a "Masked view" pill). Other responses are unchanged."""
+    if user.get("role") == "viewer" and masking.enabled(conn):
+        payload["masked"] = True
+    return payload
 
 
 @route("POST", "/api/auth/logout")
@@ -103,8 +138,42 @@ def logout(req):
 
 @route("GET", "/api/auth/me")
 def me(req):
-    return {"user": {"username": req.user["username"], "role": req.user["role"]},
-            "csrf_token": req.user["csrf"]}
+    payload = {"user": {"username": req.user["username"], "role": req.user["role"]}}
+    if "csrf" in req.user:
+        payload["csrf_token"] = req.user["csrf"]
+    return _masked_flag(req.conn, req.user, payload)
+
+
+# Account security: TOTP enrollment and sessions. The viewer can read its own status and sessions only.
+
+@route("GET", "/api/auth/mfa/status")
+def mfa_status(req):
+    return auth.mfa_status(req.conn, req.user["username"])
+
+
+@route("POST", "/api/auth/mfa/enroll", role="analyst")
+def mfa_enroll(req):
+    return auth.mfa_enroll(req.conn, req.user["username"])
+
+
+@route("POST", "/api/auth/mfa/confirm", role="analyst")
+def mfa_confirm(req):
+    return auth.mfa_confirm(req.conn, req.user["username"], body_json(req).get("code"))
+
+
+@route("POST", "/api/auth/mfa/disable", role="analyst")
+def mfa_disable(req):
+    return auth.mfa_disable(req.conn, req.user["username"], body_json(req).get("code"))
+
+
+@route("GET", "/api/auth/sessions")
+def my_sessions(req):
+    return auth.list_sessions(req.conn, req.user["username"], req.user.get("sid"))
+
+
+@route("POST", r"/api/auth/sessions/([0-9a-f]{16})/revoke", role="analyst")
+def my_session_revoke(req, sid):
+    return auth.revoke_session(req.conn, sid, req.user["username"], owner=req.user["username"])
 
 
 @route("GET", "/api/health", role="public")
@@ -124,6 +193,31 @@ def health_details(req):
     report["recent_detection_runs"] = [dict(r) for r in req.conn.execute(
         "SELECT * FROM detection_runs ORDER BY id DESC LIMIT 10")]
     return report
+
+
+# Log source health ------------------------------------------------------------------------
+# Not a check in /api/health: that endpoint reports Watchpost's own health, and a silent upstream source is
+# not a fault of this service. It is a detection (log_source_silent) and this inventory.
+
+@route("GET", "/api/sources/health")
+def sources_health(req):
+    return sources.inventory(req.conn)
+
+
+@route("POST", "/api/sources/maintenance", role="admin")
+def maintenance_propose(req):
+    """Propose a maintenance window; it excuses silence only once a second admin approves it."""
+    data = body_json(req)
+    req.status = 201
+    return improve.propose_change(req.conn, "maintenance_add", data.get("source"),
+                                  {k: data[k] for k in ("host", "start", "end") if k in data},
+                                  data.get("reason"), req.user["username"])
+
+
+@route("POST", r"/api/sources/maintenance/(\d+)/end", role="admin")
+def maintenance_end(req, window_id):
+    """End a window early: silence counts again from now. Stricter detection, so no review is needed."""
+    return sources.end_window(req.conn, int(window_id), req.user["username"])
 
 
 @route("POST", "/api/detection/run", role="analyst")
@@ -258,11 +352,12 @@ def demo_load(req):
     if not isinstance(seed, int):
         raise ApiError(400, "seed must be an integer")
     results = {}
+    demo_assets = assets.seed_demo_assets(req.conn, req.user["username"])
     for name, events in simulate.build(seed=seed).items():
         normalized, rejections = parse_payload(json.dumps(events), "json", f"demo:{name}")
         results[name] = engine.ingest(req.conn, normalized, rejections, f"demo:{name}", "json",
                                       req.user["username"], synthetic=True)
-    audit(req.conn, req.user["username"], "demo_loaded", None, {"seed": seed})
+    audit(req.conn, req.user["username"], "demo_loaded", None, {"seed": seed, "assets_created": demo_assets})
     return {name: {k: r[k] for k in ("accepted", "rejected", "detection")} for name, r in results.items()}
 
 
@@ -325,15 +420,94 @@ def events(req):
     return queries.search_events(req.conn, req.query)
 
 
+@route("GET", "/api/hunt")
+def hunt_run(req):
+    return hunt.run(req.conn, req.query)
+
+
+@route("GET", "/api/hunt/saved")
+def hunt_saved(req):
+    return hunt.list_saved(req.conn)
+
+
+@route("POST", "/api/hunt/saved", role="analyst")
+def hunt_save(req):
+    req.status = 201
+    return hunt.save_search(req.conn, body_json(req), req.user["username"])
+
+
+@route("POST", r"/api/hunt/saved/(\d+)/delete", role="analyst")
+def hunt_delete(req, search_id):
+    return hunt.delete_saved(req.conn, int(search_id), req.user["username"], auth.has_role(req.user, "admin"))
+
+
+PROMOTE_MAX_BODY = 64 * 1024  # the definition plus its labeled sample
+
+
+@route("POST", r"/api/hunt/saved/(\d+)/promote", role="analyst")
+def hunt_promote(req, search_id):
+    """Promote a saved search to a threshold detection rule. Applies nothing by itself.
+
+    Body: {group_by, threshold, window_minutes, severity, techniques (optional), name (optional, defaults to the
+    saved search's name), sample (optional), reason (optional)}. The saved search's query is copied into the
+    request, so later edits or deletion of the saved search do not change it. ?dry_run=1 compiles it and
+    previews its findings on stored events; otherwise it becomes a `search_add` change request, and approval
+    adds the rule disabled. Either way it spends one backtest from the rule-proposal bucket.
+    """
+    if len(req.body) > PROMOTE_MAX_BODY:
+        raise ApiError(413, f"a promotion is at most {PROMOTE_MAX_BODY} bytes")
+    data = body_json(req)
+    if not set(data) <= search_rules.DEFINITION_KEYS | {"sample", "reason"}:
+        raise ApiError(400, "a promotion is {group_by, threshold, window_minutes, severity, techniques (optional), "
+                            "name (optional), sample (optional), reason (optional)}")
+    saved = req.conn.execute("SELECT id, name, query FROM saved_searches WHERE id = ?", (int(search_id),)).fetchone()
+    if saved is None:
+        raise ApiError(404, "saved search not found")
+    dry_run = req.query.get("dry_run") == "1"
+    _backtest_quota(req, req.app.change_backtest_limiter)  # the preview, and the proposal's evidence, backtest
+    definition = {k: data[k] for k in search_rules.DEFINITION_KEYS if k in data}
+    try:
+        compiled = search_rules.compile_rule(saved["name"], saved["query"], definition)
+        sample = search_rules.validate_sample(data["sample"]) if data.get("sample") is not None else None
+    except search_rules.SearchRuleError as exc:
+        if not dry_run:
+            raise ApiError(400, f"refused: {exc}")
+        return {"dry_run": True, "ok": False, "refused": str(exc)}
+    if dry_run:
+        exists = req.conn.execute("SELECT 1 FROM rules WHERE id = ?", (compiled["rule_id"],)).fetchone()
+        return {"dry_run": True, "ok": not exists,
+                "refused": f"rule {compiled['rule_id']!r} already exists" if exists else None,
+                "compiled": {k: compiled[k] for k in ("rule_id", "title", "severity", "techniques", "conditions",
+                                                      "query", "params")},
+                "sample": search_rules.sample_result(compiled["params"], sample),
+                "backtest": search_rules.preview(req.conn, compiled["params"])}
+    payload = {"saved_search_id": saved["id"], "query": compiled["query"],
+               "definition": {**definition, "name": compiled["title"]},
+               **({"sample": sample} if sample is not None else {})}
+    req.status = 201
+    return improve.propose_change(req.conn, "search_add", compiled["rule_id"], payload,
+                                  data.get("reason") or f"promote saved search {saved['name']}"[:2000],
+                                  req.user["username"])
+
+
 @route("GET", r"/api/events/(\d+)")
 def event_detail(req, event_id):
     # Falls through to the archive partitions when the event is older than the hot window.
     return queries.get_event(req.conn, int(event_id), archive_dir=req.app.config.archive_dir)
 
 
+@route("GET", r"/api/events/(\d+)/ecs")
+def event_ecs(req, event_id):
+    """The event as an ECS-shaped document (ecs.py). A field mapping for export, not how events are stored."""
+    event = queries.get_event(req.conn, int(event_id))
+    event.pop("alerts")
+    return ecs.to_ecs(event)
+
+
 @route("GET", "/api/alerts")
 def alerts(req):
-    return queries.list_alerts(req.conn, req.query)
+    now = utcnow()
+    return [{**a, "sla_breach": triage.pending_breaches(a, now)} for a in queries.list_alerts(req.conn, req.query)]
 
 
 @route("GET", r"/api/alerts/(\d+)")
@@ -352,6 +526,11 @@ def alert_status(req, alert_id):
     data = body_json(req)
     return queries.update_status(req.conn, int(alert_id), req.user["username"], data.get("status"),
                                  data.get("disposition"), data.get("note"))
+
+
+@route("POST", r"/api/alerts/(\d+)/assign", role="analyst")
+def alert_assign(req, alert_id):
+    return queries.assign(req.conn, int(alert_id), req.user["username"], body_json(req).get("assignee"))
 
 
 # Incidents (correlated alerts) and ATT&CK coverage -------------------------------------
@@ -386,6 +565,12 @@ def agents_overview(req):
     return agents.overview(req.conn)
 
 
+@route("GET", r"/api/attack/navigator\.json")
+def attack_navigator(req):
+    """The same coverage as a MITRE ATT&CK Navigator layer (open it with 'Open Existing Layer')."""
+    return attack.navigator_layer(incidents.coverage(req.conn))
+
+
 # Reports ---------------------------------------------------------------------------------
 
 def _report(req, kind, ident, fmt):
@@ -393,8 +578,8 @@ def _report(req, kind, ident, fmt):
     audit(req.conn, req.user["username"], "report_downloaded", f"{kind}:{ident}", {"format": fmt})
     name = f"watchpost-{kind}-{ident}-report.{fmt}"
     if fmt == "pdf":
-        return Download(report.to_pdf_bytes(model), "application/pdf", name)
-    return Download(report.to_markdown(model).encode("utf-8"), "text/markdown; charset=utf-8", name)
+        return Download(None, "application/pdf", name, model, report.to_pdf_bytes)
+    return Download(None, "text/markdown; charset=utf-8", name, model, lambda m: report.to_markdown(m).encode("utf-8"))
 
 
 @route("GET", r"/api/alerts/(\d+)/report\.(md|pdf)")
@@ -407,19 +592,73 @@ def incident_report(req, incident_id, fmt):
     return _report(req, "incident", int(incident_id), fmt)
 
 
+@route("GET", r"/api/incidents/(\d+)/case\.(json|md)")
+def incident_case(req, incident_id, fmt):
+    ident = int(incident_id)
+    model = case_record.build(req.conn, ident)
+    audit(req.conn, req.user["username"], "case_exported", f"incident:{ident}", {"format": fmt})
+    render = case_record.to_json_bytes if fmt == "json" else case_record.to_markdown_bytes
+    content_type = "application/json" if fmt == "json" else "text/markdown; charset=utf-8"
+    return Download(None, content_type, f"watchpost-incident-{ident}-case.{fmt}", model, render)
+
+
 @route("GET", "/api/metrics")
 def metrics(req):
     return queries.metrics(req.conn, req.query.get("hours"))
 
 
+@route("GET", "/api/metrics/triage")
+def triage_metrics(req):
+    return triage.triage_metrics(req.conn, req.query.get("window"))
+
+
 # SOC dashboard ---------------------------------------------------------------------------
 
 GEO_MAX_IPS = 200
+DASHBOARD_ENTITIES = 8
+
+
+@route("GET", "/api/dashboard/views")
+def dashboard_view_list(req):
+    return dashboard_views.list_views(req.conn, req.user["username"])
+
+
+@route("POST", "/api/dashboard/views", role="analyst")
+def dashboard_view_create(req):
+    req.status = 201
+    return dashboard_views.save(req.conn, body_json(req), req.user["username"])
+
+
+@route("POST", r"/api/dashboard/views/(\d+)", role="analyst")
+def dashboard_view_update(req, view_id):
+    return dashboard_views.save(req.conn, body_json(req), req.user["username"], int(view_id))
+
+
+@route("POST", r"/api/dashboard/views/(\d+)/delete", role="analyst")
+def dashboard_view_delete(req, view_id):
+    return dashboard_views.delete(req.conn, int(view_id), req.user["username"])
 
 
 @route("GET", "/api/dashboard")
 def dashboard(req):
-    return queries.dashboard(req.conn)
+    return {**queries.dashboard(req.conn),
+            "risky_entities": entities.list_entities(req.conn, {"limit": DASHBOARD_ENTITIES})["entities"]}
+
+
+@route("GET", "/api/entities")
+def entity_list(req):
+    return entities.list_entities(req.conn, req.query)
+
+
+def _entity_route(kind):
+    # One literal route per kind; the value is percent-encoded in the path (it may hold dots, colons, pipes).
+    @route("GET", rf"/api/entities/{kind}/([^/]+)")
+    def entity_detail(req, value):
+        return entities.get_entity(req.conn, kind, unquote(value))
+
+
+for _kind in entities.KINDS:
+    _entity_route(_kind)
 
 
 @route("GET", "/api/geo")
@@ -457,23 +696,214 @@ def rules(req):
     perf = improve.rule_performance(req.conn)
     latest = improve.list_evaluations(req.conn, limit=1)
     evaluation = latest[0]["results"]["rules"] if latest else {}
-    return [{**r, "performance": perf.get(r["id"]), "evaluation": evaluation.get(r["id"])}
+    return [{**r, "performance": perf.get(r["id"]), "evaluation": evaluation.get(r["id"]),
+             **({"sigma": _sigma_detail(req.conn, r)} if sigma.is_sigma(r["id"]) else {}),
+             **({"search": _search_detail(req.conn, r)} if search_rules.is_search(r["id"]) else {})}
             for r in engine.load_rules(req.conn, enabled_only=False)]
+
+
+def _search_detail(conn, rule):
+    """A promoted saved search's query (read-only), where it came from, and its sample."""
+    rec = search_rules.stored(conn, rule["id"])
+    if rec is None:
+        return None
+    return {**{k: rec[k] for k in ("query", "saved_search_id", "proposed_by", "approved_by", "change_request_id",
+                                   "created_at", "sample")},
+            "conditions": search_rules.describe(rule["params"]),
+            "sample_result": search_rules.sample_result(rule["params"], rec["sample"])}
+
+
+def _sigma_detail(conn, rule):
+    """An imported rule's original YAML (read-only), its sha256, its compiled conditions and its sample."""
+    rec = sigma.stored(conn, rule["id"])
+    if rec is None:
+        return None
+    return {**{k: rec[k] for k in ("source", "sha256", "sigma_id", "imported_by", "approved_by", "change_request_id",
+                                   "created_at", "sample")},
+            "conditions": sigma.describe(rule["params"]["detection"]),
+            "sample_result": sigma.sample_result(rule["params"], rec["sample"])}
 
 
 @route("GET", r"/api/rules/([a-z_]+)/history")
 def rule_history(req, rule_id):
     rows = req.conn.execute("SELECT * FROM rule_history WHERE rule_id = ? ORDER BY version DESC", (rule_id,))
-    return [row_to_dict(r, ["params"]) for r in rows]
+    return [row_to_dict(r, ["params", "grouping"]) for r in rows]
+
+
+def _backtest_quota(req, limiter, cost=1):
+    """Spend `cost` backtests, all or none, from the account's quota in `limiter` (None when rate limiting is off)."""
+    if limiter is not None:
+        needed = f" ({cost} needed)" if cost > 1 else ""
+        if cost > limiter.burst:
+            raise ApiError(429, f"too many backtests{needed}: the quota holds at most {int(limiter.burst)}")
+        allowed, retry_after = limiter.allow(req.user["username"], cost)
+        if not allowed:
+            raise ApiError(429, f"too many backtests{needed}; retry in {retry_after} s")
 
 
 @route("POST", r"/api/rules/([a-z_]+)/proposals", role="analyst")
 def rule_propose(req, rule_id):
     data = body_json(req)
-    payload = {k: data[k] for k in ("params", "enabled") if k in data}
+    _backtest_quota(req, req.app.change_backtest_limiter)  # the proposal's evidence carries a backtest
+    payload = {k: data[k] for k in ("params", "enabled", "grouping") if k in data}
     req.status = 201
     return improve.propose_change(req.conn, "rule_update", rule_id, payload, data.get("reason"),
                                   req.user["username"])
+
+
+@route("GET", "/api/rules/export")
+def rules_export(req):
+    """Every rule's tuning as a versioned JSON document. Detection logic is code and is not exported."""
+    body = json.dumps(portability.export_rules(req.conn), sort_keys=True, indent=2).encode()
+    return Download(body, "application/json", "watchpost-rules.json")
+
+
+IMPORT_LABEL_RE = re.compile(r"[^A-Za-z0-9 ._()\-]")
+
+
+@route("POST", "/api/rules/import", role="analyst")
+def rules_import(req):
+    """Turn an exported rules document into reviewed rule_update proposals. Applies nothing by itself.
+
+    ?dry_run=1 returns the per-rule outcomes and proposes nothing. ?label= names the file in each reason.
+    """
+    if len(req.body) > portability.MAX_IMPORT_BYTES:
+        raise ApiError(413, f"a rules import is at most {portability.MAX_IMPORT_BYTES} bytes")
+    dry_run = req.query.get("dry_run") == "1"
+    label = IMPORT_LABEL_RE.sub("", req.query.get("label", ""))[:100].strip() or "upload"
+    plan = portability.plan_import(req.conn, body_json(req))
+    if not dry_run:
+        # Each proposal runs a backtest: spend one per changed rule from the same bucket as hand-made
+        # proposals, all up front, so an import is refused whole rather than half proposed.
+        if portability.to_propose(plan):
+            _backtest_quota(req, req.app.change_backtest_limiter, portability.to_propose(plan))
+        portability.propose_import(req.conn, plan, label, req.user["username"])
+    return {"dry_run": dry_run, "label": label, "summary": portability.summary(plan), "rules": plan}
+
+
+SIGMA_MAX_BODY = 256 * 1024  # the YAML (at most sigma.MAX_SOURCE_BYTES) plus its labeled sample
+
+
+@route("POST", "/api/rules/sigma", role="analyst")
+def sigma_import(req):
+    """Import a Sigma rule: {source, sample (optional), reason (optional)}. Applies nothing by itself.
+
+    ?dry_run=1 compiles it and previews it on stored events (spends one preview backtest) and returns the
+    compiled conditions or the refusal reason. Otherwise it becomes a `sigma_add` change request (spends one
+    from the rule-proposal bucket, as its evidence carries the same preview); approval adds the rule disabled.
+    """
+    if len(req.body) > SIGMA_MAX_BODY:
+        raise ApiError(413, f"a Sigma import is at most {SIGMA_MAX_BODY} bytes")
+    data = body_json(req)
+    if not set(data) <= {"source", "sample", "reason"}:
+        raise ApiError(400, "a Sigma import is {source, sample (optional), reason (optional)}")
+    dry_run = req.query.get("dry_run") == "1"
+    _backtest_quota(req, req.app.backtest_limiter if dry_run else req.app.change_backtest_limiter)
+    try:
+        compiled = sigma.compile_rule(data.get("source"))
+        sample = sigma.validate_sample(data["sample"]) if data.get("sample") is not None else None
+    except sigma.SigmaError as exc:
+        if not dry_run:
+            raise ApiError(400, f"refused: {exc}")
+        return {"dry_run": True, "ok": False, "refused": str(exc)}
+    if dry_run:
+        exists = req.conn.execute("SELECT 1 FROM rules WHERE id = ?", (compiled["rule_id"],)).fetchone()
+        return {"dry_run": True, "ok": not exists,
+                "refused": f"rule {compiled['rule_id']!r} already exists" if exists else None,
+                "compiled": {k: compiled[k] for k in ("rule_id", "title", "severity", "techniques", "conditions",
+                                                      "warnings", "sha256", "params", "logsource")},
+                "sample": sigma.sample_result(compiled["params"], sample),
+                "backtest": sigma.preview(req.conn, compiled["params"])}
+    payload = {"source": data["source"], **({"sample": sample} if sample is not None else {})}
+    req.status = 201
+    return improve.propose_change(req.conn, "sigma_add", compiled["rule_id"], payload,
+                                  data.get("reason") or f"import Sigma rule {compiled['title']}"[:2000],
+                                  req.user["username"])
+
+
+@route("POST", r"/api/rules/([a-z_]+)/sigma-sample", role="analyst")
+def sigma_sample_propose(req, rule_id):
+    """Attach or replace an imported rule's labeled sample; a change request like any other."""
+    data = body_json(req)
+    req.status = 201
+    return improve.propose_change(req.conn, "sigma_sample", rule_id, {"sample": data.get("sample")},
+                                  data.get("reason"), req.user["username"])
+
+
+@route("POST", r"/api/rules/([a-z_]+)/search-sample", role="analyst")
+def search_sample_propose(req, rule_id):
+    """Attach or replace a promoted search rule's labeled sample; a change request like any other."""
+    data = body_json(req)
+    req.status = 201
+    return improve.propose_change(req.conn, "search_sample", rule_id, {"sample": data.get("sample")},
+                                  data.get("reason"), req.user["username"])
+
+
+BACKTEST_BURST, BACKTEST_PER_MINUTE = 6, 12
+CHANGE_BACKTEST_BURST = 20  # rule proposals and approvals: room for a review session
+
+
+@route("GET", r"/api/rules/([a-z_]+)/backtest", role="analyst")
+def rule_backtest(req, rule_id):
+    """Preview a draft rule change on stored events before proposing it. Changes nothing.
+
+    Analyst and above, like proposing; a viewer sees the backtest inside a change request's evidence.
+    ?params=<JSON object of the params to change>&days=<1-30, default 7>.
+    """
+    try:
+        params = json.loads(req.query.get("params") or "{}")
+    except json.JSONDecodeError:
+        raise ApiError(400, "params must be a JSON object")
+    days = req.query.get("days", str(backtest_mod.DEFAULT_WINDOW_DAYS))
+    if not days.isdigit() or not 1 <= int(days) <= backtest_mod.MAX_WINDOW_DAYS:
+        raise ApiError(400, f"days must be an integer between 1 and {backtest_mod.MAX_WINDOW_DAYS}")
+    _backtest_quota(req, req.app.backtest_limiter)
+    return improve.preview_backtest(req.conn, rule_id, params, int(days))
+
+
+@route("POST", r"/api/rules/([a-z_]+)/suppressions", role="analyst")
+def suppression_propose(req, rule_id):
+    """Propose a tuning exception; nothing is suppressed until an admin approves the change request."""
+    data = body_json(req)
+    req.status = 201
+    return improve.propose_change(req.conn, "suppression_add", rule_id,
+                                  {"group_key": data.get("group_key"), "days": data.get("days")},
+                                  data.get("reason"), req.user["username"])
+
+
+@route("GET", "/api/suppressions")
+def suppressions(req):
+    return improve.list_suppressions(req.conn)
+
+
+@route("POST", r"/api/rules/([a-z_]+)/suppression-windows", role="analyst")
+def rule_suppression_propose(req, rule_id):
+    data = body_json(req)
+    req.status = 201
+    return improve.propose_change(req.conn, "rule_suppression_add", rule_id,
+                                  {"starts_at": data.get("starts_at"), "expires_at": data.get("expires_at")},
+                                  data.get("reason"), req.user["username"])
+
+
+@route("GET", "/api/rule-suppression-windows")
+def rule_suppression_windows(req):
+    return improve.list_rule_suppression_windows(req.conn)
+
+
+@route("POST", r"/api/rule-suppression-windows/(\d+)/end", role="admin")
+def rule_suppression_end(req, window_id):
+    return improve.end_rule_suppression_window(req.conn, int(window_id), req.user["username"])
+
+
+@route("POST", r"/api/suppressions/(\d+)/revoke", role="admin")
+def suppression_revoke(req, suppression_id):
+    """End an approved exception before it expires; it stops applying from the next detection run."""
+    return improve.revoke_suppression(req.conn, int(suppression_id), req.user["username"])
+
+
+@route("GET", "/api/noise-lab")
+def noise_lab(req):
+    return improve.noise_lab(req.conn)
 
 
 @route("POST", "/api/rules/suggestions", role="analyst")
@@ -505,8 +935,13 @@ def changes(req):
 @route("POST", r"/api/changes/(\d+)/review", role="admin")
 def change_review(req, change_id):
     data = body_json(req)
+    if data.get("decision") == "approve":
+        row = req.conn.execute("SELECT kind FROM change_requests WHERE id = ?", (int(change_id),)).fetchone()
+        if row is not None and row["kind"] in ("rule_update", "sigma_add", "search_add"):
+            _backtest_quota(req, req.app.change_backtest_limiter)  # approval recomputes the evidence, backtest included
     return improve.review_change(req.conn, int(change_id), data.get("decision"), req.user["username"],
-                                 data.get("note", ""))
+                                 data.get("note", ""), data.get("evidence_digest"),
+                                 data.get("acknowledge_detection_loss"))
 
 
 @route("GET", "/api/evaluations")
@@ -520,17 +955,97 @@ def evaluation_run(req):
     return improve.run_evaluation(req.conn, req.user["username"])
 
 
+# Asset inventory ------------------------------------------------------------------------
+
+@route("GET", "/api/assets")
+def asset_list(req):
+    pending = [c for c in improve.list_changes(req.conn, "pending") if c["kind"] in improve.ASSET_KINDS]
+    return {"assets": assets.list_assets(req.conn), "criticalities": list(assets.CRITICALITIES),
+            "kinds": list(assets.KINDS), "data_tags": assets.DATA_TAGS, "pending": pending}
+
+
+def _asset_saved(req, asset):
+    """After an inventory change, re-weigh open alerts and refresh incident severities."""
+    changed = assets.rescore_open_alerts(req.conn)
+    if changed:
+        engine.correlate_alerts(req.conn)
+    return {"asset": asset, "alerts_rescored": changed}
+
+
+def _review_required(req, exc, proposal_route):
+    """409 for a direct edit that could lower alert severity, pointing at the route that proposes it."""
+    req.status = 409
+    return {"error": f"{exc}; propose it with POST {proposal_route}", "review_required": True,
+            "reasons": exc.reasons, "proposal_route": proposal_route}
+
+
+# Edits that can only keep or raise alert severity apply here at once; the rest are refused with 409 and go
+# through /proposals and a second admin's review (assets.review_reasons decides which is which).
+@route("POST", "/api/assets", role="admin")
+def asset_create(req):
+    try:
+        asset = assets.save_asset(req.conn, body_json(req), req.user["username"], gated=True)
+    except assets.ReviewRequired as exc:
+        return _review_required(req, exc, "/api/assets/proposals")
+    req.status = 201
+    return _asset_saved(req, asset)
+
+
+@route("POST", r"/api/assets/(\d+)", role="admin")
+def asset_update(req, asset_id):
+    try:
+        asset = assets.save_asset(req.conn, body_json(req), req.user["username"], int(asset_id), gated=True)
+    except assets.ReviewRequired as exc:
+        return _review_required(req, exc, f"/api/assets/{asset_id}/proposals")
+    return _asset_saved(req, asset)
+
+
+@route("POST", r"/api/assets/(\d+)/delete", role="admin")
+def asset_delete(req, asset_id):
+    """A delete always needs a second admin. Kept as a route so older clients get a pointer, not a 404."""
+    assets.get_asset(req.conn, int(asset_id))  # an unknown asset is still a 404
+    return _review_required(req, assets.ReviewRequired(assets.review_reasons(None, None)),
+                            f"/api/assets/{asset_id}/proposals")
+
+
+@route("POST", "/api/assets/proposals", role="admin")
+def asset_propose_add(req):
+    data = body_json(req)
+    asset = assets.validate({k: v for k, v in data.items() if k != "reason"})  # stored as validated, nothing else
+    req.status = 201
+    return improve.propose_change(req.conn, "asset_add", asset["name"], asset, data.get("reason"),
+                                  req.user["username"])
+
+
+@route("POST", r"/api/assets/(\d+)/proposals", role="admin")
+def asset_propose(req, asset_id):
+    """Propose an edit (the full asset, as for a direct edit) or, with {"delete": true}, a delete."""
+    data = body_json(req)
+    if data.get("delete") is True:
+        assets.get_asset(req.conn, int(asset_id))
+        kind, payload = "asset_delete", {}
+    else:
+        kind, payload = "asset_update", assets.edit_payload(req.conn, int(asset_id),
+                                                            {k: v for k, v in data.items() if k != "reason"})
+    req.status = 201
+    return improve.propose_change(req.conn, kind, asset_id, payload, data.get("reason"), req.user["username"])
+
+
 # Administration ------------------------------------------------------------------------
 
 @route("GET", "/api/tokens", role="admin")
 def tokens(req):
-    return [dict(r) for r in req.conn.execute(
-        "SELECT id, name, prefix, created_by, created_at, last_used_at, revoked_at FROM api_tokens ORDER BY id")]
+    return [row_to_dict(r, json_fields=("capabilities",)) for r in req.conn.execute(
+        "SELECT id, name, prefix, created_by, created_at, last_used_at, revoked_at, role, capabilities, expires_at"
+        " FROM api_tokens ORDER BY id")]
 
 
 @route("POST", "/api/tokens", role="admin")
 def token_create(req):
-    token = auth.create_api_token(req.conn, body_json(req).get("name"), req.user["username"])
+    body = body_json(req)
+    token = auth.create_api_token(req.conn, body.get("name"), req.user["username"],
+                                  body.get("role", "analyst"), body.get("capabilities"),
+                                  body.get("expires_in_days"))
     req.status = 201
     return {"token": token, "note": "Shown once. Only a hash is stored."}
 
@@ -543,6 +1058,21 @@ def token_revoke(req, token_id):
         raise ApiError(404, "token not found or already revoked")
     audit(req.conn, req.user["username"], "api_token_revoked", token_id)
     return {"ok": True}
+
+
+@route("GET", "/api/sessions", role="admin")
+def sessions(req):
+    return auth.list_sessions(req.conn, req.query.get("user") or None, req.user.get("sid"))
+
+
+@route("POST", r"/api/sessions/([0-9a-f]{16})/revoke", role="admin")
+def session_revoke(req, sid):
+    return auth.revoke_session(req.conn, sid, req.user["username"])
+
+
+@route("POST", r"/api/users/(\w{3,32})/mfa/reset", role="admin")
+def user_mfa_reset(req, username):
+    return auth.mfa_admin_reset(req.conn, username, req.user["username"])
 
 
 @route("GET", "/api/audit", role="admin")
@@ -618,6 +1148,11 @@ def rollup_buckets(req):
 def quarantine_view(req):
     """Rejected records: the bounds and the newest entries. Content appears only when kept."""
     return {"stats": quarantine.stats(req.conn), "recent": quarantine.recent(req.conn, 50)}
+
+
+@route("GET", "/api/audit/verify", role="admin")
+def audit_verify(req):
+    return verify_chain(req.conn)
 
 
 # The only non-GET routes a read-only viewer may call.
@@ -697,7 +1232,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _rate_limited(self, path):
         """Spend a token from the login or general bucket; on an empty bucket send 429 and return True."""
-        is_login = self.command == "POST" and path == "/api/auth/login"
+        is_login = self.command == "POST" and path in ("/api/auth/login", "/api/auth/mfa")
         limiter = self.app.login_limiter if is_login else self.app.request_limiter
         if limiter is None:
             return False
@@ -732,6 +1267,7 @@ class Handler(BaseHTTPRequestHandler):
         self.status = 200
         self.set_cookie = None
         self.conn = None
+        self.masker = None
         try:
             for method, pattern, fn, role, csrf in ROUTES:
                 match = pattern.match(parsed.path)
@@ -747,7 +1283,14 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError(415, "Content-Type must be application/json")
             self.conn = self.app.conn()
             self._authorize(role, csrf, fn)
-            result = fn(self, *match.groups())
+            groups = match.groups()
+            # The one masking choke point: a viewer's pseudonyms resolve on the way in (pivots), and every
+            # response below (JSON, downloads, and the stream in _frame) is masked on the way out.
+            self.masker = masking.for_user(self.conn, self.user)
+            if self.masker is not None:
+                self.query = {k: self.masker.unmask(self.conn, v) for k, v in self.query.items()}
+                groups = tuple(g if g is None else self.masker.unmask(self.conn, g, path=True) for g in groups)
+            result = fn(self, *groups)
             if result is STREAM_RESPONSE:
                 return self._stream()
             headers = {"Cache-Control": "no-store"}
@@ -755,18 +1298,37 @@ class Handler(BaseHTTPRequestHandler):
                 headers["Set-Cookie"] = self._cookie_header(self.set_cookie)
             if isinstance(result, Download):
                 headers["Content-Disposition"] = f'attachment; filename="{result.filename}"'
-                return self._send(self.status, result.body, result.content_type, headers)
+                return self._send(self.status, self._download_body(result), result.content_type, headers)
+            if self.masker is not None:
+                result = self.masker.mask(result)
             self._send(self.status, result, extra_headers=headers)
         except ApiError as exc:
-            self._send(exc.status, {"error": str(exc)})
-        except (auth.AuthError, queries.QueryError, improve.ChangeError) as exc:
-            self._send(getattr(exc, "status", 400), {"error": str(exc)})
+            self._send_error(exc.status, str(exc))
+        except (auth.AuthError, queries.QueryError, improve.ChangeError, assets.AssetError,
+                sources.WindowError, masking.Unavailable) as exc:
+            self._send_error(getattr(exc, "status", 400), str(exc))
         except Exception as exc:
             record_error(self.conn, "api", exc, guidance=f"Unhandled error on {self.command} {parsed.path}")
             self._send(500, {"error": "internal error; it has been recorded on the Health page"})
         finally:
             if self.conn is not None:
                 self.conn.close()
+
+    def _send_error(self, status, message):
+        """Errors echo request values, and a viewer's pivot has already resolved to the real value: mask them."""
+        payload = {"error": message}
+        self._send(status, self.masker.mask(payload) if self.masker is not None else payload)
+
+    def _download_body(self, download):
+        if download.render is not None:
+            return download.render(self.masker.mask(download.data) if self.masker else download.data)
+        if self.masker is None:
+            return download.body
+        if download.content_type.startswith("application/json"):  # as data: escaped names, identity fields
+            return json.dumps(self.masker.mask(json.loads(download.body)), sort_keys=True, indent=2).encode()
+        if not download.content_type.startswith("text/"):
+            raise ApiError(403, "this download is not available in the masked view")  # fail closed
+        return self.masker.text(download.body.decode("utf-8")).encode("utf-8")
 
     def _authorize(self, role, csrf, fn=None):
         self.session_token = self._session_token()
@@ -775,11 +1337,22 @@ class Handler(BaseHTTPRequestHandler):
             return
         header = self.headers.get("Authorization", "")
         if header.startswith("Bearer "):
-            if role != "ingest":
-                raise ApiError(403, "API tokens can only be used for ingestion endpoints")
             self.user = auth.token_user(self.conn, header[7:].strip())
             if self.user is None:
                 raise ApiError(401, "invalid or revoked API token")
+            mutation_capabilities = {
+                "ingest_json": "ingest", "ingest_upload": "ingest",
+                "alert_note": "triage", "alert_status": "triage", "alert_assign": "triage",
+                "incident_status": "triage",
+            }
+            capability = "read" if self.command == "GET" else mutation_capabilities.get(fn.__name__ if fn else "")
+            if capability is None or capability not in self.user["capabilities"]:
+                raise ApiError(403, "API token does not have the required capability")
+            minimum = "analyst" if role == "ingest" else role
+            if not auth.has_role(self.user, minimum):
+                raise ApiError(403, f"requires the {minimum} role")
+            if self.user["role"] == "viewer" and self.command != "GET":
+                raise ApiError(403, "viewer tokens are read-only")
             return  # bearer tokens are not sent automatically by browsers, so no CSRF risk
         self.user = auth.session_user(self.conn, self.session_token)
         if self.user is None:
@@ -831,6 +1404,15 @@ class Handler(BaseHTTPRequestHandler):
             stream.BROKER.unsubscribe(sub)
 
     def _frame(self, kind, data, retry=None):
+        if self.user["role"] == "viewer":  # rebuilt per frame: the setting or the known usernames may have changed
+            conn = self.app.conn()
+            try:
+                masker = masking.for_user(conn, self.user)
+            except (sqlite3.Error, masking.Unavailable):
+                raise ConnectionAbortedError("masking unavailable; end the stream rather than send it unmasked")
+            finally:
+                conn.close()
+            data = masker.mask(data) if masker else data
         payload = (f"retry: {retry}\n".encode() if retry else b"") + \
             stream.frame(kind, data, stream.BROKER.next_id())
         self.wfile.write(payload)

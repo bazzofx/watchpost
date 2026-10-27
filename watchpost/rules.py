@@ -15,7 +15,10 @@ from urllib.parse import unquote_plus
 import re
 
 from . import geo
+from . import search_rules
+from . import sigma
 from .attack import techniques
+from .sources import log_source_silent
 from .db import parse_iso
 
 LOGIN_SUCCESS_TYPES = ("auth_success", "vpn_login")
@@ -262,11 +265,77 @@ DEFAULT_RULES = [
         "name": "Large data transfer by one principal",
         "description": "Fires when one account (or, without an account, one source IP) moves at least "
                        "`bytes_threshold` bytes out through allowed firewall connections and cloud storage "
-                       "reads, or makes at least `access_threshold` cloud data reads, within `window_seconds`.",
+                       "reads, or makes at least `access_threshold` cloud data reads, within `window_seconds`. "
+                       "By default the thresholds are flat: history and analyst verdicts never quiet this rule. "
+                       "A principal that has an approved, unexpired tuning exception for this rule is not skipped: "
+                       "the exception turns on a baseline for it instead. Its burst must then also be at least "
+                       "`baseline_multiplier` times its own busiest `window_seconds` in the preceding "
+                       "`history_seconds` (all of that history counts), so an excepted nightly backup that always "
+                       "moves this much stays quiet and still alerts when it moves several times more. "
+                       "`baseline_multiplier` 0 keeps the thresholds flat even for an excepted principal.",
         "techniques": techniques("T1530", "T1048"),
         "severity": "high",
         "params": {"bytes_threshold": 1_000_000_000, "access_threshold": 100, "window_seconds": 3600,
+                   "baseline_multiplier": 3, "history_seconds": 604800, "ignore_ips": [], "ignore_users": []},
+    },
+    {
+        "id": "unsanctioned_cloud_service",
+        "name": "Use of an unsanctioned cloud service (shadow IT)",
+        "description": "Fires when an account uses a cloud service that is not in `sanctioned_services`. A "
+                       "listed name also covers its subdomains. The service is read from cloud audit events of "
+                       "the form '<action> on <service>' (CloudTrail-style JSON, or a proxy/CASB feed sent as "
+                       "JSON); events that name no service are skipped. Uses of one service by one account "
+                       "within `window_seconds` join the same alert. Unsanctioned is not the same as hostile: "
+                       "a newly approved tool alerts until the list is changed through review.",
+        "techniques": techniques("T1567"),
+        "severity": "medium",
+        "params": {"sanctioned_services": ["amazonaws.com", "corp-drive.example"], "window_seconds": 3600,
                    "ignore_ips": [], "ignore_users": []},
+    },
+    {
+        "id": "cloud_logging_disabled",
+        "name": "Cloud audit logging stopped or deleted",
+        "description": "Fires when a cloud audit event records an action in `logging_actions` (by default stopping or "
+                       "deleting a CloudTrail trail, or deleting VPC flow logs). The action is read from messages of "
+                       "the form '<action> on <service>'. A denied attempt is recorded the same way and also alerts: "
+                       "check the trail status to see whether logging is off. UpdateTrail and PutEventSelectors are "
+                       "not listed by default because the event carries only the action name, not the new settings, "
+                       "so the rule cannot tell a change that turns logging off from one that leaves it on. Such "
+                       "actions by one account within `window_seconds` join the same alert.",
+        "techniques": techniques("T1562.008"),
+        "severity": "high",
+        "params": {"logging_actions": ["StopLogging", "DeleteTrail", "DeleteFlowLogs"], "window_seconds": 3600,
+                   "ignore_ips": [], "ignore_users": []},
+    },
+    {
+        "id": "admin_action_from_new_source",
+        "name": "Privileged action from a new source address",
+        "description": "Fires when an account makes a privileged action (privilege use or escalation, or a cloud IAM "
+                       "change) from a source IP it used for none of its privileged actions in the preceding "
+                       "`history_seconds`, and it made at least `min_prior_actions` privileged actions in that span. "
+                       "Cold start: an account with less history has no baseline and never alerts, which includes "
+                       "every account on a new install and an account whose first privileged action is the attack "
+                       "(cloud_iam_change_by_new_principal covers a never-seen cloud principal). Events without a "
+                       "source IP, such as most local sudo lines, are skipped and never guessed. Later privileged "
+                       "actions from the same new source within `window_seconds` join the same alert.",
+        "techniques": techniques("T1078", "T1078.004"),
+        "severity": "medium",
+        "params": {"history_seconds": 604800, "min_prior_actions": 3, "window_seconds": 3600,
+                   "ignore_ips": [], "ignore_users": []},
+    },
+    {
+        "id": "log_source_silent",
+        "name": "Log source went silent",
+        "description": "Fires when a log source (one source and host) that had a learned cadence stops sending: quiet "
+                       "for more than 6x its median gap between arrivals, at least an hour, and twice its longest "
+                       "recent gap (thresholds in watchpost/sources.py). Silence is measured by arrival time against "
+                       "the wall clock, so it reads arrivals, not the events of the scanned time range. Sources still "
+                       "learning (fewer than 10 gaps, or under 2 hours of history) never alert, and time inside an "
+                       "approved maintenance window is not counted. One silence is one alert, however often detection "
+                       "runs. A silent source is an outage or someone blocking logs; the alert cannot tell which.",
+        "techniques": techniques("T1562.006"),
+        "severity": "medium",
+        "params": {"window_seconds": 3600},
     },
 ]
 
@@ -290,6 +359,10 @@ PARAM_SCHEMA = {
     "history_seconds": ("int", 60, 86400 * 30),
     "bytes_threshold": ("int", 1, 10 ** 15),
     "access_threshold": ("int", 2, 1_000_000),
+    "baseline_multiplier": ("int", 0, 1000),
+    "sanctioned_services": ("list", 1, 500),
+    "logging_actions": ("list", 1, 500),
+    "min_prior_actions": ("int", 1, 10000),
 }
 
 
@@ -300,6 +373,16 @@ class RuleConfigError(ValueError):
 def validate_params(rule_id, params):
     import ipaddress
 
+    if sigma.is_sigma(rule_id):  # an imported Sigma rule: its params are the compiled detection, not tunable
+        try:
+            return sigma.validate_params(params)
+        except sigma.SigmaError as exc:
+            raise RuleConfigError(str(exc))
+    if search_rules.is_search(rule_id):  # a promoted saved search: only threshold and window_seconds are tunable
+        try:
+            return search_rules.validate_params(params)
+        except search_rules.SearchRuleError as exc:
+            raise RuleConfigError(str(exc))
     defaults = next((r["params"] for r in DEFAULT_RULES if r["id"] == rule_id), None)
     if defaults is None:
         raise RuleConfigError(f"unknown rule {rule_id!r}")
@@ -337,24 +420,52 @@ def _epoch(event):
     return event["_epoch"]
 
 
+# List parameters that decide which events a rule looks at, and the edit to each that hides activity.
+# `list_entry` and `covers` are the only definition of what an entry matches: the rules below use them,
+# and so does the review gate in improve.py, so the gate cannot read an entry differently from the rule.
+HIDING_EDITS = {"ignore_ips": "added", "ignore_users": "added", "sanctioned_services": "added",
+                "privileged_users": "removed", "logging_actions": "removed"}
+
+
+def list_entry(param, value):
+    """One list entry in the form the rules compare it in."""
+    if param == "ignore_ips":
+        return value
+    return value.lower().lstrip(".") if param == "sanctioned_services" else value.lower()
+
+
+def covers(param, entries, event):
+    """Whether `event` matches any of `entries` (already passed through list_entry) of a list parameter."""
+    if param == "ignore_ips":
+        return event.get("src_ip") in entries
+    if param == "sanctioned_services":  # the service itself or any subdomain of an entry
+        service = _service(event)
+        return bool(service) and any(service == s or service.endswith("." + s) for s in entries)
+    if param == "logging_actions":
+        return (_action(event) or "").lower() in entries
+    return (event.get("user") or "").lower() in entries
+
+
 def _filtered(events, params, event_type):
     types = {event_type} if isinstance(event_type, str) else set(event_type)
-    ignore_ips = set(params.get("ignore_ips", []))
-    ignore_users = {u.lower() for u in params.get("ignore_users", [])}
+    ignore_ips = {list_entry("ignore_ips", v) for v in params.get("ignore_ips", [])}
+    ignore_users = {list_entry("ignore_users", u) for u in params.get("ignore_users", [])}
     out = [
         e for e in events
         if e["event_type"] in types
-        and e.get("src_ip") not in ignore_ips
-        and (e.get("user") or "").lower() not in ignore_users
+        and not covers("ignore_ips", ignore_ips, e)
+        and not covers("ignore_users", ignore_users, e)
     ]
     out.sort(key=lambda e: (_epoch(e), e["id"]))
     return out
 
 
-def _clusters(events, window, qualifies):
+def _clusters(events, window, qualifies, span=None):
     """Return clusters of events that fall inside at least one qualifying sliding window.
 
     `qualifies(window_events)` decides whether the window ending at each event meets the rule.
+    `span(first, last)`, when given, decides the same for events[first:last + 1] by index, so a rule can
+    answer from running totals instead of re-reading every window.
     Qualifying events closer than `window` seconds to each other are merged into one cluster.
     """
     marked = set()
@@ -363,7 +474,7 @@ def _clusters(events, window, qualifies):
         dq.append(idx)
         while _epoch(event) - _epoch(events[dq[0]]) > window:
             dq.popleft()
-        if qualifies([events[i] for i in dq]):
+        if span(dq[0], idx) if span else qualifies([events[i] for i in dq]):
             marked.update(dq)
     clusters, current = [], []
     for idx in sorted(marked):
@@ -473,7 +584,8 @@ def success_after_failures(events, params):
         cluster = prior + [success]
         findings.append(_finding(
             f"{user}|{success.get('src_ip') or 'unknown'}", cluster,
-            f"Possible compromise of {success.get('user')}: login after {len(prior)} failures",
+            f"Possible compromise of {success.get('user')}: login from "
+            f"{success.get('src_ip') or 'an unknown IP'} after {len(prior)} failures",
             f"{success.get('user')} logged in successfully from {success.get('src_ip') or 'an unknown IP'} "
             f"at {success['ts']} after {len(prior)} failed attempts in the preceding {window}s "
             f"(threshold {needed}). The failures came from {', '.join(ips[:5])}"
@@ -483,12 +595,12 @@ def success_after_failures(events, params):
 
 
 def off_hours_privileged_login(events, params):
-    privileged = {u.lower() for u in params["privileged_users"]}
+    privileged = {list_entry("privileged_users", u) for u in params["privileged_users"]}
     start, end = params["business_start_hour"], params["business_end_hour"]
     findings = []
     for event in _filtered(events, params, LOGIN_SUCCESS_TYPES):
         user = (event.get("user") or "").lower()
-        if user not in privileged:
+        if not covers("privileged_users", privileged, event):
             continue
         dt = parse_iso(event["ts"])
         if start <= dt.hour < end and dt.weekday() < 5:
@@ -1064,6 +1176,17 @@ def cloud_iam_change_by_new_principal(events, params):
     return findings
 
 
+def _peak(events, window, measure):
+    """The largest `measure` over any `window`-second span of time-ordered events (0 if none)."""
+    best, dq = 0, deque()
+    for event in events:
+        dq.append(event)
+        while _epoch(event) - _epoch(dq[0]) > window:
+            dq.popleft()
+        best = max(best, measure(dq))
+    return best
+
+
 def _human_bytes(n):
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if n < 1000 or unit == "TB":
@@ -1071,28 +1194,158 @@ def _human_bytes(n):
         n /= 1000
 
 
+EXFIL_TYPES = ("cloud_data_access", "fw_allow", "network_connection")
+
+
 def data_exfil_volume(events, params):
     limit, reads, window = params["bytes_threshold"], params["access_threshold"], params["window_seconds"]
     groups = defaultdict(list)
-    for e in _filtered(events, params, ("cloud_data_access", "fw_allow", "network_connection")):
+    for e in _filtered(events, params, EXFIL_TYPES):
         if e["event_type"] != "cloud_data_access" and not e.get("bytes"):
             continue
         key = (e.get("user") or "").lower() or e.get("src_ip")
         if key:
             groups[key].append(e)
+    multiplier, history = params["baseline_multiplier"], params["history_seconds"]
+    # Supplied by the engine from approved, unexpired tuning exceptions (see exception_params); never saved.
+    excepted = set(params.get("baseline_principals", ()))
     findings = []
     volume = lambda w: sum(e.get("bytes") or 0 for e in w)
     accesses = lambda w: sum(e["event_type"] == "cloud_data_access" for e in w)
     for principal, group in groups.items():
-        for cluster in _clusters(group, window, lambda w: volume(w) >= limit or accesses(w) >= reads):
+        # Running totals make each window's sums O(1): an ingest rescan reads a week of a busy account's
+        # transfers, and summing every window of it was most of the detection time in the load test.
+        sent, read = [0], [0]
+        for e in group:
+            sent.append(sent[-1] + (e.get("bytes") or 0))
+            read.append(read[-1] + (e["event_type"] == "cloud_data_access"))
+        span = lambda lo, hi: sent[hi + 1] - sent[lo] >= limit or read[hi + 1] - read[lo] >= reads
+        for cluster in _clusters(group, window, None, span):
             total, count = volume(cluster), accesses(cluster)
+            if not multiplier or principal not in excepted:
+                mode = ("Flat thresholds applied: " + ("baseline_multiplier is 0." if principal in excepted else
+                        f"{principal} has no approved tuning exception, so its history is not compared."))
+            else:
+                # Baseline: this principal's own busiest window before the burst, inside the history span.
+                t0 = _epoch(cluster[0])
+                before = [e for e in group if 0 < t0 - _epoch(e) <= history]
+                peak_bytes, peak_reads = _peak(cluster, window, volume), _peak(cluster, window, accesses)
+                base_bytes, base_reads = _peak(before, window, volume), _peak(before, window, accesses)
+                if not ((peak_bytes >= limit and peak_bytes >= multiplier * base_bytes)
+                        or (peak_reads >= reads and peak_reads >= multiplier * base_reads)):
+                    continue  # comparable to what this excepted principal normally moves
+                mode = f"Baseline mode (approved tuning exception for {principal}): "
+                if not before:
+                    mode += (f"no earlier transfers by {principal} in the preceding {history}s, so there is "
+                             f"nothing to compare against.")
+                else:
+                    ratio = f"{peak_bytes / base_bytes:,.1f}x" if base_bytes else "no bytes before"
+                    mode += (f"its busiest {window}s in the preceding {history}s moved "
+                             f"{_human_bytes(base_bytes)} ({base_reads} reads); this burst peaked at "
+                             f"{_human_bytes(peak_bytes)} ({peak_reads} reads), {ratio} the baseline "
+                             f"(alerts at {multiplier}x or more).")
             findings.append(_finding(
                 principal, cluster,
                 f"Large data transfer by {principal}: {_human_bytes(total)}",
                 f"{principal} moved {_human_bytes(total)} across {len(cluster)} events ({count} cloud data "
                 f"reads) between {cluster[0]['ts']} and {cluster[-1]['ts']}. Thresholds: "
-                f"{_human_bytes(limit)} or {reads} reads within {window}s.",
+                f"{_human_bytes(limit)} or {reads} reads within {window}s. {mode}",
             ))
+    return findings
+
+
+def _service(event):
+    """The cloud service named by an '<action> on <service>' message, or None. Never guessed."""
+    _, found, rest = (event.get("message") or "").partition(" on ")
+    name = rest.split()[0].strip(".,;()").lower() if found and rest.split() else ""
+    return name if "." in name else None
+
+
+def _action(event):
+    """The action named by an '<action> on <service>' message (the word before ' on '), or None."""
+    before, found, _ = (event.get("message") or "").partition(" on ")
+    return before.split()[-1] if found and before.split() else None
+
+
+def unsanctioned_cloud_service(events, params):
+    sanctioned = [list_entry("sanctioned_services", s) for s in params["sanctioned_services"]]
+    window = params["window_seconds"]
+    groups = defaultdict(list)
+    for e in _filtered(events, params, CLOUD_TYPES):
+        service, user = _service(e), (e.get("user") or "").lower()
+        if not service or not user or covers("sanctioned_services", sanctioned, e):
+            continue
+        groups[(user, service)].append(e)
+    findings = []
+    for (user, service), group in groups.items():
+        for cluster in _clusters(group, window, lambda w: True):
+            total = sum(e.get("bytes") or 0 for e in cluster)
+            ips = sorted({e.get("src_ip") or "unknown" for e in cluster})
+            findings.append(_finding(
+                f"{user}|{service}", cluster,
+                f"Unsanctioned cloud service: {cluster[0]['user']} used {service}",
+                f"{cluster[0]['user']} used {service} {len(cluster)} time(s) between {cluster[0]['ts']} and "
+                f"{cluster[-1]['ts']} from {', '.join(ips[:5])}, moving {_human_bytes(total)}. {service} is "
+                f"not on the sanctioned list ({', '.join(sanctioned[:8])}{'…' if len(sanctioned) > 8 else ''}). "
+                f"This is a policy finding: it shows use of an unapproved service, not intent.",
+            ))
+    return findings
+
+
+def cloud_logging_disabled(events, params):
+    actions = {list_entry("logging_actions", a) for a in params["logging_actions"]}
+    window = params["window_seconds"]
+    groups = defaultdict(list)
+    for e in _filtered(events, params, CLOUD_TYPES):
+        key = (e.get("user") or "").lower() or e.get("src_ip")
+        if key and covers("logging_actions", actions, e):
+            groups[key].append(e)
+    findings = []
+    for principal, group in groups.items():
+        for cluster in _clusters(group, window, lambda w: True):
+            done = Counter(_action(e) for e in cluster)
+            ips = sorted({e.get("src_ip") or "unknown" for e in cluster})
+            findings.append(_finding(
+                principal, cluster,
+                f"Cloud audit logging disabled by {principal}: {', '.join(done)}",
+                f"{principal} called {', '.join(f'{a} ({n})' for a, n in done.items())} between {cluster[0]['ts']} "
+                f"and {cluster[-1]['ts']} from {', '.join(ips[:5])}. These actions stop or delete cloud audit "
+                f"logging, which hides what happens next. A denied attempt is recorded the same way, so check "
+                f"whether logging is actually off.",
+            ))
+    return findings
+
+
+PRIVILEGED_TYPES = ("privilege_use", "privilege_escalation", "cloud_iam_change")
+
+
+def admin_action_from_new_source(events, params):
+    history, needed, window = params["history_seconds"], params["min_prior_actions"], params["window_seconds"]
+    actions = [e for e in _filtered(events, params, PRIVILEGED_TYPES) if e.get("src_ip")]
+    findings = []
+    for user, group in _group_users(actions).items():
+        # Sources of this account's privileged actions inside the history span before each action.
+        known, start = Counter(), 0
+        for index, event in enumerate(group):
+            t = _epoch(event)
+            while _epoch(group[start]) < t - history:
+                known[group[start]["src_ip"]] -= 1
+                start += 1
+            prior, ip = index - start, event["src_ip"]
+            if prior >= needed and known[ip] <= 0:
+                cluster = [e for e in group[index:] if e["src_ip"] == ip and _epoch(e) - t <= window]
+                sources = sorted(s for s, n in known.items() if n > 0)
+                what = Counter(_action(e) or e["event_type"] for e in cluster)
+                findings.append(_finding(
+                    f"{user}|{ip}", cluster,
+                    f"Privileged action by {event['user']} from new source {ip}",
+                    f"{event['user']} made {len(cluster)} privileged action(s) "
+                    f"({', '.join(a for a, _ in what.most_common(5))}) from {ip} starting {event['ts']}. In the "
+                    f"preceding {history}s it made {prior} privileged actions, all from "
+                    f"{', '.join(sources[:5])}{'…' if len(sources) > 5 else ''}; never from {ip}. Accounts with "
+                    f"fewer than {needed} earlier privileged actions have no baseline and are not judged.",
+                ))
+            known[ip] += 1
     return findings
 
 
@@ -1118,11 +1371,14 @@ RULE_FUNCTIONS = {
     "privilege_escalation_after_login": privilege_escalation_after_login,
     "cloud_iam_change_by_new_principal": cloud_iam_change_by_new_principal,
     "data_exfil_volume": data_exfil_volume,
+    "unsanctioned_cloud_service": unsanctioned_cloud_service,
+    "cloud_logging_disabled": cloud_logging_disabled,
+    "admin_action_from_new_source": admin_action_from_new_source,
+    "log_source_silent": log_source_silent,
 }
 
 
-# How far back a rule can look. Detection uses these per rule, so a 300-second rule reads 300
-# seconds of events rather than the whole span the widest rule needs.
+# How far back a rule can look. The scan window is sized from these.
 def rule_span(rule):
     """Seconds this rule alone can look back from an event: its window plus any escalation reach."""
     params = rule["params"]
@@ -1134,12 +1390,44 @@ def rule_history(rule):
     return rule["params"].get("history_seconds", 0)
 
 
-# The widest window any of these rules needs, and the longest history: the worst case a scan can
-# span. Kept for reporting and for the detectors that reason about the overall range; detection
-# itself no longer uses them to size every rule's read.
+def rule_function(rule_id):
+    """The function that runs a rule: a built-in from RULE_FUNCTIONS, the Sigma evaluator, or the search-rule
+    evaluator. None if none of them."""
+    if sigma.is_sigma(rule_id):
+        return sigma.run
+    if search_rules.is_search(rule_id):
+        return search_rules.run
+    return RULE_FUNCTIONS.get(rule_id)
+
+
+# Rules where a tuning exception does not skip findings but turns on the principal's baseline instead.
+EXCEPTION_ENABLES_BASELINE = ("data_exfil_volume",)
+
+
+def exception_params(rule_id, params, suppressions):
+    """The params to hand a rule function, given active exceptions as a set of (rule_id, group_key).
+
+    `baseline_principals` exists only here: validate_params rejects it, so it cannot be saved or proposed.
+    """
+    if rule_id not in EXCEPTION_ENABLES_BASELINE:
+        return params
+    return {**params, "baseline_principals": sorted(key for rid, key in suppressions if rid == rule_id)}
+
+
+# The largest time span a rule can look across; used to pick the rescan window after ingest.
 def lookback_seconds(rules):
     return max([rule_span(r) for r in rules] + [3600])
 
 
 def history_seconds(rules):
     return max([rule_history(r) for r in rules] + [0])
+
+
+# The event types each rule with a `history_seconds` param reads. On an ingest rescan the engine fetches only
+# these types from the history span before the scan window, instead of every event of the past week per
+# batch. A history rule missing here would lose its history, so a test checks the list is complete.
+HISTORY_EVENT_TYPES = {
+    "cloud_iam_change_by_new_principal": CLOUD_TYPES,
+    "data_exfil_volume": EXFIL_TYPES,
+    "admin_action_from_new_source": PRIVILEGED_TYPES,
+}

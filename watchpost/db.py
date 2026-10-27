@@ -1,5 +1,7 @@
 """SQLite storage: connection handling and schema."""
 
+import hashlib
+import hmac
 import json
 import os
 import sqlite3
@@ -7,7 +9,11 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 15
+
+# prev_hash of the first audit entry. Every later entry links to the hash of the one before it.
+GENESIS_HASH = "0" * 64
+AUDIT_FIELDS = ("id", "created_at", "actor", "action", "target", "detail")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -34,6 +40,18 @@ CREATE INDEX IF NOT EXISTS idx_events_src_ip ON events(src_ip, ts);
 CREATE INDEX IF NOT EXISTS idx_events_user ON events(user, ts);
 CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type, ts);
 CREATE INDEX IF NOT EXISTS idx_events_batch ON events(batch_id);
+-- 6.0: indexes for the hot read paths, chosen from EXPLAIN QUERY PLAN on a 100k-event load test
+-- (scripts/loadtest.py). User filters compare case-insensitively, which the BINARY idx_events_user cannot
+-- serve; the NOCASE one also serves `user LIKE 'prefix%'`. dest_ip lets `(src_ip = ? OR dest_ip = ?)` use
+-- two index lookups instead of a scan. ingested_at and synthetic back the dashboard and metrics counts.
+CREATE INDEX IF NOT EXISTS idx_events_user_nocase ON events(user COLLATE NOCASE, ts);
+CREATE INDEX IF NOT EXISTS idx_events_host ON events(host, ts);
+CREATE INDEX IF NOT EXISTS idx_events_dest_ip ON events(dest_ip, ts);
+CREATE INDEX IF NOT EXISTS idx_events_severity ON events(severity, ts);
+CREATE INDEX IF NOT EXISTS idx_events_ingested ON events(ingested_at);
+CREATE INDEX IF NOT EXISTS idx_events_synthetic ON events(synthetic);
+-- 10.0: log source health reads each (source, host) pair's arrivals, newest first (watchpost/sources.py).
+CREATE INDEX IF NOT EXISTS idx_events_source_host ON events(source, host, ingested_at);
 
 CREATE TABLE IF NOT EXISTS ingest_batches (
     id TEXT PRIMARY KEY,
@@ -152,6 +170,14 @@ CREATE TABLE IF NOT EXISTS sessions (
     expires_at TEXT NOT NULL
 );
 
+-- 8.0: the password step of a login for an account with TOTP enrolled. Short-lived; only the hash is stored.
+CREATE TABLE IF NOT EXISTS mfa_pending (
+    token_hash TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS api_tokens (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
@@ -160,7 +186,10 @@ CREATE TABLE IF NOT EXISTS api_tokens (
     created_by TEXT NOT NULL,
     created_at TEXT NOT NULL,
     last_used_at TEXT,
-    revoked_at TEXT
+    revoked_at TEXT,
+    role TEXT NOT NULL DEFAULT 'analyst',
+    capabilities TEXT NOT NULL DEFAULT '["ingest"]',
+    expires_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS settings (
@@ -208,7 +237,9 @@ CREATE TABLE IF NOT EXISTS audit_log (
     actor TEXT NOT NULL,
     action TEXT NOT NULL,
     target TEXT,
-    detail TEXT
+    detail TEXT,
+    prev_hash TEXT,
+    hash TEXT
 );
 
 CREATE TABLE IF NOT EXISTS health_probe (id INTEGER PRIMARY KEY, written_at TEXT NOT NULL);
@@ -267,6 +298,120 @@ CREATE TABLE IF NOT EXISTS quarantine (
     record TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_quarantine_received ON quarantine(received_at);
+
+CREATE TABLE IF NOT EXISTS assets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    kind TEXT NOT NULL,
+    criticality TEXT NOT NULL,
+    data_tags TEXT NOT NULL,
+    addresses TEXT NOT NULL,
+    owner TEXT,
+    description TEXT,
+    synthetic INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    updated_by TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS suppressions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    rule_id TEXT NOT NULL,
+    group_key TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    proposed_by TEXT NOT NULL,
+    approved_by TEXT NOT NULL,
+    change_request_id INTEGER,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_suppressions_rule ON suppressions(rule_id, group_key);
+
+-- 12.0: reviewed, time-bounded suppression of every finding from one rule. The row remains as history after
+-- expiry or an admin ends it early.
+CREATE TABLE IF NOT EXISTS rule_suppression_windows (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    rule_id TEXT NOT NULL,
+    starts_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    proposed_by TEXT NOT NULL,
+    approved_by TEXT NOT NULL,
+    change_request_id INTEGER,
+    created_at TEXT NOT NULL,
+    ended_at TEXT,
+    ended_by TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_rule_suppression_windows_active
+    ON rule_suppression_windows(rule_id, starts_at, expires_at);
+
+-- 5.0: hunting. A saved search stores the query text; time terms like last:24h resolve when it runs.
+-- 9.0: imported Sigma rules. The rule itself is a row in `rules` (id sigma_<slug>); this keeps the original
+-- YAML, its sha256, and the labeled sample that must pass before the rule can be enabled.
+CREATE TABLE IF NOT EXISTS sigma_rules (
+    rule_id TEXT PRIMARY KEY,
+    source TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    sigma_id TEXT,
+    sample TEXT,
+    imported_by TEXT NOT NULL,
+    approved_by TEXT NOT NULL,
+    change_request_id INTEGER,
+    created_at TEXT NOT NULL
+);
+
+-- 11.0: saved searches promoted to detections. The rule is a row in `rules` (id search_<slug>, params the compiled
+-- query, group-by, threshold and window); this keeps the query it was promoted with, the saved search it came
+-- from (which may since be deleted), and the labeled sample that must pass before the rule can be enabled.
+CREATE TABLE IF NOT EXISTS search_rules (
+    rule_id TEXT PRIMARY KEY,
+    query TEXT NOT NULL,
+    saved_search_id INTEGER,
+    sample TEXT,
+    proposed_by TEXT NOT NULL,
+    approved_by TEXT NOT NULL,
+    change_request_id INTEGER,
+    created_at TEXT NOT NULL
+);
+
+-- 10.0: planned silence for a log source (host NULL: every host of the source). Added only through an approved
+-- change request; an admin can end one early (ended_at). The row stays as history.
+CREATE TABLE IF NOT EXISTS maintenance_windows (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL,
+    host TEXT,
+    starts_at TEXT NOT NULL,
+    ends_at TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    proposed_by TEXT NOT NULL,
+    approved_by TEXT NOT NULL,
+    change_request_id INTEGER,
+    created_at TEXT NOT NULL,
+    ended_at TEXT,
+    ended_by TEXT
+);
+
+CREATE TABLE IF NOT EXISTS saved_searches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    query TEXT NOT NULL,
+    description TEXT,
+    owner TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+-- 14.0: named dashboard severity filters and ordered panel subsets. Shared views are readable by every role;
+-- private views and all mutations are restricted to their owner by the server.
+CREATE TABLE IF NOT EXISTS dashboard_views (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    filters TEXT NOT NULL,
+    layout TEXT NOT NULL,
+    visibility TEXT NOT NULL,
+    owner TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(owner, name COLLATE NOCASE)
+);
 """
 
 # Columns added after 1.0. Existing databases gain them in place on startup.
@@ -277,6 +422,31 @@ ADDED_COLUMNS = [
     ("events", "http_status", "INTEGER"),
     ("events", "tier", "TEXT"),
     ("detection_runs", "correlation", "TEXT"),
+    # Asset weighting: the rule's severity, the matched assets (JSON), and why the severity changed.
+    ("alerts", "base_severity", "TEXT"),
+    ("alerts", "assets", "TEXT"),
+    ("alerts", "severity_note", "TEXT"),
+    ("detection_runs", "alerts_suppressed", "INTEGER NOT NULL DEFAULT 0"),
+    # 3.1: an admin can end a tuning exception before it expires; the row stays as history.
+    ("suppressions", "revoked_at", "TEXT"),
+    ("suppressions", "revoked_by", "TEXT"),
+    # 7.0: when an alert first left `open` (triage metrics). Rows from before stay NULL: never backfilled.
+    ("alerts", "acknowledged_at", "TEXT"),
+    # 8.0: TOTP second factor. The secret is stored as-is (not encrypted at rest). `totp_pending` holds an
+    # enrollment until it is confirmed with a valid code; `totp_last_step` refuses a replayed time step.
+    ("users", "totp_secret", "TEXT"),
+    ("users", "totp_pending", "TEXT"),
+    ("users", "totp_last_step", "INTEGER"),
+    # 8.0: a non-secret session id (for listing and revoking) and when the session was last used.
+    ("sessions", "sid", "TEXT"),
+    ("sessions", "last_seen_at", "TEXT"),
+    # 13.0: least-privilege bearer tokens. Existing ingest tokens retain their original behavior.
+    ("api_tokens", "role", "TEXT NOT NULL DEFAULT 'analyst'"),
+    ("api_tokens", "capabilities", "TEXT NOT NULL DEFAULT '[\"ingest\"]'"),
+    ("api_tokens", "expires_at", "TEXT"),
+    # 15.0: reviewed fields that replace a rule's built-in alert deduplication key.
+    ("rules", "grouping", "TEXT NOT NULL DEFAULT '[]'"),
+    ("rule_history", "grouping", "TEXT NOT NULL DEFAULT '[]'"),
 ]
 
 
@@ -297,17 +467,22 @@ def parse_iso(value):
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
-def connect(db_path):
+class Connection(sqlite3.Connection):
+    """A connection that carries the audit chain key (SIEM_AUDIT_KEY), so the key travels with the App's
+    connections instead of living in process-wide state that a second App could change."""
+    audit_key = None
+
+
+def connect(db_path, audit_key=None):
     """Open a connection.
 
     Deliberately cheap: the server opens one of these per HTTP request, so nothing here may take a
-    lock. Journal mode and durability used to be set here, which meant every request took a lock on
-    the database header — one of the causes of 'database is locked' under load. They are now set once
-    in init_schema().
+    lock. Journal mode and durability are set once in init_schema() instead.
     """
     if db_path != ":memory:":
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path, timeout=30, isolation_level=None)
+    conn = sqlite3.connect(db_path, timeout=10, isolation_level=None, factory=Connection)
+    conn.audit_key = audit_key or None
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     # A writer that has to wait longer than this is a sign of overload rather than a slow query, so
@@ -388,6 +563,18 @@ def init_schema(conn):
         # the last transactions is only possible on power loss or a kernel panic. Set FULL to refuse
         # that trade.
         conn.execute("PRAGMA synchronous = NORMAL")
+    # Sessions from before 8.0 get an id so they can be listed and revoked like new ones.
+    conn.execute("UPDATE sessions SET sid = lower(hex(randomblob(8))) WHERE sid IS NULL")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_sid ON sessions(sid)")
+    # 4.0: hash-chained audit log. Rows written before the chain existed are never hashed here: the server
+    # would be signing whatever the database file says, including rows someone rewrote before a restart.
+    with transaction(conn):
+        audit_columns = {r["name"] for r in conn.execute("PRAGMA table_info(audit_log)")}
+        for column in ("prev_hash", "hash"):
+            if column not in audit_columns:
+                conn.execute(f"ALTER TABLE audit_log ADD COLUMN {column} TEXT")
+        _start_audit_chain(conn)
+        _check_chain_key(conn)
     conn.execute(
         "INSERT INTO meta(key, value) VALUES ('schema_version', ?)"
         " ON CONFLICT(key) DO UPDATE SET value = excluded.value", (str(SCHEMA_VERSION),)
@@ -404,8 +591,183 @@ def row_to_dict(row, json_fields=()):
     return data
 
 
+class AuditKeyError(RuntimeError):
+    """The configured SIEM_AUDIT_KEY is not the key the audit chain was started with."""
+
+
+def audit_key_id(key):
+    """A short public identifier for a key (HMAC of a fixed label), recorded in the chain start; None unkeyed."""
+    if not key:
+        return None
+    return hmac.new(key.encode() if isinstance(key, str) else key, b"watchpost audit key id",
+                    hashlib.sha256).hexdigest()[:16]
+
+
+def _key_mismatch(declared, current):
+    if declared and current:
+        return "the chain was started with a different SIEM_AUDIT_KEY"
+    if declared:
+        return "the chain was started with SIEM_AUDIT_KEY, but none is set"
+    return "the chain was started without SIEM_AUDIT_KEY, but one is set"
+
+
+def audit_hash(prev_hash, row, key):
+    """HMAC-SHA256 (or SHA-256 without a key) over the previous hash and the row's canonical JSON."""
+    canonical = json.dumps({f: row[f] for f in AUDIT_FIELDS}, sort_keys=True, separators=(",", ":"))
+    payload = ((prev_hash or "") + canonical).encode()
+    if key:
+        return hmac.new(key.encode() if isinstance(key, str) else key, payload, hashlib.sha256).hexdigest()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _start_audit_chain(conn):
+    """Begin the chain with an `audit_chain_started` entry when no entry carries a hash yet.
+
+    That is a new database, a 3.x upgrade, or a log whose hashes were dropped or cleared. Earlier rows stay
+    unhashed; verify_chain reports them as legacy and unverified, and this entry records how many there were
+    and which key signs the chain (signed, so neither can change afterwards without a break).
+    """
+    if conn.execute("SELECT 1 FROM audit_log WHERE hash IS NOT NULL LIMIT 1").fetchone():
+        return
+    count, last_id = conn.execute("SELECT COUNT(*), MAX(id) FROM audit_log").fetchone()
+    key_id = audit_key_id(conn.audit_key)
+    _set_meta_key_id(conn, key_id)
+    audit(conn, "system", "audit_chain_started", None,
+          {"legacy_entries": count, "legacy_last_id": last_id, "keyed": bool(key_id), "key_id": key_id})
+
+
+def _set_meta_key_id(conn, key_id):
+    # A copy of the chain start's key id where audit() can read it with one lookup. It only lets the server
+    # refuse early; verify_chain trusts the signed chain start, never this row.
+    conn.execute("INSERT INTO meta(key, value) VALUES ('audit_key_id', ?)"
+                 " ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key_id or "unkeyed",))
+
+
+def _check_chain_key(conn):
+    """At startup: refuse to run with a key other than the one the chain was started with."""
+    first = conn.execute(f"SELECT {', '.join(AUDIT_FIELDS)} FROM audit_log WHERE hash IS NOT NULL"
+                         " ORDER BY id LIMIT 1").fetchone()
+    declared = _declared(first)["key_id"] if first else _UNDECLARED
+    key_id = audit_key_id(conn.audit_key)
+    if declared is not _UNDECLARED and declared != key_id:
+        raise AuditKeyError(f"audit log: {_key_mismatch(declared, key_id)}. Restore the original setting: the "
+                            "server will not extend the chain under another key.")
+    _set_meta_key_id(conn, key_id)
+
+
 def audit(conn, actor, action, target=None, detail=None):
-    conn.execute(
-        "INSERT INTO audit_log(created_at, actor, action, target, detail) VALUES (?,?,?,?,?)",
-        (now_iso(), actor, action, target, json.dumps(detail) if detail is not None else None),
-    )
+    # Reading the previous hash and inserting must happen under one write lock, or two writers could link to
+    # the same predecessor. Callers inside transaction() already hold it (BEGIN IMMEDIATE); otherwise take it.
+    key = getattr(conn, "audit_key", None)
+    own = not conn.in_transaction
+    if own:
+        conn.execute("BEGIN IMMEDIATE")
+    try:
+        # Never append links under a key other than the chain's: they would verify under neither.
+        expected = conn.execute("SELECT value FROM meta WHERE key = 'audit_key_id'").fetchone()
+        if expected and expected[0] != (audit_key_id(key) or "unkeyed"):
+            raise AuditKeyError("this connection's SIEM_AUDIT_KEY is not the key the audit chain was started with")
+        # Link to the newest hashed entry; an unhashed row after it is reported by verify_chain, not adopted.
+        last = conn.execute("SELECT hash FROM audit_log WHERE hash IS NOT NULL ORDER BY id DESC LIMIT 1").fetchone()
+        # Every column is TEXT: store strings so the values hashed below are exactly the values stored.
+        values = (now_iso(), str(actor), str(action), None if target is None else str(target),
+                  json.dumps(detail) if detail is not None else None)
+        cur = conn.execute("INSERT INTO audit_log(created_at, actor, action, target, detail) VALUES (?,?,?,?,?)", values)
+        # Hash what this call wrote, never the row read back: a trigger in the database file could have changed
+        # it, and the server would then sign content it did not write.
+        prev_hash = last[0] if last else GENESIS_HASH
+        digest = audit_hash(prev_hash, dict(zip(AUDIT_FIELDS, (cur.lastrowid, *values))), key)
+        conn.execute("UPDATE audit_log SET prev_hash = ?, hash = ? WHERE id = ?", (prev_hash, digest, cur.lastrowid))
+    except BaseException:
+        if own:
+            conn.execute("ROLLBACK")
+        raise
+    else:
+        if own:
+            conn.execute("COMMIT")
+
+
+_CONFIGURED_KEY = object()
+
+
+def verify_chain(conn, key=_CONFIGURED_KEY):
+    """Walk the audit log once, oldest first, and report the first entry that breaks the chain.
+
+    The chain starts at the first hashed entry, which must link to the genesis hash and follow directly after
+    any unhashed rows. Those rows are legacy: counted, never verified, and they must match the range its
+    `audit_chain_started` detail records (an ordinary first entry declares none). Reasons: `key_mismatch`
+    (the chain was started with another key, or with none), `deleted` (an id gap, an empty log, or entries
+    missing before the chain start), `modified` (an entry does not match its hash, or has none),
+    `broken_link` (an intact entry that does not point at the one before it, including a second chain start),
+    and `legacy_mismatch` (rows before the chain start were added or removed).
+
+    `status` is `verified` only when every row is chained and intact, `partial` when the chain is intact but
+    legacy rows precede it, `broken` otherwise; `ok` is true only for `verified`. Deleting the newest entries
+    leaves a valid shorter chain; only a head recorded elsewhere shows that.
+    """
+    key = getattr(conn, "audit_key", None) if key is _CONFIGURED_KEY else key
+    key_id = audit_key_id(key)
+    entries, prev_id, prev_hash, head, first_break, started = 0, None, GENESIS_HASH, None, None, None
+    legacy = {"entries": 0, "last_id": None}
+    # One SELECT reads one consistent snapshot, even while other connections append.
+    cur = conn.execute(f"SELECT {', '.join(AUDIT_FIELDS)}, prev_hash, hash FROM audit_log ORDER BY id")
+    for row in cur:
+        row_id, stored_prev, stored_hash = row[0], row[6], row[7]
+        if started is None and stored_hash is None:
+            legacy = {"entries": legacy["entries"] + 1, "last_id": row_id}
+            continue
+        entries += 1
+        head = {"id": row_id, "hash": stored_hash}
+        if started is None:
+            started = {"id": row_id, "created_at": row[1]}
+            declared = _declared(row)
+            if declared["key_id"] is not _UNDECLARED and declared["key_id"] != key_id:
+                first_break = {"id": row_id, "reason": "key_mismatch",
+                               "detail": _key_mismatch(declared["key_id"], key_id)}
+            elif stored_hash != audit_hash(stored_prev, dict(zip(AUDIT_FIELDS, row)), key):
+                first_break = {"id": row_id, "reason": "modified", "detail": "the entry no longer matches its hash"}
+            elif stored_prev != GENESIS_HASH:
+                first_break = {"id": row_id, "reason": "deleted", "detail": "entries before this one are missing"}
+            elif declared["legacy"] != legacy:
+                first_break = {"id": row_id, "reason": "legacy_mismatch",
+                               "detail": f"{legacy['entries']} entries precede the chain start, which recorded "
+                                         f"{declared['legacy']['entries']}"}
+            elif row_id != (legacy["last_id"] or 0) + 1:
+                first_break = {"id": row_id, "reason": "deleted",
+                               "detail": "entries before the chain start are missing"}
+        elif first_break is None:
+            if row_id != prev_id + 1:
+                first_break = {"id": row_id, "reason": "deleted",
+                               "detail": f"entries #{prev_id + 1} to #{row_id - 1} are missing"}
+            elif stored_hash != audit_hash(stored_prev, dict(zip(AUDIT_FIELDS, row)), key):
+                first_break = {"id": row_id, "reason": "modified",
+                               "detail": "the entry no longer matches its hash" if stored_hash else "the entry has no hash"}
+            elif stored_prev != prev_hash:
+                first_break = {"id": row_id, "reason": "broken_link",
+                               "detail": f"the entry does not link to entry #{prev_id}"}
+        prev_id, prev_hash = row_id, stored_hash
+    if started is None:
+        # Every log begins with a chain start, so there is nothing to vouch for: the hashes were cleared (the
+        # server only starts a new chain on restart) or the rows were removed.
+        first_break = ({"id": legacy["last_id"], "reason": "modified", "detail": "no entry in the log carries a hash"}
+                       if legacy["entries"] else
+                       {"id": None, "reason": "deleted", "detail": "the audit log is empty"})
+    status = "broken" if first_break else "partial" if legacy["entries"] else "verified"
+    return {"ok": status == "verified", "status": status, "entries": entries, "keyed": bool(key), "head": head,
+            "first_break": first_break, "legacy": legacy, "chain_started": started}
+
+
+_UNDECLARED = object()
+
+
+def _declared(row):
+    """What a chain start recorded about itself: the legacy range and the key id. Any other first entry (a
+    chain from before chain starts existed) declares no legacy rows and no key."""
+    if row[3] == "audit_chain_started" and row[5]:
+        try:
+            detail = json.loads(row[5])
+            return {"legacy": {"entries": detail["legacy_entries"], "last_id": detail["legacy_last_id"]},
+                    "key_id": detail.get("key_id", _UNDECLARED)}
+        except (ValueError, KeyError, TypeError, AttributeError):
+            pass
+    return {"legacy": {"entries": 0, "last_id": None}, "key_id": _UNDECLARED}
