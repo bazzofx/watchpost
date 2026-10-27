@@ -9,6 +9,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 
 from watchpost import archive, engine, queries, server
 from watchpost.db import connect, init_schema
@@ -223,6 +224,37 @@ class ArchiveTests(unittest.TestCase):
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM event_rollups").fetchone()[0], 0)
 
 
+    # --- alerts-only policy --------------------------------------------------------------
+
+    def test_alerts_only_discard_archives_before_deleting(self):
+        engine.ingest(self.conn, [
+            {"ts": OLD, "source": "auth", "event_type": "auth_failure", "severity": "medium",
+             "src_ip": "203.0.113.9", "user": "admin", "message": "fail"} for _ in range(12)],
+            [], "auth", "json", "t")
+        engine.ingest(self.conn, [old_event(i) for i in range(3)], [], "s", "json", "t")
+        linked = {r[0] for r in self.conn.execute("SELECT event_id FROM alert_events")}
+        unlinked = {r[0] for r in self.conn.execute(
+            "SELECT id FROM events WHERE id NOT IN (SELECT event_id FROM alert_events)")}
+        report = archive.discard_unlinked(self.conn, CUTOFF, self.archives, archive_first=True)
+        self.assertEqual((report["archived"], report["discarded"]), (len(unlinked), len(unlinked)))
+        self.assertEqual({r[0] for r in self.conn.execute("SELECT id FROM events")}, linked)
+        part = sqlite3.connect(archive.partition_path(self.archives, "2026-01-02"))
+        try:
+            self.assertEqual({r[0] for r in part.execute("SELECT id FROM events")}, unlinked)
+        finally:
+            part.close()
+
+    def test_alerts_only_discard_keeps_rows_when_the_partition_fails(self):
+        engine.ingest(self.conn, [old_event(i) for i in range(3)], [], "s", "json", "t")
+        before = {r[0] for r in self.conn.execute("SELECT id FROM events")}
+        with mock.patch.object(archive, "_write_partition",
+                               side_effect=sqlite3.OperationalError("database or disk is full")):
+            report = archive.discard_unlinked(self.conn, CUTOFF, self.archives, archive_first=True)
+        self.assertEqual(report["discarded"], 0)
+        self.assertEqual(len(report["errors"]), 1)
+        self.assertEqual({r[0] for r in self.conn.execute("SELECT id FROM events")}, before)
+
+
 class JournalModeTests(unittest.TestCase):
     """The partition is a separate file; it must open and close cleanly on every call."""
 
@@ -274,6 +306,157 @@ class RetentionRouteGuardTests(unittest.TestCase):
         report = server.retention_preview(req)
         self.assertFalse(report["enabled"])
         self.assertIn("SIEM_HOT_HOURS", report["note"])
+
+
+class AlertsOnlyDiscardTests(unittest.TestCase):
+    """Policy: keep the events an alert references, discard everything else past the grace window.
+
+    Exercised with `archive_first=False`, which is the mode that deletes outright — so these run in
+    memory, everywhere, with no temporary directory.
+    """
+
+    def setUp(self):
+        self.conn = connect(":memory:")
+        init_schema(self.conn)
+        engine.seed_rules(self.conn)
+        # Twelve failures become alert evidence (linked); three routine requests stay unlinked.
+        engine.ingest(self.conn, [
+            {"ts": "2026-01-02T09:00:%02d.000Z" % i, "source": "auth", "event_type": "auth_failure",
+             "severity": "medium", "src_ip": "203.0.113.9", "user": "admin",
+             "message": "Failed password"} for i in range(12)], [], "auth", "json", "t")
+        engine.ingest(self.conn, [
+            {"ts": "2026-01-02T09:30:%02d.000Z" % i, "source": "web", "event_type": "web_request",
+             "severity": "low", "message": "GET /a.css 200"} for i in range(3)], [], "web", "json", "t")
+
+    def tearDown(self):
+        self.conn.close()
+
+    def linked_ids(self):
+        return {r[0] for r in self.conn.execute("SELECT event_id FROM alert_events")}
+
+    def unlinked_ids(self):
+        return {r[0] for r in self.conn.execute(
+            "SELECT id FROM events WHERE id NOT IN (SELECT event_id FROM alert_events)")}
+
+    def test_linked_events_survive_and_unlinked_ones_are_discarded(self):
+        linked, unlinked = self.linked_ids(), self.unlinked_ids()
+        self.assertTrue(linked, "the fixture must produce alert evidence")
+        report = archive.discard_unlinked(self.conn, CUTOFF, "/unused", archive_first=False)
+        self.assertEqual(report["mode"], "alerts")
+        self.assertEqual(report["discarded"], len(unlinked))
+        remaining = {r[0] for r in self.conn.execute("SELECT id FROM events")}
+        self.assertEqual(remaining, linked, "only alert-linked events may remain")
+        self.assertEqual({r[0] for r in self.conn.execute("SELECT event_id FROM alert_events")}, linked,
+                         "evidence links must survive the event rows")
+
+    def test_evidence_of_a_resolved_alert_is_still_kept(self):
+        """The policy is 'linked to an alert', not 'linked to an open one'."""
+        self.conn.execute("UPDATE alerts SET status = 'resolved'")
+        linked = self.linked_ids()
+        archive.discard_unlinked(self.conn, CUTOFF, "/unused", archive_first=False)
+        self.assertEqual({r[0] for r in self.conn.execute("SELECT id FROM events")}, linked)
+
+    def test_events_after_the_cutoff_are_kept(self):
+        """Unlinked does not mean deleted immediately: the grace window protects recent events."""
+        engine.ingest(self.conn, [{"ts": "2026-06-01T09:00:00.000Z", "source": "web",
+                                   "event_type": "web_request", "severity": "low",
+                                   "message": "recent"}], [], "web", "json", "t")
+        archive.discard_unlinked(self.conn, CUTOFF, "/unused", archive_first=False)
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) FROM events WHERE ts > ?", (CUTOFF,)).fetchone()[0], 1)
+
+    def test_the_pass_is_bounded_by_limit(self):
+        unlinked = len(self.unlinked_ids())
+        report = archive.discard_unlinked(self.conn, CUTOFF, "/unused", limit=2, archive_first=False)
+        self.assertEqual(report["discarded"], min(2, unlinked))
+        self.assertEqual(len(self.unlinked_ids()), unlinked - report["discarded"])
+
+    def test_routine_rows_are_rolled_up_before_they_go(self):
+        report = archive.discard_unlinked(self.conn, CUTOFF, "/unused", archive_first=False)
+        self.assertGreater(report["rolled_up"], 0)
+        row = self.conn.execute("SELECT SUM(events) FROM event_rollups").fetchone()[0]
+        self.assertEqual(row, report["rolled_up"])
+
+    def test_the_pass_is_audited(self):
+        archive.discard_unlinked(self.conn, CUTOFF, "/unused", archive_first=False, actor="admin")
+        detail = self.conn.execute(
+            "SELECT detail FROM audit_log WHERE action = 'retention_discard'").fetchone()
+        self.assertIsNotNone(detail)
+        self.assertIn("discarded", detail[0])
+
+    def test_preview_counts_what_would_go_and_what_stays(self):
+        unlinked = len(self.unlinked_ids())
+        report = archive.preview_unlinked(self.conn, CUTOFF, "/unused")
+        self.assertEqual(report["mode"], "alerts")
+        self.assertEqual(report["discardable"], unlinked)
+        self.assertEqual(report["kept_linked"], len(self.linked_ids()))
+        self.assertTrue(report["dry_run"])
+        # Read-only: nothing moved.
+        self.assertEqual(len(self.unlinked_ids()), unlinked)
+
+
+class AlertsOnlyRouteTests(unittest.TestCase):
+    """The route must demand the word that matches the policy: DISCARD deletes, ARCHIVE archives."""
+
+    class Req:
+        def __init__(self, body, mode="alerts", discard_archive=True, keep_hours=1):
+            self.body = body
+            self.query = {}
+            self.headers = {}
+            self.user = {"username": "admin"}
+            self.conn = None
+            config = type("Config", (), {"hot_hours": 0, "routine_hours": 0, "archive_dir": "/x",
+                                         "retention_mode": mode, "keep_unlinked_hours": keep_hours,
+                                         "discard_archive": discard_archive})()
+            self.app = type("App", (), {"config": config})()
+
+    def setUp(self):
+        self.conn = connect(":memory:")
+        init_schema(self.conn)
+        engine.seed_rules(self.conn)
+        engine.ingest(self.conn, [
+            {"ts": "2026-01-02T09:00:%02d.000Z" % i, "source": "auth", "event_type": "auth_failure",
+             "severity": "medium", "src_ip": "203.0.113.9", "user": "admin",
+             "message": "Failed password"} for i in range(12)], [], "auth", "json", "t")
+        engine.ingest(self.conn, [{"ts": "2026-01-02T09:30:00.000Z", "source": "web",
+                                   "event_type": "web_request", "severity": "low",
+                                   "message": "routine"}], [], "web", "json", "t")
+
+    def tearDown(self):
+        self.conn.close()
+
+    def test_the_wrong_confirmation_word_is_refused(self):
+        req = self.Req(b'{"confirm": "ARCHIVE"}')
+        req.conn = self.conn
+        with self.assertRaises(server.ApiError) as ctx:
+            server.retention_run(req)
+        self.assertEqual(ctx.exception.status, 400)
+        self.assertIn("DISCARD", str(ctx.exception))
+
+    def test_discard_runs_and_reports_the_policy(self):
+        req = self.Req(b'{"confirm": "DISCARD"}')
+        req.conn = self.conn
+        report = server.retention_run(req)
+        self.assertEqual(report["mode"], "alerts")
+        self.assertTrue(report["enabled"])
+        self.assertGreater(report["discarded"], 0)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM events WHERE id NOT IN"
+                                           " (SELECT event_id FROM alert_events)").fetchone()[0], 0)
+
+    def test_preview_uses_the_alerts_policy(self):
+        req = self.Req(b"")
+        req.conn = self.conn
+        report = server.retention_preview(req)
+        self.assertEqual(report["mode"], "alerts")
+        self.assertGreaterEqual(report["kept_linked"], 1)
+        self.assertIn("discardable", report)
+
+    def test_an_unknown_mode_falls_back_to_age(self):
+        req = self.Req(b'{"confirm": "ARCHIVE"}', mode="nonsense")
+        req.conn = self.conn
+        with self.assertRaises(server.ApiError) as ctx:
+            server.retention_run(req)          # age mode with hot_hours 0 -> refused
+        self.assertIn("retention is off", str(ctx.exception))
 
 
 if __name__ == "__main__":

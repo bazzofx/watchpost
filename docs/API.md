@@ -338,8 +338,8 @@ session (UI uploads, the demo loader) or by the syslog listener are not agents a
 | `GET /api/audit` | admin | Last 200 audit entries |
 | `GET /api/admin/log-data` | admin | What a reset would delete, and which tables it keeps. Read-only; changes nothing |
 | `POST /api/admin/log-data/reset` | admin | Deletes all ingested data. Body **must** be `{"confirm": "RESET"}` |
-| `GET /api/admin/retention` | admin | Dry run: what a retention pass would archive, by day and tier. Changes nothing |
-| `POST /api/admin/retention/run` | admin | Archives and deletes expired events. Body **must** be `{"confirm": "ARCHIVE"}` |
+| `GET /api/admin/retention` | admin | Dry run for the configured policy (`age`: what would be archived; `alerts`: what would be discarded and how much linked evidence stays). Changes nothing |
+| `POST /api/admin/retention/run` | admin | Runs it. `age` mode archives then deletes and needs `{"confirm": "ARCHIVE"}`; `alerts` mode keeps only alert-linked events and needs `{"confirm": "DISCARD"}` |
 | `GET /api/admin/quarantine` | admin | Rejected-record bounds and the newest entries (content only when kept) |
 | `GET /api/pipeline` | viewer | Stage counters: observed / accepted / rejected / stored / aggregated / detected / quarantined |
 | `GET /api/rollups` | viewer | Rolled-up routine traffic, hourly buckets (`?hours=`, `?limit=`) |

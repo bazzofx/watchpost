@@ -20,11 +20,65 @@ inspected, backed up and copied with ordinary tools.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `SIEM_HOT_HOURS` | `0` | events older than this move to the archive. **0 = retention off** (keep everything) |
+| `SIEM_RETENTION_MODE` | `age` | `age`: keep everything for `SIEM_HOT_HOURS`, then archive. `alerts`: keep only what an alert references |
+| `SIEM_HOT_HOURS` | `0` | (`age` mode) events older than this move to the archive. **0 = retention off** (keep everything) |
+| `SIEM_ROUTINE_HOURS` | `0` | (`age` mode) Category C expires earlier; 0 = same window as `SIEM_HOT_HOURS` |
+| `SIEM_KEEP_UNLINKED_HOURS` | `0` | (`alerts` mode) grace window for unlinked events; **0 derives it from the rules** |
+| `SIEM_DISCARD_ARCHIVE` | `0` | (`alerts` mode) `1` deletes outright instead of archiving first |
 | `SIEM_ARCHIVE_DIR` | `<db dir>/archive` | where the per-day partitions live |
 
 `cutoff_for(0)` raises rather than treating 0 as "now", so a caller that passes the off value by
 mistake cannot archive the entire store.
+
+## The two policies
+
+### `age` (default)
+
+Everything is kept for `SIEM_HOT_HOURS`, then archived by day. Evidence pinned to an unresolved alert
+or incident is never moved. This is "keep it all, but not all in the hot store".
+
+### `alerts`
+
+**Keep only the events that an alert references; discard everything else.** Linked events are kept
+whatever their age — that is the point of the policy. Everything unlinked is discarded once it is older
+than the grace window.
+
+```
+SIEM_RETENTION_MODE=alerts
+SIEM_KEEP_UNLINKED_HOURS=0     # 0 = derive from the enabled rules (175 h with the default rule set)
+```
+
+**Why a grace window at all.** "Keep only what alerted" cannot mean "delete immediately": detection
+reads back over each rule's window *and* its history span, so an event that has not been linked to an
+alert **yet** may still be the evidence that makes one fire. With `SIEM_KEEP_UNLINKED_HOURS=0` the
+window is computed as the widest rule lookback + the longest rule history + 1 hour — 175 h with the
+default rules, because three rules compare against a seven-day baseline. Setting it lower silently
+disables those rules' baselines; the number is deliberately not a constant in the code.
+
+**What is discarded**, in bounded batches: every event older than the window with no row in
+`alert_events`. Routine (Category C) rows are folded into their hourly rollups first, so counting
+trends survive even though the detail does not.
+
+**What is never discarded:** any event an alert references, whatever the alert's status. Resolving an
+alert does not release its evidence under this policy — that is what "linked to alerts" means, and it
+is also why the hot store still grows with alert volume: the ceiling is the evidence of your alerts,
+not your ingest rate.
+
+**Archive first, or not.** By default the pass writes the discarded rows to the day's partition first
+and verifies them, exactly like `age` mode, so a failed write cannot lose a record. Set
+`SIEM_DISCARD_ARCHIVE=1` to skip the partition and delete outright — that is the mode that actually
+frees disk immediately. Either way, partitions already on disk keep occupying space until you remove
+them.
+
+### Running and previewing either policy
+
+| Route | Role | Effect |
+|---|---|---|
+| `GET /api/admin/retention` | admin | dry run for the configured policy: for `alerts`, `discardable` and `kept_linked` per day |
+| `POST /api/admin/retention/run` | admin | runs it; the body must carry `{"confirm": "ARCHIVE"}` in `age` mode or `{"confirm": "DISCARD"}` in `alerts` mode |
+
+Two different words on purpose: one archives, the other can delete records outright. Both passes are
+audited (`retention_archive` / `retention_discard`) with the counts, days and errors.
 
 ## The mover, step by step
 

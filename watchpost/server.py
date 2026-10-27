@@ -1113,34 +1113,74 @@ def log_data_reset(req):
     return maintenance.reset_logs(req.conn, req.user["username"])
 
 
+def _retention_mode(config):
+    """The configured policy: "age" (archive by age) or "alerts" (keep only what alerted)."""
+    mode = str(getattr(config, "retention_mode", "age") or "age").lower()
+    return mode if mode in ("age", "alerts") else "age"
+
+
+def _keep_unlinked_hours(conn, config):
+    """Grace window for unlinked events: configured, or derived from the rules that would read them."""
+    configured = int(getattr(config, "keep_unlinked_hours", 0) or 0)
+    return configured if configured > 0 else archive.keep_hours_for(conn)
+
+
 @route("GET", "/api/admin/retention", role="admin")
 def retention_preview(req):
-    """What a retention pass would archive, by day. Read-only, safe to call at any time."""
+    """What a retention pass would remove, by day. Read-only, safe to call at any time."""
     config = req.app.config
+    mode = _retention_mode(config)
+    if mode == "alerts":
+        hours = _keep_unlinked_hours(req.conn, config)
+        report = archive.preview_unlinked(req.conn, archive.cutoff_for(hours), config.archive_dir)
+        report.update(enabled=True, mode=mode, keep_unlinked_hours=hours,
+                      archive_first=not getattr(config, "discard_archive", False),
+                      archive_dir=config.archive_dir)
+        return report
     if config.hot_hours <= 0:
-        return {"enabled": False, "hot_hours": config.hot_hours, "archive_dir": config.archive_dir,
-                "note": "retention is off; set SIEM_HOT_HOURS to a positive number of hours"}
+        return {"enabled": False, "mode": "age", "hot_hours": config.hot_hours,
+                "archive_dir": config.archive_dir,
+                "note": "retention is off; set SIEM_HOT_HOURS to a positive number of hours, or "
+                        "SIEM_RETENTION_MODE=alerts to keep only what alerted"}
     hot_cutoff, routine_cutoff = archive.cutoffs(config.hot_hours, config.routine_hours)
     report = archive.dry_run(req.conn, hot_cutoff, config.archive_dir, routine_cutoff=routine_cutoff)
-    report.update(enabled=True, hot_hours=config.hot_hours, routine_hours=config.routine_hours)
+    report.update(enabled=True, mode="age", hot_hours=config.hot_hours,
+                  routine_hours=config.routine_hours)
     return report
 
 
 @route("POST", "/api/admin/retention/run", role="admin")
 def retention_run(req):
-    """Archive events older than SIEM_HOT_HOURS, then delete them. Body: {"confirm": "ARCHIVE"}.
+    """Run the configured retention policy.
 
-    Pinned evidence — anything referenced by an unresolved alert or incident — is never moved, and
-    a row is deleted from hot only after it is verifiably present in its archive partition.
+    `age` mode archives everything older than SIEM_HOT_HOURS and then deletes it (body must carry
+    `{"confirm": "ARCHIVE"}`). `alerts` mode keeps only the events an alert references and discards
+    the rest once they are older than the grace window (body must carry `{"confirm": "DISCARD"}`, a
+    different word because that policy can delete records outright rather than archive them).
+
+    Pinned evidence is never touched in `age` mode, and linked events are never touched in `alerts`
+    mode; a row is deleted only after it is verifiably written to its partition, unless the operator
+    turned archiving off on purpose.
     """
-    if body_json(req).get("confirm") != "ARCHIVE":
-        raise ApiError(400, 'refusing to move data without {"confirm": "ARCHIVE"} in the body')
-    config = req.app.config
+    config = getattr(req.app, "config", None)
+    mode = _retention_mode(config)
+    word = "DISCARD" if mode == "alerts" else "ARCHIVE"
+    if body_json(req).get("confirm") != word:
+        raise ApiError(400, f'refusing to move data without {{"confirm": "{word}"}} in the body')
+    if mode == "alerts":
+        hours = _keep_unlinked_hours(req.conn, config)
+        report = archive.discard_unlinked(req.conn, archive.cutoff_for(hours), config.archive_dir,
+                                          archive_first=not getattr(config, "discard_archive", False),
+                                          actor=req.user["username"])
+        report.update(enabled=True, mode=mode, keep_unlinked_hours=hours,
+                      archive_dir=config.archive_dir)
+        return report
     if config.hot_hours <= 0:
         raise ApiError(400, "retention is off; set SIEM_HOT_HOURS to a positive number of hours")
     report = archive.run_retention(req.conn, config.hot_hours, config.archive_dir,
                                    routine_hours=config.routine_hours, actor=req.user["username"])
-    report.update(enabled=True, hot_hours=config.hot_hours, routine_hours=config.routine_hours)
+    report.update(enabled=True, mode="age", hot_hours=config.hot_hours,
+                  routine_hours=config.routine_hours)
     return report
 
 

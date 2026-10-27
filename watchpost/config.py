@@ -49,6 +49,16 @@ class Config:
     # 0 means "use hot_hours", i.e. no early expiry. It is clamped to never exceed hot_hours.
     routine_hours: int = 0
     archive_dir: str = ""
+    # Retention policy. "age" (default): keep everything for hot_hours, then archive it.
+    # "alerts": keep only the events an alert references and discard the rest, older than the grace
+    # window below. Linked evidence is kept whatever its age — that is the point of the policy.
+    retention_mode: str = "age"
+    # Grace window for unlinked events in "alerts" mode. 0 derives a safe value from the enabled rules
+    # (their widest lookback + longest history + 1h): discarding sooner would starve the history rules
+    # of the baseline they compare against.
+    keep_unlinked_hours: int = 0
+    # "alerts" mode archives before deleting by default; True deletes outright and frees the disk now.
+    discard_archive: bool = False
     # HMAC key for the hash-chained audit log. Unset: plain SHA-256, which detects edits but not a full rewrite.
     audit_key: str | None = None
 
@@ -82,6 +92,9 @@ class Config:
             hot_hours=int(os.environ.get("SIEM_HOT_HOURS", "0")),
             routine_hours=int(os.environ.get("SIEM_ROUTINE_HOURS", "0")),
             archive_dir=os.environ.get("SIEM_ARCHIVE_DIR", str(Path(db_path).parent / "archive")),
+            retention_mode=os.environ.get("SIEM_RETENTION_MODE", "age").strip().lower(),
+            keep_unlinked_hours=int(os.environ.get("SIEM_KEEP_UNLINKED_HOURS", "0")),
+            discard_archive=os.environ.get("SIEM_DISCARD_ARCHIVE", "0") == "1",
             audit_key=os.environ.get("SIEM_AUDIT_KEY") or None,
         )
         values.update(overrides)

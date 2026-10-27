@@ -253,6 +253,111 @@ def run_retention(conn, hot_hours, archives_dir, routine_hours=0, limit=DEFAULT_
                 actor=actor)
 
 
+# --- alerts-only retention ---------------------------------------------------------------
+
+def keep_hours_for(conn, margin_hours=1):
+    """A safe grace window for unlinked events, derived from the enabled rules.
+
+    "Keep only what alerted" cannot mean "delete immediately": detection reads back over each rule's
+    window and its history span, so an event that has not been linked to an alert *yet* may still be
+    the evidence that makes one fire. The window is the widest lookback plus the longest history, plus
+    a margin, so an alerts-only policy cannot quietly disable the history rules by discarding their
+    baseline out from under them.
+    """
+    from . import rules as rules_mod      # local: keeps the import graph acyclic
+    from .engine import load_rules        # load_rules lives in engine, next to detection
+    active = load_rules(conn, enabled_only=True)
+    seconds = rules_mod.lookback_seconds(active) + rules_mod.history_seconds(active)
+    return max(1, int(seconds // 3600) + margin_hours)
+
+
+_UNLINKED = "ts < ? AND NOT EXISTS (SELECT 1 FROM alert_events ae WHERE ae.event_id = events.id)"
+
+
+def _unlinked_args(cutoff):
+    return (_UNLINKED, (cutoff,))
+
+
+def preview_unlinked(conn, cutoff, archives_dir):
+    """What an alerts-only pass would discard, and how much linked evidence it would keep."""
+    where, args = _unlinked_args(cutoff)
+    rows = conn.execute(
+        f"SELECT substr(ts, 1, 10) AS day, COALESCE(tier, '?') AS tier, COUNT(*) AS rows,"
+        f" SUM(LENGTH(COALESCE(message, '')) + LENGTH(COALESCE(raw, ''))) AS text_bytes"
+        f" FROM events WHERE {where} GROUP BY day, tier ORDER BY day, tier", args).fetchall()
+    linked = conn.execute(
+        "SELECT COUNT(*) FROM events e WHERE e.ts < ? AND EXISTS"
+        " (SELECT 1 FROM alert_events ae WHERE ae.event_id = e.id)", (cutoff,)).fetchone()[0]
+    days = {}
+    for row in rows:
+        entry = days.setdefault(row["day"], {
+            "day": row["day"], "rows": 0, "bytes_estimate": 0, "by_tier": {},
+            "partition": str(partition_path(archives_dir, row["day"]))})
+        entry["rows"] += row["rows"]
+        entry["bytes_estimate"] += int((row["text_bytes"] or 0) + 120 * row["rows"])
+        entry["by_tier"][row["tier"]] = entry["by_tier"].get(row["tier"], 0) + row["rows"]
+    ordered = [days[day] for day in sorted(days)]
+    return {"mode": "alerts", "cutoff": cutoff, "dry_run": True, "days": ordered,
+            "discardable": sum(d["rows"] for d in ordered), "kept_linked": linked,
+            "archives_dir": str(archives_dir)}
+
+
+def discard_unlinked(conn, cutoff, archives_dir, limit=DEFAULT_BATCH, archive_first=True, actor=None):
+    """Delete events older than `cutoff` that no alert references; linked rows always stay.
+
+    Same ordering guarantee as `move` when `archive_first` is on: a partition is written and verified
+    before anything is deleted, so an alerts-only policy still cannot lose a record to a failed write.
+    With it off the rows are deleted outright — that is the mode that actually frees disk, and the one
+    to choose when the archive is not wanted.
+
+    Routine (Category C) rows are folded into their hourly rollups before they go, so counting trends
+    survive even though the detail does not.
+    """
+    where, args = _unlinked_args(cutoff)
+    days = [r[0] for r in conn.execute(
+        f"SELECT DISTINCT substr(ts, 1, 10) FROM events WHERE {where} ORDER BY 1", args).fetchall()]
+    report = {"mode": "alerts", "cutoff": cutoff, "archives_dir": str(archives_dir),
+              "archive_first": archive_first, "discarded": 0, "archived": 0, "rolled_up": 0,
+              "days": [], "errors": []}
+    remaining = limit
+    for day in days:
+        if remaining <= 0:
+            break
+        batch = [dict(r) for r in conn.execute(
+            f"SELECT * FROM events WHERE {where} AND ts LIKE ? ORDER BY id LIMIT ?",
+            (*args, day + "%", remaining)).fetchall()]
+        if not batch:
+            continue
+        ids = [r["id"] for r in batch]
+        if archive_first:
+            path = partition_path(archives_dir, day)
+            try:
+                present = set(_write_partition(conn, path, batch))
+            except (sqlite3.Error, OSError) as exc:
+                report["errors"].append({"day": day, "partition": str(path),
+                                         "error": f"{type(exc).__name__}: {exc}"})
+                continue                  # nothing deleted: the rows are still in hot
+            if present != set(ids):
+                report["errors"].append({"day": day, "partition": str(path),
+                                         "error": f"{len(ids) - len(present)} row(s) missing after "
+                                                  f"the insert; nothing deleted"})
+                continue
+            report["archived"] += len(ids)
+        with transaction(conn):
+            report["rolled_up"] += _rollup_batch(conn, batch)
+            for part in _chunks(ids):
+                conn.execute("DELETE FROM events WHERE id IN (%s)" % ",".join("?" * len(part)), part)
+        report["discarded"] += len(ids)
+        report["days"].append({"day": day, "rows": len(ids)})
+        remaining -= len(ids)
+    if actor:
+        audit(conn, actor, "retention_discard", None,
+              {"cutoff": cutoff, "discarded": report["discarded"], "archived": report["archived"],
+               "rolled_up": report["rolled_up"], "archive_first": archive_first,
+               "days": [d["day"] for d in report["days"]], "errors": report["errors"]})
+    return report
+
+
 def _rollup_batch(conn, rows):
     """Fold the Category C rows of one batch into hourly rollups. Returns how many events.
 
