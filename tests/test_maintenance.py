@@ -19,7 +19,8 @@ class ClassificationTests(unittest.TestCase):
         conn = connect(":memory:")
         init_schema(conn)
         present = {row["name"] for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' "
+            "AND name NOT LIKE 'events_fts%'")}  # FTS5 search index and its shadow tables
         conn.close()
 
         logs, kept = set(maintenance.LOG_TABLES), set(maintenance.KEPT_TABLES)

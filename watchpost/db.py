@@ -1,6 +1,7 @@
 """SQLite storage: connection handling and schema."""
 
 import json
+import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -297,6 +298,48 @@ def transaction(conn):
         conn.execute("COMMIT")
 
 
+def _init_search(conn):
+    """Create the events full-text index when the build supports it, and keep it in sync.
+
+    Uses the FTS5 trigram tokenizer, which answers a substring `LIKE '%term%'` query through an
+    index (see `queries.search_events` for which terms use it). It costs substantially more space
+    than a word tokenizer, so `SIEM_SEARCH_FTS=0` skips it entirely and search falls back to the
+    plain LIKE scan. Returns True when the index exists and is ready.
+    """
+    if os.environ.get("SIEM_SEARCH_FTS", "1") == "0":
+        return False
+    try:
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events_fts'").fetchone() is not None
+        if not exists:
+            conn.execute(
+                "CREATE VIRTUAL TABLE events_fts USING fts5("
+                "message, tokenize='trigram', content='events')")
+        # Triggers keep the index in step with the content table. The DELETE trigger uses FTS5's
+        # special 'delete' command, because an external-content table has no rows of its own.
+        conn.execute(
+            "CREATE TRIGGER IF NOT EXISTS trg_events_fts_ins AFTER INSERT ON events BEGIN "
+            "INSERT INTO events_fts(rowid, message) VALUES (new.id, new.message); END")
+        conn.execute(
+            "CREATE TRIGGER IF NOT EXISTS trg_events_fts_del AFTER DELETE ON events BEGIN "
+            "INSERT INTO events_fts(events_fts, rowid, message) VALUES ('delete', old.id, old.message); END")
+        if not exists:
+            # A database upgraded in place may already hold events; index them once.
+            conn.execute("INSERT INTO events_fts(events_fts) VALUES ('rebuild')")
+        return True
+    except sqlite3.Error:
+        return False
+
+
+def fts_available(conn):
+    """True when the events full-text index exists and can serve search queries."""
+    try:
+        return conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events_fts'").fetchone() is not None
+    except sqlite3.Error:
+        return False
+
+
 def init_schema(conn):
     """Create or upgrade the schema. Also sets the file-level pragmas, exactly once at startup."""
     conn.executescript(SCHEMA)
@@ -304,6 +347,7 @@ def init_schema(conn):
         existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
         if column not in existing:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
+    _init_search(conn)
     # Journal mode and durability belong to the database file, not to a connection, and WAL persists
     # once set — so this is done here rather than in connect(), which runs on every request.
     if conn.execute("PRAGMA journal_mode").fetchone()[0] != "memory":

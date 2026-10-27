@@ -1,5 +1,6 @@
 """Read-side queries and analyst workflow operations."""
 
+import sqlite3
 from datetime import timedelta
 
 from .db import iso, now_iso, parse_iso, row_to_dict, transaction, utcnow
@@ -69,8 +70,15 @@ def search_events(conn, params):
         where.append("(src_ip = ? OR dest_ip = ?)")
         args += [params["ip"], params["ip"]]
     if params.get("q"):
-        where.append("message LIKE ? ESCAPE '\\'")
-        args.append("%" + _escape_like(params["q"][:200]) + "%")
+        term = params["q"][:200]
+        if _fts_ready(conn) and _fts_friendly(term):
+            # The trigram FTS index answers this substring query. It matches LIKE's
+            # case-insensitivity, but not its ESCAPE clause — which is why _fts_friendly gates it.
+            where.append("id IN (SELECT rowid FROM events_fts WHERE message LIKE ?)")
+            args.append("%" + term + "%")
+        else:
+            where.append("message LIKE ? ESCAPE '\\'")
+            args.append("%" + _escape_like(term) + "%")
     if params.get("synthetic") in ("0", "1"):
         where.append("synthetic = ?")
         args.append(int(params["synthetic"]))
@@ -94,6 +102,32 @@ def search_events(conn, params):
 
 def _escape_like(text):
     return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+# --- `q` search: the FTS fast path, and exactly when it is safe -------------------------
+
+# Characters that force the plain-LIKE path: the trigram tokenizer does not honour LIKE's ESCAPE
+# clause, so a term that needs `%`/`_`/`\` escaping must not be served by the FTS index.
+_FTS_WILDCARDS = "\\%_"
+
+
+def _fts_friendly(term):
+    """True when the trigram FTS index can answer this `q` term with results identical to LIKE.
+
+    The trigram tokenizer serves substring `LIKE` queries, but only for terms of at least three
+    characters, and it ignores the ESCAPE clause — so short terms, or terms containing the
+    wildcard/escape characters, keep the plain LIKE scan.
+    """
+    return len(term) >= 3 and not any(ch in term for ch in _FTS_WILDCARDS)
+
+
+def _fts_ready(conn):
+    """True when the events full-text index exists (created by db.init_schema when supported)."""
+    try:
+        return conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events_fts'").fetchone() is not None
+    except sqlite3.Error:
+        return False
 
 
 def get_event(conn, event_id):
