@@ -7,6 +7,7 @@ import queue
 import mimetypes
 import re
 import sqlite3
+import time
 from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -32,6 +33,19 @@ class ApiError(Exception):
     def __init__(self, status, message):
         super().__init__(message)
         self.status = status
+
+
+def _is_lock_error(exc):
+    """SQLite's transient contention errors ("database is locked" / "database is busy").
+
+    They mean another connection held the single writer longer than this connection's busy timeout.
+    A read can simply be retried; a write must be left to the sender to retry, so it is answered with
+    503 + Retry-After rather than a 500 that looks like a bug.
+    """
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    text = str(exc).lower()
+    return "locked" in text or "busy" in text
 
 
 class Download:
@@ -1247,15 +1261,35 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle(self):
         """Answer one request. A client that hangs up is normal, not an error worth recording."""
-        try:
-            self._dispatch()
-        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as exc:
-            # The peer went away: a shipper that hit its own request timeout, a closed browser tab, a
-            # load balancer giving up. There is nobody left to answer, and recording this would add a
-            # write to a database that is already busy at exactly the moment it can least afford one
-            # — and then try to send a 500 to a dead socket, which raises again.
-            log.debug("client disconnected during %s %s (%s)", self.command,
-                      urlparse(self.path).path, type(exc).__name__)
+        # SQLite has one writer. Under a fast ingest something else may hold it, and a request that
+        # only reads is safe to try again — the handler has not produced a response yet. A write is
+        # not retried here (a second attempt could apply it twice); it gets a 503 with Retry-After so
+        # the sender backs off instead of receiving a generic 500.
+        attempts = 3 if self.command in ("GET", "HEAD") else 1
+        for attempt in range(attempts):
+            try:
+                self._dispatch()
+                return
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as exc:
+                # The peer went away: a shipper that hit its own request timeout, a closed browser tab, a
+                # load balancer giving up. There is nobody left to answer, and recording this would add a
+                # write to a database that is already busy at exactly the moment it can least afford one
+                # — and then try to send a 500 to a dead socket, which raises again.
+                log.debug("client disconnected during %s %s (%s)", self.command,
+                          urlparse(self.path).path, type(exc).__name__)
+                return
+            except sqlite3.OperationalError as exc:
+                if not _is_lock_error(exc):
+                    raise
+                if attempt + 1 < attempts:
+                    log.debug("storage busy, retrying read %s %s (%s)", self.command,
+                              urlparse(self.path).path, exc)
+                    time.sleep(0.2 * (attempt + 1))
+                    continue
+                log.warning("storage busy during %s %s: %s", self.command, urlparse(self.path).path, exc)
+                self._send(503, {"error": "storage is busy; retry shortly", "retry_after": 2},
+                           extra_headers={"Retry-After": "2", "Cache-Control": "no-store"})
+                return
 
     def _dispatch(self):
         parsed = urlparse(self.path)

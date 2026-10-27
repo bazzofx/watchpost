@@ -3,6 +3,7 @@
 import json
 import sqlite3
 import threading
+import time
 import uuid
 from datetime import timedelta
 
@@ -15,7 +16,7 @@ from . import rules as rules_mod
 from . import sources as sources_mod
 from . import stream
 from .db import audit, iso, now_iso, parse_iso, row_to_dict, transaction
-from .diagnostics import describe_exception, record_error
+from .diagnostics import describe_exception, log, record_error
 
 EVENT_COLUMNS = ["ts", "source", "host", "event_type", "outcome", "severity",
                  "user", "src_ip", "dest_ip", "dest_port", "bytes", "http_status", "tier", "message",
@@ -441,6 +442,7 @@ def run_detection(conn, trigger="manual", start=None, end=None):
                     "UPDATE ingest_batches SET detection_status = 'recovered'"
                     " WHERE detection_status = 'failed' AND created_at <= ?", (started,))
             # Correlation runs after the alerts are safely stored; if it fails, alerts stay as they are.
+            started_correlation = time.perf_counter()
             try:
                 summary["correlation"] = {"status": "ok", **correlate_alerts(conn)}
             except Exception as exc:
@@ -448,6 +450,16 @@ def run_detection(conn, trigger="manual", start=None, end=None):
                 record_error(conn, "correlation", exc,
                              guidance="Alerts are unaffected. Fix the cause, then use 'Run detection' to "
                                       "correlate again.")
+            seconds = round(time.perf_counter() - started_correlation, 3)
+            # Kept beside `correlation`, not inside it: that dict's shape is documented (status and
+            # the incident counts) and the timing is diagnostic.
+            summary["correlation_seconds"] = seconds
+            if seconds > 2:
+                # Correlation reads every evidence row of every open alert. When that grows, it is the
+                # operation that makes an ingest slow and, before the read moved out of the write
+                # transaction, the one that held SQLite's single writer long enough to lock everyone out.
+                log.warning("correlation took %.1f s; open alerts are carrying a large evidence set "
+                            "(enable retention with SIEM_HOT_HOURS to bound it)", seconds)
             conn.execute("UPDATE detection_runs SET correlation = ? WHERE id = ?",
                          (summary["correlation"]["status"], run_id))
         except Exception as exc:
@@ -499,12 +511,20 @@ def _incident_values(summary):
 
 
 def correlate_alerts(conn, window_seconds=correlate_mod.DEFAULT_WINDOW_SECONDS):
-    """Group related alerts into incidents and persist them. Safe to rerun: nothing changes twice."""
+    """Group related alerts into incidents and persist them. Safe to rerun: nothing changes twice.
+
+    The candidate load reads every evidence row of every open alert, and it runs **before** the write
+    transaction on purpose. SQLite has a single writer: doing that read inside BEGIN IMMEDIATE held the
+    write lock for the length of the read, so every other request queued behind correlation and failed
+    with "database is locked" once its busy timeout expired. Reads now happen first; the transaction
+    covers only the inserts and updates.
+    """
     result = {"incidents_created": 0, "incidents_updated": 0}
+    alerts = _candidate_alerts(conn)
+    groups = correlate_mod.correlate(list(alerts.values()), window_seconds)
+    now = now_iso()
     with transaction(conn):
-        alerts = _candidate_alerts(conn)
-        now = now_iso()
-        for group in correlate_mod.correlate(list(alerts.values()), window_seconds):
+        for group in groups:
             members = [alerts[i] for i in group["alert_ids"]]
             incident_id = group["incident_id"]
             if incident_id is None and not correlate_mod.should_open(members):

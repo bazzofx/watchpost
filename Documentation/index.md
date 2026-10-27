@@ -33,6 +33,7 @@ here and linked from the project plan.
 | Metrics & quarantine | [Pipeline counters and quarantine](observability/pipeline-and-quarantine.md) | ✅ implemented (Phase 4) |
 | Detection scheduling | [Detection decoupling: measured, not needed](detection/decoupling.md) | ✅ measured (Phase 5) |
 | Operational hardening | [Hardening and load tests](phase6/hardening.md) | ✅ implemented (Phase 6) |
+| Write locking | ["Database is locked": causes and knobs](operations/write-locking.md) | ✅ fixed (read out of the write transaction) |
 
 See also the [final report](final-report.md) for the measured results and the open gaps.
 

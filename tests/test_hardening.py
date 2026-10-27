@@ -177,5 +177,33 @@ class BoundParameterTests(unittest.TestCase):
         conn.close()
 
 
+class LockErrorHandlingTests(unittest.TestCase):
+    """Transient SQLite contention must not look like a bug: reads retry, writes ask for a retry."""
+
+    def test_lock_and_busy_errors_are_recognised(self):
+        for message in ("database is locked", "database is busy", "database table is locked"):
+            with self.subTest(message=message):
+                self.assertTrue(server._is_lock_error(sqlite3.OperationalError(message)))
+
+    def test_other_errors_are_not_treated_as_contention(self):
+        for exc in (sqlite3.OperationalError("no such table: nope"),
+                    sqlite3.IntegrityError("database is locked"),   # not an OperationalError
+                    ValueError("database is locked")):
+            with self.subTest(exc=repr(exc)):
+                self.assertFalse(server._is_lock_error(exc))
+
+    def test_correlation_reports_how_long_it_took(self):
+        conn = connect(":memory:")
+        init_schema(conn)
+        engine.seed_rules(conn)
+        result = engine.ingest(conn, [{"ts": f"2026-10-03T10:00:{i:02d}.000Z", "source": "auth",
+                                       "event_type": "auth_failure", "severity": "medium",
+                                       "src_ip": "203.0.113.9", "user": "admin",
+                                       "message": "fail"} for i in range(12)], [], "auth", "json", "t")
+        self.assertIn("correlation_seconds", result["detection"])
+        self.assertGreaterEqual(result["detection"]["correlation_seconds"], 0.0)
+        conn.close()
+
+
 if __name__ == "__main__":
     unittest.main()
