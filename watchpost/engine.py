@@ -399,6 +399,9 @@ def run_detection(conn, trigger="manual", start=None, end=None):
 
             max_id = conn.execute("SELECT COALESCE(MAX(id), 0) FROM events").fetchone()[0]
             events, history_events, scan_start = scan_events(conn, active, max_id, start, end)
+            # No explicit range means the whole store, which is the only case where a batch whose
+            # detection failed can be considered covered and marked recovered below.
+            full_scan = not (start and end)
             synthetic_ids = {e["id"] for e in events + history_events if e["synthetic"]}
             summary["events_scanned"] = len(events) + len(history_events)
             assets_idx = assets_mod.load_index(conn)

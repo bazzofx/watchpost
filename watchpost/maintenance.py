@@ -24,9 +24,14 @@ LOG_TABLES = (
 
 # Everything the reset leaves untouched. A test asserts these two tuples together cover every table
 # in the schema, so a new table cannot be added without deciding which side it belongs on.
+# The upstream tables added with v5.0 are configuration or analyst content, never ingestion output:
+# assets and dashboard views are configuration, the suppression/maintenance/search/sigma tables are
+# reviewed artefacts, saved searches are analyst content, and mfa_pending is enrolment state.
 KEPT_TABLES = (
     "users", "sessions", "api_tokens", "rules", "rule_history", "settings",
     "change_requests", "evaluation_runs", "audit_log", "meta", "health_probe",
+    "assets", "dashboard_views", "maintenance_windows", "mfa_pending", "rule_suppression_windows",
+    "saved_searches", "search_rules", "sigma_rules", "suppressions",
 )
 
 
