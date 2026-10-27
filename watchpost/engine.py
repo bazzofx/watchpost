@@ -1,6 +1,7 @@
 """Ingestion and detection orchestration against the database."""
 
 import json
+import sqlite3
 import threading
 import uuid
 from datetime import timedelta
@@ -62,9 +63,43 @@ def load_rules(conn, enabled_only=True):
 
 # --- Ingestion ------------------------------------------------------------------
 
-def store_batch(conn, events, rejections, source, fmt, submitted_by, synthetic=False):
-    """Persist a batch atomically and return its id. Detection is run separately."""
-    batch_id = uuid.uuid4().hex
+def stored_batch(conn, batch_id):
+    """The acknowledgement for a batch that is already stored, or None if it is not.
+
+    This is the read half of client-batch idempotency: a retried upload reuses its batch id, and a
+    replay returns this acknowledgement unchanged instead of storing the events again or repeating
+    the detection side effects.
+    """
+    if not batch_id:
+        return None
+    row = conn.execute(
+        "SELECT id, received, accepted, rejected, errors, detection_status"
+        " FROM ingest_batches WHERE id = ?", (batch_id,)).fetchone()
+    if row is None:
+        return None
+    try:
+        rejections = json.loads(row["errors"] or "[]")
+    except ValueError:
+        rejections = []
+    return {
+        "batch_id": row["id"],
+        "received": row["received"],
+        "accepted": row["accepted"],
+        "rejected": row["rejected"],
+        "rejections": rejections if isinstance(rejections, list) else [],
+        "duplicate": True,
+        "detection": {"status": row["detection_status"], "replayed": True},
+    }
+
+
+def store_batch(conn, events, rejections, source, fmt, submitted_by, synthetic=False, batch_id=None):
+    """Persist a batch atomically and return its id. Detection is run separately.
+
+    The events and the batch row share one transaction, so a crash leaves either the whole batch or
+    none of it — never events without their batch record. `batch_id` is the caller's idempotency key
+    when supplied, and a fresh random one otherwise.
+    """
+    batch_id = batch_id or uuid.uuid4().hex
     now = now_iso()
     with transaction(conn):
         conn.executemany(
@@ -81,8 +116,26 @@ def store_batch(conn, events, rejections, source, fmt, submitted_by, synthetic=F
     return batch_id
 
 
-def ingest(conn, events, rejections, source, fmt, submitted_by, synthetic=False):
-    batch_id = store_batch(conn, events, rejections, source, fmt, submitted_by, synthetic)
+def ingest(conn, events, rejections, source, fmt, submitted_by, synthetic=False, batch_id=None):
+    """Store a batch, then detect over it. With a batch_id, a replay changes nothing.
+
+    Without a batch id — the historical behaviour — every call stores a new batch. With one, a batch
+    that is already stored returns its original acknowledgement and nothing else happens: no second
+    copy of the events, no second detection run, no duplicate alerts.
+    """
+    if batch_id is not None:
+        replayed = stored_batch(conn, batch_id)
+        if replayed is not None:
+            return replayed
+    try:
+        batch_id = store_batch(conn, events, rejections, source, fmt, submitted_by, synthetic,
+                               batch_id=batch_id)
+    except sqlite3.IntegrityError:
+        # Two requests raced on the same id and the other one committed first: answer as a replay.
+        replayed = stored_batch(conn, batch_id)
+        if replayed is not None:
+            return replayed
+        raise
     result = {
         "batch_id": batch_id,
         "received": len(events) + len(rejections),

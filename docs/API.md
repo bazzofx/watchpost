@@ -93,6 +93,28 @@ If only `detection.correlation.status` is `"failed"`, alerts were stored and onl
 
 `detection.events_scanned` is how many **distinct** events the run examined — the size of the history it looked at, not the sum of what each rule read. Rules are read with their own windows (a 300-second rule reads 300 seconds, not the widest window any rule needs), so this number stays comparable whatever the rule set is.
 
+### Idempotent uploads: `batch_id` / `Idempotency-Key`
+
+Both ingest routes accept a stable **batch id**, which makes a retry safe. Send it as the `batch_id`
+query parameter or the `Idempotency-Key` header — 1–64 characters of letters, digits, `_ . : -`;
+anything else is `400`.
+
+If that id is already stored, the server returns the original acknowledgement with
+`"duplicate": true` and does **not** parse, store, or detect again. A retry therefore cannot duplicate
+events, inflate occurrence counts, or create a second alert, and the HTTP status matches the original
+response because it is derived from the same stored counts. Without an id, every call stores a new
+batch — the historical behaviour, so existing senders are unaffected.
+
+The id identifies the *batch*, not its contents: replaying an id with a different payload returns the
+original acknowledgement. Identical log lines arriving under different ids are still separate events.
+
+```bash
+curl -X POST "http://127.0.0.1:8080/api/ingest/upload?format=authlog&source=bastion01&batch_id=bastion01-auth-2026-10-03T10:00" \
+  -H "Authorization: Bearer $SIEM_INGEST_TOKEN" -H "Content-Type: text/plain" --data-binary @/var/log/auth.log
+```
+
+Full contract: [Documentation/ingestion/idempotency.md](../Documentation/ingestion/idempotency.md).
+
 ### `POST /api/ingest/upload?format=&source=&synthetic=&year=` (analyst session or token)
 
 Raw UTF-8 file body (`Content-Type: text/plain`). `format` is `auto` (default), `json`, `jsonl`, `csv`, `authlog`, `weblog`, or `nginx_error`. `authlog` also understands sudo/su, useradd, auditd `exe=`/`type=PATH` records, UFW/iptables `[BLOCK]`/`[ALLOW]` lines, and OpenVPN "Peer Connection Initiated" lines. `weblog` is the nginx/Apache combined access log; requests for scanner paths (`/.env`, `/wp-login.php`, `.git`, …), injection strings, or scanner user agents become `web_scan`, 5xx responses `web_error`. `nginx_error` is the nginx **error** log (`2026/10/03 08:50:02 [error] 1234#1234: *5678 open() "/x" failed, client: 203.0.113.5, request: "GET /x HTTP/1.1"`), which is not in the combined access format and has its own parser: every line becomes `web_error`, severity follows the nginx level (`crit` → critical, `error` → high, `warn` → medium, `notice` → low), the `client:` address becomes `src_ip`, and a message with a request leads with `METHOD PATH` like an access event. It is auto-detected — which matters, because these lines contain commas and were previously mistaken for **CSV**, which silently yielded no records at all. `year` applies only to BSD syslog lines, which carry no year. `synthetic=1` tags events and prefixes the source with `demo:`.

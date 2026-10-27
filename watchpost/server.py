@@ -135,7 +135,44 @@ def detection_run(req):
 
 # Ingestion ---------------------------------------------------------------------------
 
+# A client batch id doubles as the idempotency key. Same character set as a source name.
+_IDEMPOTENCY_KEY = re.compile(r"^[A-Za-z0-9_.:\-]{1,64}$")
+
+
+def _batch_id(req):
+    """The client's idempotency key for this upload, or None.
+
+    Accepted as `batch_id` in the query string or as an `Idempotency-Key` header, so a sender that
+    already has a stable per-batch identifier does not have to reshape its request.
+    """
+    value = req.query.get("batch_id") or req.headers.get("Idempotency-Key")
+    if value is None:
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    if not _IDEMPOTENCY_KEY.match(value):
+        raise ApiError(400, "batch_id must be 1-64 chars of letters, digits, _ . : -")
+    return value
+
+
+def _ingest_status(result):
+    """HTTP status for an ingest result; the same rule for a fresh batch and for a replay."""
+    if result["rejected"] and result["accepted"]:
+        return 207
+    return 422 if not result["accepted"] else 201
+
+
 def _ingest(req, text, fmt, source, synthetic, year=None):
+    batch_id = _batch_id(req)
+    if batch_id is not None:
+        # A retry of a batch that is already stored: answer from the record, without parsing,
+        # storing or detecting again. The same id replayed with a different payload returns the
+        # original acknowledgement on purpose — the id identifies the batch, not its contents.
+        replayed = engine.stored_batch(req.conn, batch_id)
+        if replayed is not None:
+            req.status = _ingest_status(replayed)
+            return replayed
     try:
         source = validate_source(source)
         events, rejections = parse_payload(text, fmt, source, year=year,
@@ -147,12 +184,13 @@ def _ingest(req, text, fmt, source, synthetic, year=None):
             if not event["source"].startswith("demo:"):
                 event["source"] = "demo:" + event["source"][:59]
     try:
-        result = engine.ingest(req.conn, events, rejections, source, fmt, req.user["username"], synthetic)
+        result = engine.ingest(req.conn, events, rejections, source, fmt, req.user["username"],
+                               synthetic, batch_id=batch_id)
     except Exception as exc:
         record_error(req.conn, "ingestion", exc,
                      guidance="The batch was not stored. Check storage health, then resubmit the batch.")
         raise ApiError(500, "ingestion failed; the batch was not stored (see Health for details)")
-    req.status = 207 if result["rejected"] and result["accepted"] else (422 if not result["accepted"] else 201)
+    req.status = _ingest_status(result)
     return result
 
 

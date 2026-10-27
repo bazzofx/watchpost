@@ -27,7 +27,7 @@ here and linked from the project plan.
 | Area | Page | Status |
 |---|---|---|
 | Search | [FTS5 full-text](search/fts5.md) | ✅ implemented (Phase 1) |
-| Ingestion idempotency | `ingestion/` | planned (Phase 2) |
+| Ingestion idempotency | [Batch idempotency](ingestion/idempotency.md) | ✅ implemented (Phase 2) |
 | Retention & archive | `retention/` | planned (Phase 3) |
 | Classification & aggregation | `processing/` | planned (Phase 4) |
 | Metrics & quarantine | `observability/` | planned (Phase 4) |

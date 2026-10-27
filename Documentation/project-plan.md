@@ -14,7 +14,7 @@ for active investigations, archive safely, and expose the health of the whole pi
 |---|---|---|
 | 0 | Baseline & documentation | ✅ done (this page, [architecture](architecture.md), [security logging](security-logging.md)) |
 | 1 | FTS5 search | ✅ done — [search/fts5.md](search/fts5.md) |
-| 2 | Ingestion idempotency | ⬜ |
+| 2 | Ingestion idempotency | ✅ done — [ingestion/idempotency.md](ingestion/idempotency.md) |
 | 3 | Retention & archive | ⬜ |
 | 4 | Classification & aggregation | ⬜ |
 | 5 | Detection decoupling | ⬜ (only if measured) |
@@ -42,7 +42,7 @@ Replace the `q` full-table scan with SQLite FTS5, with explicit semantics.
 
 Deliverable page: `search/`.
 
-## Phase 2 — Ingestion idempotency
+## Phase 2 — Ingestion idempotency ✅
 
 Add a stable client batch ID so a retried upload cannot duplicate events or repeat detection.
 
