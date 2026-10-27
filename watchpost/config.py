@@ -42,11 +42,16 @@ class Config:
     # Attack storyline auto-replay for public demos (off unless SIEM_DEMO_LOOP=<minutes between runs>).
     demo_loop_minutes: int = 0
     demo_loop_speed: float = 1.0
+    # Retention. Events older than `hot_hours` move into per-day archive files under `archive_dir`.
+    # 0 (the default) keeps everything: nothing is moved or deleted unless an operator opts in.
+    hot_hours: int = 0
+    archive_dir: str = ""
 
     @classmethod
     def from_env(cls, **overrides):
+        db_path = os.environ.get("SIEM_DB", str(BASE_DIR / "data" / "watchpost.db"))
         values = dict(
-            db_path=os.environ.get("SIEM_DB", str(BASE_DIR / "data" / "watchpost.db")),
+            db_path=db_path,
             # Loopback by default. Binding 0.0.0.0 (e.g. on Replit) is an explicit choice.
             host=os.environ.get("SIEM_HOST", "127.0.0.1"),
             port=int(os.environ.get("SIEM_PORT", os.environ.get("PORT", "8080"))),
@@ -69,6 +74,8 @@ class Config:
             trust_proxy=os.environ.get("SIEM_TRUST_PROXY", "0") == "1",
             demo_loop_minutes=int(os.environ.get("SIEM_DEMO_LOOP", "0")),
             demo_loop_speed=float(os.environ.get("SIEM_DEMO_LOOP_SPEED", "1")),
+            hot_hours=int(os.environ.get("SIEM_HOT_HOURS", "0")),
+            archive_dir=os.environ.get("SIEM_ARCHIVE_DIR", str(Path(db_path).parent / "archive")),
         )
         values.update(overrides)
         return cls(**values)

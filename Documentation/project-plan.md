@@ -15,7 +15,7 @@ for active investigations, archive safely, and expose the health of the whole pi
 | 0 | Baseline & documentation | ✅ done (this page, [architecture](architecture.md), [security logging](security-logging.md)) |
 | 1 | FTS5 search | ✅ done — [search/fts5.md](search/fts5.md) |
 | 2 | Ingestion idempotency | ✅ done — [ingestion/idempotency.md](ingestion/idempotency.md) |
-| 3 | Retention & archive | ⬜ |
+| 3 | Retention & archive | ✅ done — [retention/archive.md](retention/archive.md) |
 | 4 | Classification & aggregation | ⬜ |
 | 5 | Detection decoupling | ⬜ (only if measured) |
 | 6 | Operational hardening & load tests | ⬜ |
@@ -57,7 +57,7 @@ This is a **prerequisite** for safe retries, spool, and the archive mover — do
 
 Deliverable page: `ingestion/`.
 
-## Phase 3 — Retention and archive
+## Phase 3 — Retention and archive ✅
 
 Three logical tiers with a value-aware expiry.
 

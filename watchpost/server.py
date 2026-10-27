@@ -12,8 +12,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from . import (__version__, agents, auth, engine, geo, improve, incidents, maintenance, queries, report,
-               simulate, storyline, stream)
+from . import (__version__, agents, archive, auth, engine, geo, improve, incidents, maintenance, queries,
+               report, simulate, storyline, stream)
 from .ratelimit import TokenBucketLimiter
 from .config import Config
 from .db import audit, connect, init_schema, now_iso, row_to_dict
@@ -310,7 +310,8 @@ def events(req):
 
 @route("GET", r"/api/events/(\d+)")
 def event_detail(req, event_id):
-    return queries.get_event(req.conn, int(event_id))
+    # Falls through to the archive partitions when the event is older than the hot window.
+    return queries.get_event(req.conn, int(event_id), archive_dir=req.app.config.archive_dir)
 
 
 @route("GET", "/api/alerts")
@@ -549,6 +550,36 @@ def log_data_reset(req):
     if body_json(req).get("confirm") != "RESET":
         raise ApiError(400, 'refusing to delete data without {"confirm": "RESET"} in the body')
     return maintenance.reset_logs(req.conn, req.user["username"])
+
+
+@route("GET", "/api/admin/retention", role="admin")
+def retention_preview(req):
+    """What a retention pass would archive, by day. Read-only, safe to call at any time."""
+    config = req.app.config
+    if config.hot_hours <= 0:
+        return {"enabled": False, "hot_hours": config.hot_hours, "archive_dir": config.archive_dir,
+                "note": "retention is off; set SIEM_HOT_HOURS to a positive number of hours"}
+    report = archive.dry_run(req.conn, archive.cutoff_for(config.hot_hours), config.archive_dir)
+    report.update(enabled=True, hot_hours=config.hot_hours)
+    return report
+
+
+@route("POST", "/api/admin/retention/run", role="admin")
+def retention_run(req):
+    """Archive events older than SIEM_HOT_HOURS, then delete them. Body: {"confirm": "ARCHIVE"}.
+
+    Pinned evidence — anything referenced by an unresolved alert or incident — is never moved, and
+    a row is deleted from hot only after it is verifiably present in its archive partition.
+    """
+    if body_json(req).get("confirm") != "ARCHIVE":
+        raise ApiError(400, 'refusing to move data without {"confirm": "ARCHIVE"} in the body')
+    config = req.app.config
+    if config.hot_hours <= 0:
+        raise ApiError(400, "retention is off; set SIEM_HOT_HOURS to a positive number of hours")
+    report = archive.move(req.conn, archive.cutoff_for(config.hot_hours), config.archive_dir,
+                          actor=req.user["username"])
+    report.update(enabled=True, hot_hours=config.hot_hours)
+    return report
 
 
 # The only non-GET routes a read-only viewer may call.

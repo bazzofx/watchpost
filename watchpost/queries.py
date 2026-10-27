@@ -3,6 +3,7 @@
 import sqlite3
 from datetime import timedelta
 
+from . import archive
 from .db import iso, now_iso, parse_iso, row_to_dict, transaction, utcnow
 from .normalize import EVENT_TYPES, SEVERITIES, EventError, parse_timestamp
 
@@ -130,11 +131,24 @@ def _fts_ready(conn):
         return False
 
 
-def get_event(conn, event_id):
+def get_event(conn, event_id, archive_dir=None):
+    """One event by id, from the hot store — or, when it has been archived, from the archive.
+
+    Alert links live in the hot database and are the same either way. An archived event is marked
+    `archived` so a caller can say where the record came from. Evidence pinned to an unresolved
+    alert or incident never leaves hot, so this path is for older, closed activity.
+    """
     row = conn.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
+    archived = False
+    if row is None and archive_dir:
+        found = archive.find_event(archive_dir, event_id)
+        if found is not None:
+            row, archived = found, True
     if row is None:
         raise QueryError("event not found", 404)
     event = dict(row)
+    if archived:
+        event["archived"] = True
     event["alerts"] = [dict(r) for r in conn.execute(
         "SELECT a.id, a.title, a.status FROM alerts a JOIN alert_events ae ON ae.alert_id = a.id"
         " WHERE ae.event_id = ?", (event_id,))]
