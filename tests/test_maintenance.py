@@ -73,6 +73,10 @@ class ResetTests(unittest.TestCase):
             "INSERT INTO event_rollups(bucket_start, event_type, source, host, outcome, severity,"
             " events, first_seen, last_seen) VALUES (?,?,?,?,?,?,?,?,?)",
             (now, "web_request", "web01-web", "web01", "success", "low", 3, now, now))
+        # Quarantine is written only when a batch contains rejections; seed one directly.
+        self.conn.execute(
+            "INSERT INTO quarantine(received_at, source, record_index, reason)"
+            " VALUES (?, 'web01-web', 2, 'line is not in syslog format')", (now,))
 
     def rows(self, table):
         return self.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]

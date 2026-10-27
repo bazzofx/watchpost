@@ -7,6 +7,7 @@ import uuid
 from datetime import timedelta
 
 from . import classify
+from . import quarantine
 from . import correlate as correlate_mod
 from . import rules as rules_mod
 from . import stream
@@ -143,6 +144,9 @@ def ingest(conn, events, rejections, source, fmt, submitted_by, synthetic=False,
         if replayed is not None:
             return replayed
         raise
+    if rejections:
+        # Counted always; content only when the operator opted into quarantine excerpts.
+        quarantine.add_many(conn, source, batch_id, rejections)
     result = {
         "batch_id": batch_id,
         "received": len(events) + len(rejections),

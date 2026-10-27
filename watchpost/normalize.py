@@ -482,8 +482,23 @@ def detect_format(text):
     raise EventError("could not detect format; pass format=json|jsonl|csv|authlog|weblog")
 
 
-def parse_payload(text, fmt, default_source, year=None, now=None, max_events=20000):
-    """Return (events, rejections). Rejections are [{"index": n, "reason": str}]."""
+REJECTED_SNIPPET = 160
+
+
+def _rejected_snippet(item):
+    """A short, redacted excerpt of a rejected record: enough to debug, bounded and scrubbed."""
+    text = item if isinstance(item, str) else json.dumps(item, default=str)
+    return redact(text)[:REJECTED_SNIPPET]
+
+
+def parse_payload(text, fmt, default_source, year=None, now=None, max_events=20000,
+                  keep_rejected=False):
+    """Return (events, rejections). Rejections are [{"index": n, "reason": str}].
+
+    With `keep_rejected` a rejection also carries a short redacted excerpt of the record
+    (`"record"`), for the opt-in quarantine. The default is off on purpose: rejected content can
+    contain secrets, so it is only kept when an operator asks for it.
+    """
     fmt = (fmt or "auto").lower()
     if fmt == "auto":
         fmt = detect_format(text)
@@ -531,6 +546,10 @@ def parse_payload(text, fmt, default_source, year=None, now=None, max_events=200
             else:
                 events.append(normalize_record(item, default_source, now))
         except EventError as exc:
-            # Only the reason and position are recorded, never the rejected content.
-            rejections.append({"index": index, "reason": str(exc)})
+            # The reason and position are always recorded. The content itself is not, unless the
+            # caller opted into the quarantine excerpt — it may contain secrets.
+            rejection = {"index": index, "reason": str(exc)}
+            if keep_rejected:
+                rejection["record"] = _rejected_snippet(item)
+            rejections.append(rejection)
     return events, rejections

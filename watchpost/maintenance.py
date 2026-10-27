@@ -18,7 +18,8 @@ from .engine import detection_lock
 # keys, so no delete can violate one.
 LOG_TABLES = (
     "alert_activity", "alert_notes", "alert_events", "incident_alerts",
-    "alerts", "incidents", "detection_runs", "ingest_batches", "event_rollups", "events", "error_log",
+    "alerts", "incidents", "detection_runs", "ingest_batches", "event_rollups", "quarantine",
+    "events", "error_log",
 )
 
 # Everything the reset leaves untouched. A test asserts these two tuples together cover every table

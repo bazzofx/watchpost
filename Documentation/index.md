@@ -29,8 +29,8 @@ here and linked from the project plan.
 | Search | [FTS5 full-text](search/fts5.md) | ✅ implemented (Phase 1) |
 | Ingestion idempotency | [Batch idempotency](ingestion/idempotency.md) | ✅ implemented (Phase 2) |
 | Retention & archive | [Retention and archive](retention/archive.md) | ✅ implemented (Phase 3) |
-| Classification & aggregation | [Value tiers and rollups](processing/tiers-and-rollups.md) | ◐ tiers + rollups done (Phase 4) |
-| Metrics & quarantine | `observability/` | planned (Phase 4) |
+| Classification & aggregation | [Value tiers and rollups](processing/tiers-and-rollups.md) | ✅ implemented (Phase 4) |
+| Metrics & quarantine | [Pipeline counters and quarantine](observability/pipeline-and-quarantine.md) | ✅ implemented (Phase 4) |
 | Detection scheduling | `detection/` | planned (Phase 5) |
 
 ## Existing documentation

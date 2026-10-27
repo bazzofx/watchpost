@@ -254,6 +254,19 @@ CREATE TABLE IF NOT EXISTS event_rollups (
     UNIQUE (bucket_start, event_type, source, host, outcome, severity)
 );
 CREATE INDEX IF NOT EXISTS idx_rollups_bucket ON event_rollups(bucket_start);
+
+-- Bounded quarantine for rejected input: why it was refused, and (only when an operator opts in)
+-- a short redacted excerpt. Self-limiting: a row ceiling and a TTL, enforced on every write.
+CREATE TABLE IF NOT EXISTS quarantine (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    received_at TEXT NOT NULL,
+    source TEXT NOT NULL,
+    batch_id TEXT,
+    record_index INTEGER,
+    reason TEXT NOT NULL,
+    record TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_quarantine_received ON quarantine(received_at);
 """
 
 # Columns added after 1.0. Existing databases gain them in place on startup.

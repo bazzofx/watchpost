@@ -12,8 +12,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from . import (__version__, agents, archive, auth, engine, geo, improve, incidents, maintenance, queries,
-               report, simulate, storyline, stream)
+from . import (__version__, agents, archive, auth, engine, geo, improve, incidents, maintenance,
+               pipeline, quarantine, queries, report, simulate, storyline, stream)
 from .ratelimit import TokenBucketLimiter
 from .config import Config
 from .db import audit, connect, init_schema, now_iso, row_to_dict
@@ -176,7 +176,8 @@ def _ingest(req, text, fmt, source, synthetic, year=None):
     try:
         source = validate_source(source)
         events, rejections = parse_payload(text, fmt, source, year=year,
-                                           max_events=req.app.config.max_batch_events)
+                                           max_events=req.app.config.max_batch_events,
+                                           keep_rejected=quarantine.limits()[2])
     except EventError as exc:
         raise ApiError(400, str(exc))
     if synthetic:
@@ -581,6 +582,26 @@ def retention_run(req):
                                    routine_hours=config.routine_hours, actor=req.user["username"])
     report.update(enabled=True, hot_hours=config.hot_hours, routine_hours=config.routine_hours)
     return report
+
+
+# Pipeline visibility (read-only) --------------------------------------------------------
+
+@route("GET", "/api/pipeline")
+def pipeline_stages(req):
+    """The pipeline stage counts. Distinct values — they are not interchangeable totals."""
+    return pipeline.stages(req.conn)
+
+
+@route("GET", "/api/rollups")
+def rollup_buckets(req):
+    """Rolled-up routine traffic: hourly buckets, newest first. Query: hours, limit."""
+    return pipeline.rollups(req.conn, req.query.get("hours"), req.query.get("limit"))
+
+
+@route("GET", "/api/admin/quarantine", role="admin")
+def quarantine_view(req):
+    """Rejected records: the bounds and the newest entries. Content appears only when kept."""
+    return {"stats": quarantine.stats(req.conn), "recent": quarantine.recent(req.conn, 50)}
 
 
 # The only non-GET routes a read-only viewer may call.
