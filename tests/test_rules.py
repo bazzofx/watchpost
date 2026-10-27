@@ -223,6 +223,61 @@ class WebBehaviourRuleTests(unittest.TestCase):
         self.assertEqual(rules.web_request_burst(flood, p), [])
 
 
+class RapidDiscoveryRuleTests(unittest.TestCase):
+    """Rapid path discovery is the *fast* sibling of web_path_discovery: distinct failing paths in a
+    short window, not just anywhere inside five minutes."""
+
+    def test_threshold_boundary(self):
+        p = params("web_rapid_discovery")
+        self.assertEqual(rules.web_rapid_discovery(make([web(i * 0.2, f"/w{i}") for i in range(24)]), p), [])
+        found = rules.web_rapid_discovery(make([web(i * 0.2, f"/w{i}") for i in range(25)]), p)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["group_key"], "203.0.113.1")
+        self.assertIn("25 different paths", found[0]["explanation"])
+
+    def test_successful_browsing_is_not_discovery(self):
+        """Many distinct paths that all succeed is a fast page load, not enumeration."""
+        p = params("web_rapid_discovery")
+        browsing = make([web(i * 0.2, f"/asset{i}", outcome="success", status=200) for i in range(60)])
+        self.assertEqual(rules.web_rapid_discovery(browsing, p), [])
+
+    def test_a_slow_wide_walk_is_breadth_not_rapid(self):
+        """25 distinct failing paths spread over a minute never fit inside the 15 s window."""
+        p = params("web_rapid_discovery")
+        self.assertEqual(rules.web_rapid_discovery(make([web(i * 2, f"/w{i}") for i in range(25)]), p), [])
+
+    def test_one_burst_is_one_alert_not_one_per_request(self):
+        p = params("web_rapid_discovery")
+        burst = make([web(i * 0.1, f"/w{i}") for i in range(60)])
+        found = rules.web_rapid_discovery(burst, p)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(len(found[0]["event_ids"]), 60)
+        self.assertIn("60 attempts", found[0]["explanation"])
+
+    def test_failures_must_dominate(self):
+        """Interleaving enough successes dilutes the failure ratio below the gate."""
+        p = params("web_rapid_discovery")
+        mixed = make([web(i * 0.1, f"/missing{i}") for i in range(25)]
+                     + [web(i * 0.1, f"/ok{i}", outcome="success", status=200) for i in range(25)])
+        self.assertEqual(rules.web_rapid_discovery(mixed, p), [])  # 25/50 = 50% failure
+        mostly_fail = make([web(i * 0.1, f"/missing{i}") for i in range(25)]
+                           + [web(i * 0.1, f"/ok{i}", outcome="success", status=200) for i in range(1)])
+        self.assertEqual(len(rules.web_rapid_discovery(mostly_fail, p)), 1)  # 25/26 = 96% failure
+
+    def test_repeating_one_path_is_not_discovery(self):
+        p = params("web_rapid_discovery")
+        self.assertEqual(rules.web_rapid_discovery(make([web(i * 0.05, "/api/orders") for i in range(400)]), p), [])
+
+    def test_rapid_and_breadth_are_complementary(self):
+        rapid, breadth = params("web_rapid_discovery"), params("web_path_discovery")
+        fast_and_wide = make([web(i * 0.1, f"/w{i}") for i in range(40)])
+        self.assertEqual(len(rules.web_rapid_discovery(fast_and_wide, rapid)), 1)
+        self.assertEqual(len(rules.web_path_discovery(fast_and_wide, breadth)), 1)
+        slow_and_wide = make([web(i * 3, f"/w{i}") for i in range(36)])
+        self.assertEqual(rules.web_rapid_discovery(slow_and_wide, rapid), [])
+        self.assertEqual(len(rules.web_path_discovery(slow_and_wide, breadth)), 1)
+
+
 class GeoLoginRuleTests(unittest.TestCase):
     def test_impossible_travel(self):
         p = params("impossible_geo_login")

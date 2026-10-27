@@ -100,6 +100,21 @@ DEFAULT_RULES = [
                    "ignore_ips": [], "ignore_users": []},
     },
     {
+        "id": "web_rapid_discovery",
+        "name": "Rapid path discovery on the web server",
+        "description": "Fires when one source IP requests at least `distinct_paths` different paths within "
+                       "`window_seconds` — a short, fast window — and at least `min_failure_percent` of "
+                       "those requests did not succeed. This is the fast companion to web_path_discovery, "
+                       "which catches a patient walk across 300 seconds; a content-discovery tool fires a "
+                       "wordlist of hundreds of paths in seconds, so the short window is what separates the "
+                       "two. A browser loading a page and its assets cannot open this many different, "
+                       "mostly-missing paths in so little time.",
+        "techniques": techniques("T1083", "T1595"),
+        "severity": "medium",
+        "params": {"distinct_paths": 25, "window_seconds": 15, "min_failure_percent": 90,
+                   "ignore_ips": [], "ignore_users": []},
+    },
+    {
         "id": "web_request_burst",
         "name": "Rapid request burst from one IP",
         "description": "Fires when one source IP sends at least `threshold` requests to the web server "
@@ -560,6 +575,87 @@ def web_path_discovery(events, params):
     return findings
 
 
+def web_rapid_discovery(events, params):
+    """Rapid directory/file enumeration: a burst of distinct, mostly-refused paths.
+
+    This is the *fast* companion to `web_path_discovery`, which catches a patient walk (30+ distinct
+    paths across 300 s). A content-discovery tool is not patient: it fires a wordlist of hundreds of
+    paths in seconds, so this rule keys on a short window — `distinct_paths` different paths inside
+    `window_seconds` (default 25 in 15 s) with at least `min_failure_percent` refused. A browser cannot
+    open 25 different, mostly-missing paths in 15 s; a gobuster/ffuf run does exactly that.
+
+    Efficiency is the second point. The breadth rule re-parses every web event's message on every
+    window slide; on a busy host that is most of the traffic for no reason. Here each event is first
+    split on `outcome` (a field set at ingest, no parsing): successful requests are only *counted*
+    toward the failure ratio and never have their message regex-parsed. The path is extracted once per
+    failing event, and the window advances with running counts and a per-path refcount, so the scan is
+    one pass over the source's requests with memory proportional to the requests inside the window,
+    not to every request the source ever made.
+    """
+    needed, window, percent = params["distinct_paths"], params["window_seconds"], params["min_failure_percent"]
+    findings = []
+    web = _filtered(events, params, WEB_TYPES)
+    for ip, group in _group(web, "src_ip").items():
+        # One lightweight record per event. The message regex runs here, exactly once per failing
+        # event; a success is a bare time-stamp marker with no path, so ordinary browsing never
+        # pays the parse cost. An error-log line that names no request is skipped entirely.
+        series = []
+        for event in group:
+            if event.get("outcome") == "failure":
+                path = _web_request(event)[1]
+                if path is None:
+                    continue  # e.g. an nginx error line with no request in it
+                series.append((_epoch(event), path, event))
+            else:
+                series.append((_epoch(event), None, event))
+
+        marked = set()
+        window_paths = Counter()
+        failed = 0
+        left = 0
+        for right, (t, path, _event) in enumerate(series):
+            if path is not None:
+                failed += 1
+                window_paths[path] += 1
+            while t - series[left][0] > window:
+                expired = series[left][1]
+                if expired is not None:
+                    failed -= 1
+                    window_paths[expired] -= 1
+                    if window_paths[expired] == 0:
+                        del window_paths[expired]
+                left += 1
+            total = right - left + 1
+            if len(window_paths) >= needed and failed * 100 >= percent * total:
+                marked.update(range(left, right + 1))
+
+        clusters, current = [], []
+        for idx in sorted(marked):
+            if current and series[idx][0] - series[current[-1]][0] > window:
+                clusters.append(current)
+                current = []
+            current.append(idx)
+        if current:
+            clusters.append(current)
+
+        for cluster in clusters:
+            chosen = [series[i][2] for i in cluster]
+            paths = sorted({series[i][1] for i in cluster if series[i][1] is not None})
+            attempts_failed = sum(1 for i in cluster if series[i][1] is not None)
+            samples = ", ".join(paths[:8]) + (" …" if len(paths) > 8 else "")
+            findings.append(_finding(
+                ip, chosen,
+                f"Rapid path discovery from {ip}: {len(paths)} paths in {len(chosen)} attempts",
+                f"{ip} requested {len(paths)} different paths in {len(chosen)} attempts "
+                f"({attempts_failed} of them refused) between {chosen[0]['ts']} and {chosen[-1]['ts']} — "
+                f"at least {percent}% refused within a {window}s window, the shape of a directory/file "
+                f"brute-force tool rather than browsing. Paths included: {samples}. Threshold: {needed} "
+                f"distinct paths within {window}s. Every attempt is attached as evidence; the "
+                f"{len(chosen)} attempts are the count to compare against the wordlist size.",
+            ))
+    return findings
+
+
 def web_request_burst(events, params):
     """Volumetric: one client sending far more requests than a person or a browser would."""
     threshold, window = params["threshold"], params["window_seconds"]
@@ -1008,6 +1104,7 @@ RULE_FUNCTIONS = {
     "off_hours_privileged_login": off_hours_privileged_login,
     "web_scanner": web_scanner,
     "web_path_discovery": web_path_discovery,
+    "web_rapid_discovery": web_rapid_discovery,
     "web_request_burst": web_request_burst,
     "web_login_abuse": web_login_abuse,
     "web_injection_attempt": web_injection_attempt,

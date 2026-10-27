@@ -10,6 +10,7 @@ every number below is a starting default rather than a fixed truth.
 |---|---|---|
 | `web_scanner` | ≥ 5 requests whose **path or user agent matches a known signature** (`/.env`, `/.git`, `/wp-login.php`, injection strings, `sqlmap`/`nikto`/`nmap` user agents) from one IP in 300 s | medium |
 | `web_path_discovery` | one IP asks for **≥ 30 distinct paths** in 300 s and **≥ 70 % of those requests failed** — directory and file brute force | medium |
+| `web_rapid_discovery` | one IP asks for **≥ 25 distinct paths** in **15 s** and **≥ 90 % of those requests failed** — the same brute force, done at tool speed | medium |
 | `web_request_burst` | one IP sends **≥ 200 requests in 60 s**, whatever the paths — a flood, a fast scanner, or credential stuffing | medium |
 | `web_login_abuse` | one IP makes **≥ 10 failed requests to a login endpoint** in 300 s, whatever the code | high |
 | `web_auth_brute_force` | **≥ 10 responses with status 401 on one endpoint** from one IP in 300 s | high |
@@ -24,6 +25,13 @@ paths someone already wrote down; a wordlist walk over `/admin`, `/backup`, `/up
 invisible to it, which is exactly why the breadth rule exists. And breadth and volume are separate
 axes: a patient scanner at 1 request/s trips the breadth rule, a fast one hammering three URLs trips
 the volume rule, and neither rule substitutes for the other.
+
+`web_rapid_discovery` is the *rate* companion to `web_path_discovery`. The breadth rule keys on how
+**many different paths** one client asked for inside five minutes, patient or not; the rapid rule keys
+on how **fast** they came — 25 distinct refused paths inside 15 seconds is tool speed, because a
+browser loading one page and its assets asks for a handful of known paths that mostly succeed. A slow,
+wide wordlist walk trips only the breadth rule; a gobuster/ffuf burst trips both; a busy-but-healthy
+site trips neither, because its requests succeed.
 
 ## The status column every further web rule needed
 
@@ -84,6 +92,7 @@ nothing new; the four status rules needed the column above.
 | `web_access_denied_burst` | ≥ 20 responses with status **403** for one IP in 300 s | A01 | T1083, T1078 |
 | `web_server_error_burst` | ≥ 10 responses with status **5xx** from the access log for one IP in 300 s | A05, A06 | T1190 |
 | `web_error_probe_burst` | ≥ 20 nginx **error.log** lines naming a request for one IP in 300 s | A01, A06 | T1595.003 |
+| `web_rapid_discovery` | ≥ 25 distinct, mostly-refused paths from one IP in **15 s** — the brute force at tool speed | A01, A05 | T1083, T1595 |
 
 Four decisions are worth knowing about:
 

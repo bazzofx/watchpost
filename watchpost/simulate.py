@@ -297,6 +297,40 @@ def web_error_probe(day, rng):
     return events
 
 
+# Directory names a gobuster/ffuf-style wordlist would fire in a tight burst. Deliberately none is a
+# substring of SCAN_PATHS, SENSITIVE_NAMES, or a login/injection pattern, so this scenario exercises
+# web_rapid_discovery (and, because it is wide too, web_path_discovery) without tripping web_scanner
+# or the payload rules.
+RAPID_DISCOVERY_PATHS = [
+    "/admin-panel", "/administrator-old", "/backup_2025", "/backup_2026", "/backup-old",
+    "/backup_data", "/old", "/oldsite", "/legacy", "/archive",
+    "/archives", "/tmp", "/temp", "/temp-files", "/private",
+    "/private2", "/hidden", "/hidden-admin", "/secret", "/secure",
+    "/security", "/portal", "/intranet-old", "/internal2", "/staff",
+    "/staff-old", "/team", "/users-list", "/accounts", "/reports-old",
+    "/export", "/exports", "/download", "/downloads-old", "/files",
+    "/upload", "/uploads-old", "/data", "/database-old", "/db-dump",
+]
+
+
+def rapid_discovery(day, rng):
+    """A wordlist run: 40 distinct paths in under ten seconds, all refused.
+
+    The short, fast window is the whole point. web_path_discovery (the breadth rule) fires on any
+    30+ distinct failing paths in 300 s, patient or not; web_rapid_discovery needs them inside a
+    single fast burst. Ordinary readers on a different address stay quiet for both rules.
+    """
+    ip, start = "198.51.100.88", _at(day, 14, 30)
+    events = [_access(start + timedelta(seconds=i * 0.2), "rapid_discovery", ip, "GET",
+                      RAPID_DISCOVERY_PATHS[i % len(RAPID_DISCOVERY_PATHS)], 404,
+                      note="wordlist scan")
+              for i in range(len(RAPID_DISCOVERY_PATHS))]
+    for i, path in enumerate(["/", "/pricing", "/docs", "/about"]):
+        events.append(_access(start + timedelta(seconds=i), "rapid_discovery", "10.0.1.70", "GET",
+                              path, 200, note="normal browsing"))
+    return events
+
+
 def impossible_travel(day, rng):
     return [
         _event(_at(day, 9, 0), "impossible_travel", "auth_success", "erin", "10.0.1.24", host="mail01",
@@ -440,6 +474,14 @@ SCENARIOS = {
                         "description": "Twenty-two nginx error-log lines naming a request from one "
                                        "client, on a vhost with access logging off: no response codes "
                                        "at all, so only the error-log rule can see them."},
+    # Appended last for the same reason as the entries above it: the shared rng sequence for the
+    # scenarios before it must not shift.
+    "rapid_discovery": {"build": rapid_discovery, "malicious": True,
+                        "expected": {"web_rapid_discovery": "198.51.100.88",
+                                     "web_path_discovery": "198.51.100.88"},
+                        "description": "One client fires a wordlist of 40 distinct paths in under ten "
+                                       "seconds, all 404. The short, fast window is what the rapid rule "
+                                       "keys on; the breadth rule also fires because the walk is wide."},
 }
 
 
