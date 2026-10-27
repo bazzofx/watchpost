@@ -16,7 +16,7 @@ for active investigations, archive safely, and expose the health of the whole pi
 | 1 | FTS5 search | ✅ done — [search/fts5.md](search/fts5.md) |
 | 2 | Ingestion idempotency | ✅ done — [ingestion/idempotency.md](ingestion/idempotency.md) |
 | 3 | Retention & archive | ✅ done — [retention/archive.md](retention/archive.md) |
-| 4 | Classification & aggregation | ⬜ |
+| 4 | Classification & aggregation | ◐ tiers + rollups done — [processing/tiers-and-rollups.md](processing/tiers-and-rollups.md); metrics + quarantine next |
 | 5 | Detection decoupling | ⬜ (only if measured) |
 | 6 | Operational hardening & load tests | ⬜ |
 
@@ -81,7 +81,7 @@ exists. Provide a dry-run that reports rows/bytes to move and to delete, grouped
 
 Deliverable page: `retention/`.
 
-## Phase 4 — Classification, aggregation, metrics, quarantine
+## Phase 4 — Classification, aggregation, metrics, quarantine ◐
 
 Classify every normalized event into a value tier **after** detection has run, then route it:
 

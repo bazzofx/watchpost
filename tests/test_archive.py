@@ -162,6 +162,66 @@ class ArchiveTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             archive.cutoff_for(0)
 
+    # --- value tiers ---------------------------------------------------------------------
+
+    def test_routine_traffic_expires_before_high_value_evidence(self):
+        """Category C uses the routine window; A/B use the hot window."""
+        engine.ingest(self.conn, [{"ts": "2026-01-03T10:00:00.000Z", "source": "web",
+                                   "event_type": "web_request", "severity": "low",
+                                   "message": "routine"}], [], "web", "json", "t")
+        engine.ingest(self.conn, [{"ts": "2026-01-03T10:00:00.000Z", "source": "auth",
+                                   "event_type": "auth_failure", "severity": "medium",
+                                   "message": "evidence"}], [], "auth", "json", "t")
+        hot = "2026-01-02T00:00:00.000Z"          # only evidence older than this expires
+        routine = "2026-01-05T00:00:00.000Z"      # routine older than this expires
+        report = archive.move(self.conn, hot, self.archives, routine_cutoff=routine)
+        self.assertEqual(report["archived"], 1)
+        self.assertEqual([r[0] for r in self.conn.execute("SELECT event_type FROM events")],
+                         ["auth_failure"])
+
+    def test_routine_rows_become_hourly_rollups_as_they_expire(self):
+        events = [{"ts": "2026-01-02T10:%02d:00.000Z" % i, "source": "web", "host": "web01",
+                   "event_type": "web_request", "severity": "low", "outcome": "success",
+                   "message": "ok"} for i in range(5)]
+        engine.ingest(self.conn, events, [], "web", "json", "t")
+        report = archive.move(self.conn, CUTOFF, self.archives)
+        self.assertEqual(report["rolled_up"], 5)
+        rows = [dict(r) for r in self.conn.execute("SELECT * FROM event_rollups")]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["events"], 5)
+        self.assertEqual(rows[0]["bucket_start"], "2026-01-02T10:00:00.000Z")
+        self.assertEqual(rows[0]["event_type"], "web_request")
+        self.assertEqual(rows[0]["first_seen"], "2026-01-02T10:00:00.000Z")
+        self.assertEqual(rows[0]["last_seen"], "2026-01-02T10:04:00.000Z")
+
+    def test_rollups_accumulate_across_sliced_passes(self):
+        events = [{"ts": "2026-01-02T10:%02d:00.000Z" % i, "source": "web",
+                   "event_type": "web_request", "severity": "low", "message": "ok"}
+                  for i in range(3)]
+        engine.ingest(self.conn, events, [], "web", "json", "t")
+        for _ in range(3):
+            archive.move(self.conn, CUTOFF, self.archives, limit=1)
+        self.assertEqual(self.conn.execute("SELECT SUM(events) FROM event_rollups").fetchone()[0], 3)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM event_rollups").fetchone()[0], 1)
+
+    def test_different_hours_are_different_buckets(self):
+        engine.ingest(self.conn, [
+            {"ts": "2026-01-02T10:10:00.000Z", "source": "web", "event_type": "web_request",
+             "severity": "low", "message": "a"},
+            {"ts": "2026-01-02T11:10:00.000Z", "source": "web", "event_type": "web_request",
+             "severity": "low", "message": "b"}], [], "web", "json", "t")
+        archive.move(self.conn, CUTOFF, self.archives)
+        buckets = [r[0] for r in self.conn.execute(
+            "SELECT bucket_start FROM event_rollups ORDER BY bucket_start")]
+        self.assertEqual(buckets, ["2026-01-02T10:00:00.000Z", "2026-01-02T11:00:00.000Z"])
+
+    def test_high_value_rows_are_not_rolled_up(self):
+        engine.ingest(self.conn, [{"ts": OLD, "source": "auth", "event_type": "auth_failure",
+                                   "severity": "medium", "message": "x"}], [], "auth", "json", "t")
+        report = archive.move(self.conn, CUTOFF, self.archives)
+        self.assertEqual(report["rolled_up"], 0)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM event_rollups").fetchone()[0], 0)
+
 
 class JournalModeTests(unittest.TestCase):
     """The partition is a separate file; it must open and close cleanly on every call."""

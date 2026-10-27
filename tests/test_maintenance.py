@@ -68,6 +68,11 @@ class ResetTests(unittest.TestCase):
                           (alert_id, "analyst", "investigating", now))
         self.conn.execute("INSERT INTO error_log(created_at, component, message, guidance)"
                           " VALUES (?, 'ingestion', 'boom', 'retry')", (now,))
+        # Rollups are written only by a retention pass, so seed one directly.
+        self.conn.execute(
+            "INSERT INTO event_rollups(bucket_start, event_type, source, host, outcome, severity,"
+            " events, first_seen, last_seen) VALUES (?,?,?,?,?,?,?,?,?)",
+            (now, "web_request", "web01-web", "web01", "success", "low", 3, now, now))
 
     def rows(self, table):
         return self.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]

@@ -45,6 +45,9 @@ class Config:
     # Retention. Events older than `hot_hours` move into per-day archive files under `archive_dir`.
     # 0 (the default) keeps everything: nothing is moved or deleted unless an operator opts in.
     hot_hours: int = 0
+    # How long Category C (routine) traffic stays hot before it expires and is folded into rollups.
+    # 0 means "use hot_hours", i.e. no early expiry. It is clamped to never exceed hot_hours.
+    routine_hours: int = 0
     archive_dir: str = ""
 
     @classmethod
@@ -75,6 +78,7 @@ class Config:
             demo_loop_minutes=int(os.environ.get("SIEM_DEMO_LOOP", "0")),
             demo_loop_speed=float(os.environ.get("SIEM_DEMO_LOOP_SPEED", "1")),
             hot_hours=int(os.environ.get("SIEM_HOT_HOURS", "0")),
+            routine_hours=int(os.environ.get("SIEM_ROUTINE_HOURS", "0")),
             archive_dir=os.environ.get("SIEM_ARCHIVE_DIR", str(Path(db_path).parent / "archive")),
         )
         values.update(overrides)

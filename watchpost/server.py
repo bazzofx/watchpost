@@ -559,8 +559,9 @@ def retention_preview(req):
     if config.hot_hours <= 0:
         return {"enabled": False, "hot_hours": config.hot_hours, "archive_dir": config.archive_dir,
                 "note": "retention is off; set SIEM_HOT_HOURS to a positive number of hours"}
-    report = archive.dry_run(req.conn, archive.cutoff_for(config.hot_hours), config.archive_dir)
-    report.update(enabled=True, hot_hours=config.hot_hours)
+    hot_cutoff, routine_cutoff = archive.cutoffs(config.hot_hours, config.routine_hours)
+    report = archive.dry_run(req.conn, hot_cutoff, config.archive_dir, routine_cutoff=routine_cutoff)
+    report.update(enabled=True, hot_hours=config.hot_hours, routine_hours=config.routine_hours)
     return report
 
 
@@ -576,9 +577,9 @@ def retention_run(req):
     config = req.app.config
     if config.hot_hours <= 0:
         raise ApiError(400, "retention is off; set SIEM_HOT_HOURS to a positive number of hours")
-    report = archive.move(req.conn, archive.cutoff_for(config.hot_hours), config.archive_dir,
-                          actor=req.user["username"])
-    report.update(enabled=True, hot_hours=config.hot_hours)
+    report = archive.run_retention(req.conn, config.hot_hours, config.archive_dir,
+                                   routine_hours=config.routine_hours, actor=req.user["username"])
+    report.update(enabled=True, hot_hours=config.hot_hours, routine_hours=config.routine_hours)
     return report
 
 

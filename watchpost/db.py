@@ -237,6 +237,23 @@ CREATE TABLE IF NOT EXISTS incident_alerts (
     added_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_incident_alerts_incident ON incident_alerts(incident_id);
+
+-- Rolled-up routine events: what the hot store keeps once Category C rows age out, so trends and
+-- counts survive the detail. Written and deleted-from in the same transaction by the retention pass.
+CREATE TABLE IF NOT EXISTS event_rollups (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    bucket_start TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    source TEXT NOT NULL,
+    host TEXT NOT NULL DEFAULT '',
+    outcome TEXT NOT NULL DEFAULT '',
+    severity TEXT NOT NULL,
+    events INTEGER NOT NULL,
+    first_seen TEXT NOT NULL,
+    last_seen TEXT NOT NULL,
+    UNIQUE (bucket_start, event_type, source, host, outcome, severity)
+);
+CREATE INDEX IF NOT EXISTS idx_rollups_bucket ON event_rollups(bucket_start);
 """
 
 # Columns added after 1.0. Existing databases gain them in place on startup.
@@ -245,6 +262,7 @@ ADDED_COLUMNS = [
     ("events", "dest_port", "INTEGER"),
     ("events", "bytes", "INTEGER"),
     ("events", "http_status", "INTEGER"),
+    ("events", "tier", "TEXT"),
     ("detection_runs", "correlation", "TEXT"),
 ]
 

@@ -129,54 +129,81 @@ def cutoff_for(hot_hours, now=None):
     return iso(now - timedelta(hours=hot_hours))
 
 
-def plan(conn, cutoff):
-    """Per-day eligible rows and a rough byte estimate. Read-only."""
+def cutoffs(hot_hours, routine_hours=0, now=None):
+    """(hot_cutoff, routine_cutoff-or-None) from the two retention windows.
+
+    Category C expires on `routine_hours`, everything else on `hot_hours`. The routine window is
+    clamped so it can never be *longer* than the hot window: a misconfiguration must not keep routine
+    traffic in the fast tier longer than the evidence sitting next to it.
+    """
+    now = now or datetime.now(timezone.utc)
+    hot = cutoff_for(hot_hours, now)
+    if not routine_hours or routine_hours <= 0:
+        return hot, None
+    return hot, max(cutoff_for(routine_hours, now), hot)
+
+
+def _eligible(hot_cutoff, routine_cutoff):
+    """SQL for "this row is old enough for its tier", with its arguments."""
+    routine = routine_cutoff or hot_cutoff
+    return ("((tier = 'C' AND ts < ?) OR ((tier IS NULL OR tier != 'C') AND ts < ?))",
+            (routine, hot_cutoff))
+
+
+def plan(conn, hot_cutoff, routine_cutoff=None):
+    """Per-day, per-tier eligible rows. Read-only."""
     pinned = pinned_predicate()
+    where, args = _eligible(hot_cutoff, routine_cutoff)
     rows = conn.execute(
-        f"SELECT substr(ts, 1, 10) AS day, COUNT(*) AS rows,"
+        f"SELECT substr(ts, 1, 10) AS day, COALESCE(tier, '?') AS tier, COUNT(*) AS rows,"
         f" SUM(LENGTH(COALESCE(message, '')) + LENGTH(COALESCE(raw, ''))) AS text_bytes"
-        f" FROM events WHERE ts < ? AND NOT ({pinned}) GROUP BY day ORDER BY day",
-        (cutoff,)).fetchall()
+        f" FROM events WHERE {where} AND NOT ({pinned})"
+        f" GROUP BY day, tier ORDER BY day, tier", args).fetchall()
     pinned_rows = conn.execute(
-        f"SELECT COUNT(*) FROM events WHERE ts < ? AND ({pinned})", (cutoff,)).fetchone()[0]
+        f"SELECT COUNT(*) FROM events WHERE {where} AND ({pinned})", args).fetchone()[0]
     return rows, pinned_rows
 
 
-def dry_run(conn, cutoff, archives_dir):
-    """What a retention pass would move, by day. Changes nothing and pins nothing."""
-    rows, pinned_rows = plan(conn, cutoff)
-    days = [{
-        "day": row["day"],
-        "rows": row["rows"],
+def dry_run(conn, hot_cutoff, archives_dir, routine_cutoff=None):
+    """What a retention pass would move, by day and tier. Changes nothing, creates no file."""
+    rows, pinned_rows = plan(conn, hot_cutoff, routine_cutoff)
+    days = {}
+    for row in rows:
+        entry = days.setdefault(row["day"], {
+            "day": row["day"], "rows": 0, "bytes_estimate": 0, "by_tier": {},
+            "partition": str(partition_path(archives_dir, row["day"]))})
+        entry["rows"] += row["rows"]
         # Coarse: the two text columns plus ~120 bytes of fixed-width columns. An estimate, not a
         # measurement of the page file.
-        "bytes_estimate": int((row["text_bytes"] or 0) + 120 * row["rows"]),
-        "partition": str(partition_path(archives_dir, row["day"])),
-    } for row in rows]
-    return {"cutoff": cutoff, "dry_run": True, "days": days, "pinned": pinned_rows,
-            "eligible": sum(d["rows"] for d in days), "archives_dir": str(archives_dir)}
+        entry["bytes_estimate"] += int((row["text_bytes"] or 0) + 120 * row["rows"])
+        entry["by_tier"][row["tier"]] = entry["by_tier"].get(row["tier"], 0) + row["rows"]
+    ordered = [days[day] for day in sorted(days)]
+    return {"cutoff": hot_cutoff, "routine_cutoff": routine_cutoff or hot_cutoff, "dry_run": True,
+            "days": ordered, "pinned": pinned_rows, "eligible": sum(d["rows"] for d in ordered),
+            "archives_dir": str(archives_dir)}
 
 
-def move(conn, cutoff, archives_dir, limit=DEFAULT_BATCH, actor=None):
+def move(conn, hot_cutoff, archives_dir, routine_cutoff=None, limit=DEFAULT_BATCH, actor=None):
     """Archive then delete eligible events. Never deletes a row that is not in a partition.
 
     Per day: write the partition (idempotent on the event id), re-read it to prove the rows arrived,
-    and only then delete them from hot in a separate transaction. A failure at any earlier point
-    leaves the hot rows in place and records the reason, so the next run retries the same work.
-    `limit` bounds how many rows one pass handles.
+    then — in one hot-database transaction — record the Category C rollups and delete the ids. Putting
+    the rollup and the delete in the same transaction is what keeps the retry honest: a crash cannot
+    leave a rollup counted for rows that are still queued to move.
     """
-    rows, pinned_rows = plan(conn, cutoff)
-    report = {"cutoff": cutoff, "dry_run": False, "archives_dir": str(archives_dir),
-              "archived": 0, "deleted": 0, "pinned": pinned_rows, "days": [], "errors": []}
-    remaining = limit
+    rows, pinned_rows = plan(conn, hot_cutoff, routine_cutoff)
+    report = {"cutoff": hot_cutoff, "routine_cutoff": routine_cutoff or hot_cutoff, "dry_run": False,
+              "archives_dir": str(archives_dir), "archived": 0, "deleted": 0, "rolled_up": 0,
+              "pinned": pinned_rows, "days": [], "errors": []}
+    where, args = _eligible(hot_cutoff, routine_cutoff)
     pinned = pinned_predicate()
-    for row in rows:
+    remaining = limit
+    for day in sorted({row["day"] for row in rows}):
         if remaining <= 0:
             break
-        day = row["day"]
         batch = [dict(r) for r in conn.execute(
-            f"SELECT * FROM events WHERE ts < ? AND ts LIKE ? AND NOT ({pinned})"
-            f" ORDER BY id LIMIT ?", (cutoff, day + "%", remaining)).fetchall()]
+            f"SELECT * FROM events WHERE {where} AND ts LIKE ? AND NOT ({pinned})"
+            f" ORDER BY id LIMIT ?", (*args, day + "%", remaining)).fetchall()]
         if not batch:
             continue
         path = partition_path(archives_dir, day)
@@ -193,6 +220,7 @@ def move(conn, cutoff, archives_dir, limit=DEFAULT_BATCH, actor=None):
                                               f"insert; nothing deleted"})
             continue
         with transaction(conn):
+            report["rolled_up"] += _rollup_batch(conn, batch)
             conn.execute("DELETE FROM events WHERE id IN (%s)" % ",".join("?" * len(ids)), ids)
         report["archived"] += len(ids)
         report["deleted"] += len(ids)
@@ -200,10 +228,49 @@ def move(conn, cutoff, archives_dir, limit=DEFAULT_BATCH, actor=None):
         remaining -= len(ids)
     if actor:
         audit(conn, actor, "retention_archive", None,
-              {"cutoff": cutoff, "archived": report["archived"], "deleted": report["deleted"],
-               "pinned": pinned_rows, "days": [d["day"] for d in report["days"]],
-               "errors": report["errors"]})
+              {"cutoff": hot_cutoff, "routine_cutoff": routine_cutoff or hot_cutoff,
+               "archived": report["archived"], "deleted": report["deleted"],
+               "rolled_up": report["rolled_up"], "pinned": pinned_rows,
+               "days": [d["day"] for d in report["days"]], "errors": report["errors"]})
     return report
+
+
+def run_retention(conn, hot_hours, archives_dir, routine_hours=0, limit=DEFAULT_BATCH, actor=None):
+    """One retention pass: roll routine traffic up, archive what expired, delete what was archived."""
+    hot_cutoff, routine_cutoff = cutoffs(hot_hours, routine_hours)
+    return move(conn, hot_cutoff, archives_dir, routine_cutoff=routine_cutoff, limit=limit,
+                actor=actor)
+
+
+def _rollup_batch(conn, rows):
+    """Fold the Category C rows of one batch into hourly rollups. Returns how many events.
+
+    Called inside the same transaction as the delete, so a rollup is never recorded for a row that
+    survives to be counted again. Counts accumulate across passes (a day can arrive in slices).
+    """
+    buckets = {}
+    for row in rows:
+        if row.get("tier") != "C":
+            continue
+        key = (row["ts"][:13] + ":00:00.000Z", row["event_type"], row["source"],
+               row.get("host") or "", row.get("outcome") or "", row["severity"])
+        entry = buckets.get(key)
+        if entry is None:
+            buckets[key] = [1, row["ts"], row["ts"]]
+        else:
+            entry[0] += 1
+            entry[1] = min(entry[1], row["ts"])
+            entry[2] = max(entry[2], row["ts"])
+    for (bucket, event_type, source, host, outcome, severity), (count, first, last) in buckets.items():
+        conn.execute(
+            "INSERT INTO event_rollups(bucket_start, event_type, source, host, outcome, severity,"
+            " events, first_seen, last_seen) VALUES (?,?,?,?,?,?,?,?,?)"
+            " ON CONFLICT(bucket_start, event_type, source, host, outcome, severity) DO UPDATE SET"
+            " events = events + excluded.events,"
+            " first_seen = MIN(first_seen, excluded.first_seen),"
+            " last_seen = MAX(last_seen, excluded.last_seen)",
+            (bucket, event_type, source, host, outcome, severity, count, first, last))
+    return sum(entry[0] for entry in buckets.values())
 
 
 def _write_partition(hot_conn, path, rows):

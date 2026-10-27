@@ -6,6 +6,7 @@ import threading
 import uuid
 from datetime import timedelta
 
+from . import classify
 from . import correlate as correlate_mod
 from . import rules as rules_mod
 from . import stream
@@ -13,7 +14,8 @@ from .db import audit, iso, now_iso, parse_iso, row_to_dict, transaction
 from .diagnostics import describe_exception, record_error
 
 EVENT_COLUMNS = ["ts", "source", "host", "event_type", "outcome", "severity",
-                 "user", "src_ip", "dest_ip", "dest_port", "bytes", "http_status", "message", "raw"]
+                 "user", "src_ip", "dest_ip", "dest_port", "bytes", "http_status", "tier", "message",
+                 "raw"]
 # Fields detection rules can read.
 #
 # `http_status` was added for the OWASP web rules, which need the response code as a field rather
@@ -101,6 +103,11 @@ def store_batch(conn, events, rejections, source, fmt, submitted_by, synthetic=F
     """
     batch_id = batch_id or uuid.uuid4().hex
     now = now_iso()
+    # Value tier, computed once here so every writer gets it: it decides how long a row stays in
+    # the hot tier, never whether it is detected (detection runs on everything after storage).
+    for event in events:
+        if event.get("tier") is None:
+            event["tier"] = classify.tier_for(event)
     with transaction(conn):
         conn.executemany(
             f"INSERT INTO events(ingested_at, synthetic, batch_id, {', '.join(EVENT_COLUMNS)})"
