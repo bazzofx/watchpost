@@ -17,6 +17,10 @@ from .diagnostics import describe_exception, record_error
 EVENT_COLUMNS = ["ts", "source", "host", "event_type", "outcome", "severity",
                  "user", "src_ip", "dest_ip", "dest_port", "bytes", "http_status", "tier", "message",
                  "raw"]
+
+# SQLite caps bound parameters (999 on older builds, 32766 on modern ones). Any query built from an
+# unbounded list of ids must be chunked or it fails at scale — see _count_present.
+IN_CHUNK = 900
 # Fields detection rules can read.
 #
 # `http_status` was added for the OWASP web rules, which need the response code as a field rather
@@ -179,17 +183,49 @@ def _existing_alert(conn, rule_id, group_key, first_seen, window):
     ).fetchone()
 
 
+def _count_present(conn, rule_id, group_key, ids, chunk=IN_CHUNK):
+    """How many of these event ids are already evidence for this rule and group.
+
+    Chunked on purpose. A detection window can cover tens of thousands of events, and a single
+    `IN (?, …)` with one parameter per id exceeds SQLite's bound-variable limit — measured in the
+    Phase 6 load test as "too many SQL variables", which made detection fail for whole batches.
+    Event ids are unique, so summing per-chunk distinct counts is exact.
+    """
+    if not ids:
+        return 0
+    total = 0
+    for start in range(0, len(ids), chunk):
+        part = ids[start:start + chunk]
+        total += conn.execute(
+            f"SELECT COUNT(DISTINCT ae.event_id) FROM alert_events ae"
+            f" JOIN alerts a ON a.id = ae.alert_id"
+            f" WHERE a.rule_id = ? AND a.group_key = ?"
+            f" AND ae.event_id IN ({','.join('?' for _ in part)})",
+            (rule_id, group_key, *part)).fetchone()[0]
+    return total
+
+
+def _evidence_has(conn, rule_id, group_key, event_id):
+    """Is this event already evidence for this rule and group? One indexed lookup."""
+    return conn.execute(
+        "SELECT 1 FROM alert_events ae JOIN alerts a ON a.id = ae.alert_id"
+        " WHERE a.rule_id = ? AND a.group_key = ? AND ae.event_id = ? LIMIT 1",
+        (rule_id, group_key, event_id)).fetchone() is not None
+
+
 def _apply_finding(conn, rule, finding, synthetic):
     """Create or extend an alert. Returns 'created', 'updated', or 'unchanged'."""
     ids = finding["event_ids"]
-    placeholders = ",".join("?" for _ in ids)
-    already = conn.execute(
-        f"SELECT COUNT(DISTINCT ae.event_id) FROM alert_events ae JOIN alerts a ON a.id = ae.alert_id"
-        f" WHERE a.rule_id = ? AND a.group_key = ? AND ae.event_id IN ({placeholders})",
-        (rule["id"], finding["group_key"], *ids),
-    ).fetchone()[0]
-    if already == len(ids):
-        return "unchanged"  # e.g. a rescan, or evidence already on a resolved alert
+    if not ids:
+        return "unchanged"
+    # "Is the whole finding already linked?" only matters for a rescan or a re-delivery. On a live
+    # batch the newest id is new, so one indexed lookup settles it; the full count is the rare path.
+    # Before this, every batch counted the whole finding, which grew with the alert's evidence and
+    # made detection O(evidence) per batch (measured: ~1,030 ms per 500 events at 20k events).
+    if _evidence_has(conn, rule["id"], finding["group_key"], max(ids)):
+        already = _count_present(conn, rule["id"], finding["group_key"], ids)
+        if already == len(ids):
+            return "unchanged"  # e.g. a rescan, or evidence already on a resolved alert
 
     now = now_iso()
     window = rule["params"].get("window_seconds", 3600)

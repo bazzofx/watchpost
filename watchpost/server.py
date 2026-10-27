@@ -128,7 +128,23 @@ def health_details(req):
 
 @route("POST", "/api/detection/run", role="analyst")
 def detection_run(req):
-    result = engine.run_detection(req.conn, trigger=f"full:{req.user['username']}")
+    """Re-run detection. `?hours=N` bounds the scan to the last N hours (clamped to 1 h … 90 days).
+
+    With no parameter the whole store is scanned — that is the one O(history) operation in the app
+    (measured at 8.4 s for 100k events, ~84 s for a million in Documentation/detection/decoupling.md),
+    so an operator who only cares about recent activity should pass `hours`. Ingest never runs an
+    unbounded window: it always scopes detection to the batch's own time range.
+    """
+    hours = req.query.get("hours")
+    window, start = None, None
+    if hours not in (None, ""):
+        try:
+            window = max(1, min(int(hours), 24 * 90))
+        except (TypeError, ValueError):
+            raise ApiError(400, "hours must be an integer")
+        start = archive.cutoff_for(window)
+    result = engine.run_detection(req.conn, trigger=f"full:{req.user['username']}", start=start)
+    result["window_hours"] = window
     audit(req.conn, req.user["username"], "detection_run", None, result)
     return result
 

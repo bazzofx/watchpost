@@ -32,6 +32,9 @@ here and linked from the project plan.
 | Classification & aggregation | [Value tiers and rollups](processing/tiers-and-rollups.md) | ✅ implemented (Phase 4) |
 | Metrics & quarantine | [Pipeline counters and quarantine](observability/pipeline-and-quarantine.md) | ✅ implemented (Phase 4) |
 | Detection scheduling | [Detection decoupling: measured, not needed](detection/decoupling.md) | ✅ measured (Phase 5) |
+| Operational hardening | [Hardening and load tests](phase6/hardening.md) | ✅ implemented (Phase 6) |
+
+See also the [final report](final-report.md) for the measured results and the open gaps.
 
 ## Existing documentation
 

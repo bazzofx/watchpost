@@ -18,7 +18,7 @@ for active investigations, archive safely, and expose the health of the whole pi
 | 3 | Retention & archive | ✅ done — [retention/archive.md](retention/archive.md) |
 | 4 | Classification & aggregation | ✅ done — [tiers/rollups](processing/tiers-and-rollups.md), [counters/quarantine](observability/pipeline-and-quarantine.md); Category D telemetry deferred to Phase 6 |
 | 5 | Detection decoupling | ✅ measured — **not needed**: [detection/decoupling.md](detection/decoupling.md) |
-| 6 | Operational hardening & load tests | ⬜ |
+| 6 | Operational hardening & load tests | ✅ done — [phase6/hardening.md](phase6/hardening.md); see [final report](final-report.md) |
 
 ## Phase 0 — Baseline and assessment ✅
 
@@ -110,7 +110,7 @@ the ingest path.
 would change the answer, and the reproduction command are in [detection/decoupling.md](detection/decoupling.md).
 The tool is [`tools/bench_detection.py`](../../tools/bench_detection.py).
 
-## Phase 6 — Operational hardening
+## Phase 6 — Operational hardening ✅
 
 Expose the ingestion-stage metrics (observed / parsed / stored / aggregated / detected / rejected /
 dropped), test disk-full, queue saturation and recovery, review access controls, run the load tests,

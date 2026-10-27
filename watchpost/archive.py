@@ -21,6 +21,15 @@ from .db import audit, iso, transaction
 
 DEFAULT_BATCH = 5000
 PARTITION_SUFFIX = ".db"
+# SQLite caps bound parameters (999 on older builds); every statement built from an unbounded id
+# list is split at this size. The mover's limit is larger than the cap on purpose.
+IN_CHUNK = 900
+
+
+def _chunks(items, size=IN_CHUNK):
+    """Split a list so no generated SQL statement exceeds the bound-parameter limit."""
+    for start in range(0, len(items), size):
+        yield items[start:start + size]
 
 
 # --- partitions -------------------------------------------------------------------------
@@ -221,7 +230,9 @@ def move(conn, hot_cutoff, archives_dir, routine_cutoff=None, limit=DEFAULT_BATC
             continue
         with transaction(conn):
             report["rolled_up"] += _rollup_batch(conn, batch)
-            conn.execute("DELETE FROM events WHERE id IN (%s)" % ",".join("?" * len(ids)), ids)
+            # Chunked: `limit` can exceed SQLite's bound-parameter cap on older builds.
+            for part in _chunks(ids):
+                conn.execute("DELETE FROM events WHERE id IN (%s)" % ",".join("?" * len(part)), part)
         report["archived"] += len(ids)
         report["deleted"] += len(ids)
         report["days"].append({"day": day, "rows": len(ids), "partition": str(path)})
@@ -290,8 +301,11 @@ def _write_partition(hot_conn, path, rows):
             archive.execute("ROLLBACK")
             raise
         ids = [r["id"] for r in rows]
-        found = {r[0] for r in archive.execute(
-            "SELECT id FROM events WHERE id IN (%s)" % ",".join("?" * len(ids)), ids).fetchall()}
+        found = set()
+        for part in _chunks(ids):
+            found.update(row[0] for row in archive.execute(
+                "SELECT id FROM events WHERE id IN (%s)" % ",".join("?" * len(part)),
+                part).fetchall())
         return found
     finally:
         archive.close()
