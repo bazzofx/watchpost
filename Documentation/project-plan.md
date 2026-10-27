@@ -17,7 +17,7 @@ for active investigations, archive safely, and expose the health of the whole pi
 | 2 | Ingestion idempotency | ✅ done — [ingestion/idempotency.md](ingestion/idempotency.md) |
 | 3 | Retention & archive | ✅ done — [retention/archive.md](retention/archive.md) |
 | 4 | Classification & aggregation | ✅ done — [tiers/rollups](processing/tiers-and-rollups.md), [counters/quarantine](observability/pipeline-and-quarantine.md); Category D telemetry deferred to Phase 6 |
-| 5 | Detection decoupling | ⬜ (only if measured) |
+| 5 | Detection decoupling | ✅ measured — **not needed**: [detection/decoupling.md](detection/decoupling.md) |
 | 6 | Operational hardening & load tests | ⬜ |
 
 ## Phase 0 — Baseline and assessment ✅
@@ -98,13 +98,17 @@ Quarantine and aggregation state must be bounded.
 
 Deliverable pages: `processing/`, `observability/`.
 
-## Phase 5 — Detection decoupling
+## Phase 5 — Detection decoupling ✅ (measured: not needed)
 
-Only if Phase 0/1 measurements show per-batch detection is the bottleneck. Introduce a watermark-based
-scheduled correlation over `(last_id, max_id]` with explicit handling for late/out-of-order events,
-rule changes, and restarts. Keep detection idempotent.
+Only if measurements show per-batch detection is the bottleneck. It is not: scoped detection is ~34%
+of a request and flat as the store grows (142 ms at 20k events, 140 ms at 100k; 169–217 ms for a
+500-event batch depending on how many rules fire). Ingest scans only the batch's own window, never the
+history. The one O(history) cost is the admin-triggered full re-scan (8.4 s at 100k), which is not on
+the ingest path.
 
-Deliverable page: `detection/`.
+**Decision: no queue, no worker, no cursor, no schema change.** The measurement, the threshold that
+would change the answer, and the reproduction command are in [detection/decoupling.md](detection/decoupling.md).
+The tool is [`tools/bench_detection.py`](../../tools/bench_detection.py).
 
 ## Phase 6 — Operational hardening
 
