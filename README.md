@@ -58,8 +58,24 @@ cd labs/siem
 export SIEM_ADMIN_PASSWORD='choose-a-long-password'      # optional; otherwise generated
 export SIEM_ANALYST_PASSWORD='choose-another-long-one'   # optional; otherwise generated
 export SIEM_VIEWER_PASSWORD='a-read-only-demo-login'     # optional; creates a read-only `viewer` account
-./start.sh                                               # http://127.0.0.1:8080
+
+./start.sh                                               # http://127.0.0.1:8080 LINUX
+or
+python main.py                                           # http://127.0.0.1:8080 WINDOWS
+
+Make accesible from anywhere, create a SIEM_HOST env variable
+# Windows
+$env:SIEM_HOST = '0.0.0.0'; python main.py
+
+## Linux
+SIEM_HOST=0.0.0.0 python3 main.py
+
 ```
+
+
+
+
+
 
 If you don't set the password variables, Watchpost generates random passwords on first start. It writes them to `data/initial_credentials.txt` (mode 0600) and never prints them to the logs.
 
