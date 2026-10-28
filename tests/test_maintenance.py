@@ -193,7 +193,10 @@ class LogDataApiTests(ServerTestCase):
         self.assertEqual(self.admin.get("/api/incidents")[1], [])
         self.assertEqual(self.admin.get("/api/ingest/batches")[1], [])
 
-        self.assertEqual(len(self.admin.get("/api/rules")[1]), 13, "rules must survive")
+        # Counted from the rule set rather than hard-coded: the reset must keep every default rule,
+        # however many there are (the number changed when the web/WAF rules were merged in).
+        self.assertEqual(len(self.admin.get("/api/rules")[1]), len(rules.DEFAULT_RULES),
+                         "rules must survive")
         self.assertEqual(self.admin.get("/api/auth/me")[0], 200, "the session must survive")
         self.assertEqual(len(self.admin.get("/api/tokens")[1]), 1, "the token list must survive")
 
