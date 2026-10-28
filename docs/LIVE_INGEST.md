@@ -130,7 +130,16 @@ hand, use the agent instead — `sudo ./deploy/agent/install-agent.sh --url ...`
 
 `scripts/shipper.py` is one file with no dependencies. It tails one or more files and posts complete new lines to `POST /api/ingest/upload` with an ingest token.
 
-- **Batching:** up to 500 lines or 1 MB per request, polled every 2 seconds. **Watchpost runs a detection pass on every batch, and each pass rescans about 30 hours of events** (the longest rule lookback plus history). A large `--from-start` backfill is therefore quadratic in cost — raise `--batch-lines` to cut the number of passes, and see [AGENT.md](AGENT.md#backfilling-an-existing-log-is-expensive--read-this-first) before replaying an existing log.
+- **Batching:** up to 500 lines or 1 MB per request, polled every 2 seconds — many log lines travel in one POST, not one request per line. **Watchpost runs a detection pass on every batch, and each pass rescans the longest rule lookback plus any rule history.** A large `--from-start` backfill is therefore expensive — raise `--batch-lines` to cut the number of passes, and see [AGENT.md](AGENT.md#backfilling-an-existing-log-is-expensive--read-this-first) before replaying an existing log.
+- **Burst coalescing:** more than `--burst-threshold` web lines (default 50) from the same client address within `--burst-window` seconds (default 5) is treated as a flood. The lines before that point are sent normally; everything after it is **not sent at all**, and when the flood goes quiet the agent sends one summary event through `POST /api/ingest`:
+
+  ```
+  event_type: web_scan   src_ip: <client>   severity: medium
+  message: "Rapid asset discovery: 412 requests to 188 distinct paths in 5s
+            from 203.0.113.9 (411 line(s) suppressed by the agent)"
+  ```
+
+  That is what keeps a scanner from becoming thousands of stored events, thousands of evidence rows, and a detection pass that grows every batch. It only applies to `weblog` lines (or `auto` lines that parse as a combined access log); auth, firewall and syslog lines are never touched, and a line the agent cannot parse is always passed through rather than dropped. `--burst-threshold 0` disables it. The trade is explicit: the individual requests are not in the SIEM, only the summary — if you need them, raise the threshold or turn it off for that host.
 - **Position file:** after each accepted batch, the byte offset and inode of every file are written atomically. A restart resumes where it stopped.
 - **Rotation:** when the file is renamed and a new one created, the shipper drains the old file and then switches. It also handles truncation in place (`copytruncate`).
 - **Backoff:** network errors, 5xx responses, and 401/403 retry the same batch with exponential backoff, from 1 s up to 60 s, with jitter. Nothing is skipped.

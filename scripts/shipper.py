@@ -20,6 +20,8 @@ a file, never from the command line, and is never logged.
 """
 
 import argparse
+import collections
+import datetime
 import ipaddress
 import json
 import os
@@ -125,9 +127,117 @@ class TailedFile:
         return {"inode": self.inode, "offset": self.offset} if self.inode is not None else None
 
 
+class BurstGuard:
+    """Turn a flood from one client into one summary event instead of thousands of rows.
+
+    Web logs are the case this exists for: a scanner walking paths produces hundreds of lines from a
+    single address in seconds, and every one of them ends up as a stored event, as evidence on an
+    alert, and as work for correlation. Counting belongs on the agent, where it is cheap; the server
+    then receives one event that says what happened.
+
+    The rule: more than `threshold` lines from the same source address within `window` seconds is a
+    burst. Once a burst starts, its lines are swallowed (they are *not* sent) and one summary is
+    emitted when the burst goes quiet. The first `threshold` lines of a burst are sent normally — the
+    agent cannot know a flood is starting until it has seen it.
+
+    Kept pure (a clock in, no I/O) so the thresholds can be tested without a server.
+    """
+
+    def __init__(self, threshold=50, window=5.0, clock=time.monotonic, max_paths=200):
+        self.threshold = max(1, int(threshold))
+        self.window = max(0.1, float(window))
+        self.clock = clock
+        self.max_paths = max(1, int(max_paths))
+        self._recent = {}      # (source, ip) -> deque of sighting times within the window
+        self._bursts = {}      # (source, ip) -> {"count", "suppressed", "last", "paths"}
+        self.stats = {"bursts": 0, "suppressed": 0}
+
+    @staticmethod
+    def web_fields(line):
+        """(client address, request target) from an nginx/Apache combined line, else None.
+
+        Deliberately tolerant: anything that does not look like a combined access-log line returns
+        None and is passed through untouched, so a mixed-format file is never silently mangled.
+        """
+        text = line.decode("utf-8", "replace") if isinstance(line, bytes) else line
+        try:
+            address = text.split(" ", 1)[0]
+            if not address or address.count(".") != 3 and ":" not in address:
+                return None
+            quoted = text.split('"')
+            if len(quoted) < 2:
+                return None
+            parts = quoted[1].split()
+            if len(parts) < 2 or parts[0] not in ("GET", "POST", "HEAD", "PUT", "DELETE", "OPTIONS",
+                                                  "PATCH", "TRACE", "CONNECT"):
+                return None
+            return address, parts[1]
+        except (ValueError, IndexError):
+            return None
+
+    def filter(self, lines, fmt, source):
+        """Return the lines to send. Burst lines are counted here and dropped from the batch."""
+        if fmt not in ("weblog", "auto"):
+            return lines
+        kept = []
+        now = self.clock()
+        for line in lines:
+            fields = self.web_fields(line)
+            if fields is None:
+                kept.append(line)          # not a web line: never coalesce what we cannot read
+                continue
+            address, path = fields
+            key = (source, address)
+            burst = self._bursts.get(key)
+            if burst is not None:
+                burst["count"] += 1
+                burst["suppressed"] += 1
+                burst["last"] = now
+                if len(burst["paths"]) < self.max_paths:
+                    burst["paths"].add(path)
+                self.stats["suppressed"] += 1
+                continue
+            recent = self._recent.setdefault(key, collections.deque())
+            recent.append(now)
+            while recent and now - recent[0] > self.window:
+                recent.popleft()
+            if len(recent) > self.threshold:
+                # The flood threshold is crossed: this line and everything after it is summarised.
+                self._recent.pop(key, None)
+                self._bursts[key] = {"count": len(recent), "suppressed": 1, "last": now,
+                                     "paths": {path}}
+                self.stats["bursts"] += 1
+                self.stats["suppressed"] += 1
+                continue
+            kept.append(line)
+        return kept
+
+    def collect(self, now=None):
+        """Summaries for bursts that have gone quiet, as (source, address, summary) tuples."""
+        now = self.clock() if now is None else now
+        finished = [key for key, burst in self._bursts.items() if now - burst["last"] >= self.window]
+        summaries = []
+        for key in finished:
+            burst = self._bursts.pop(key)
+            source, address = key
+            paths = burst["paths"]
+            summaries.append((source, address, {
+                "ts": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                "source": source,
+                "src_ip": address,
+                "event_type": "web_scan",
+                "severity": "medium",
+                "message": (f"Rapid asset discovery: {burst['count']} requests to {len(paths)} "
+                            f"distinct paths in {self.window:g}s from {address} "
+                            f"({burst['suppressed']} line(s) suppressed by the agent)"),
+            }))
+        return summaries
+
+
 class Shipper:
     def __init__(self, url, token, files, state_path, batch_lines=500, batch_bytes=1024 * 1024,
-                 year=None, from_start=False, cafile=None, timeout=30, sleep=time.sleep):
+                 year=None, from_start=False, cafile=None, timeout=30, sleep=time.sleep,
+                 burst_threshold=50, burst_window=5.0):
         if urllib.parse.urlparse(url).scheme not in ("http", "https"):
             raise FatalError(f"url must be http(s), got {url!r}")  # urlopen would also take file:// and ftp://
         self.url, self.token = url.rstrip("/"), token
@@ -137,7 +247,9 @@ class Shipper:
         self.context = ssl.create_default_context(cafile=cafile) if url.startswith("https:") else None
         state = self._load_state()
         self.files = [TailedFile(path, fmt, source, state, from_start) for path, fmt, source in files]
-        self.stats = {"batches": 0, "lines": 0, "skipped_batches": 0, "retries": 0}
+        self.burst = BurstGuard(burst_threshold, burst_window) if burst_threshold > 0 else None
+        self.stats = {"batches": 0, "lines": 0, "skipped_batches": 0, "retries": 0, "summaries": 0,
+                      "suppressed": 0}
 
     def _load_state(self):
         try:
@@ -183,9 +295,67 @@ class Shipper:
             log(f"{tailed.path}: server refused a batch of {len(lines)} line(s) ({status}: {reason}); skipping it")
         return status
 
+    def post_summary(self, tailed, event):
+        """Send one coalesced burst summary through the JSON ingest endpoint.
+
+        One request per burst, not per line: the whole point is that the server sees a single event
+        saying "this address did rapid asset discovery" instead of hundreds of rows.
+        """
+        payload = json.dumps({"source": tailed.source, "events": [event]}).encode()
+        request = urllib.request.Request(
+            f"{self.url}/api/ingest", data=payload, method="POST",
+            headers={"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout, context=self.context) as resp:
+                resp.read()
+                return resp.status
+        except urllib.error.HTTPError as exc:
+            with exc:
+                exc.read()
+            return exc.code
+
+    def _tailed_for(self, source):
+        for tailed in self.files:
+            if tailed.source == source:
+                return tailed
+        return None
+
+    def _deliver_summary(self, tailed, address, event, attempts=3):
+        delay, problem = 1.0, None
+        for _ in range(attempts):
+            try:
+                status = self.post_summary(tailed, event)
+            except (OSError, ValueError) as exc:
+                status, problem = None, f"{type(exc).__name__}: {getattr(exc, 'reason', exc)}"
+            else:
+                problem = f"HTTP {status}"
+            if status in (201, 207):
+                self.stats["summaries"] += 1
+                log(f"{tailed.path}: burst summary accepted for {address}")
+                return True
+            if status in SKIP_STATUSES:
+                log(f"{tailed.path}: server refused a burst summary ({status}); dropping it")
+                return False
+            self.sleep(delay)
+            delay = min(delay * 2, 8)
+        log(f"{tailed.path}: burst summary for {address} not delivered ({problem})")
+        return False
+
+    def _flush_summaries(self):
+        """Send the summary for every burst that has gone quiet, then forget it."""
+        if not self.burst:
+            return
+        for source, address, event in self.burst.collect():
+            tailed = self._tailed_for(source)
+            if tailed is not None:
+                self._deliver_summary(tailed, address, event)
+        self.stats["suppressed"] = self.burst.stats["suppressed"]
+        self.stats["bursts"] = self.burst.stats["bursts"]
+
     def ship_once(self, max_retries=None):
         """Send everything currently available. Returns the number of lines sent or skipped."""
         total = 0
+        self._flush_summaries()
         for tailed in self.files:
             while True:
                 lines, end = tailed.read_lines(self.batch_lines, self.batch_bytes)
@@ -194,10 +364,16 @@ class Shipper:
                         tailed.commit(end)
                         self.save_state()
                     break
-                self._send_with_backoff(tailed, lines, max_retries)
+                if self.burst:
+                    lines = self.burst.filter(lines, tailed.fmt, tailed.source)
+                if lines:
+                    self._send_with_backoff(tailed, lines, max_retries)
+                    total += len(lines)
+                # The position advances even when every line was suppressed into a burst, otherwise
+                # the same lines would be re-read (and re-suppressed) forever.
                 tailed.commit(end)
                 self.save_state()
-                total += len(lines)
+        self._flush_summaries()
         return total
 
     def _send_with_backoff(self, tailed, lines, max_retries):
@@ -280,6 +456,11 @@ def main(argv=None):
     parser.add_argument("--token-file", help="file holding the token (mode 0600 recommended)")
     parser.add_argument("--interval", type=float, default=2.0, help="seconds between polls")
     parser.add_argument("--batch-lines", type=int, default=500)
+    parser.add_argument("--burst-threshold", type=int, default=50,
+                        help="web lines from one client within --burst-window before the rest are "
+                             "coalesced into one summary event (0 disables)")
+    parser.add_argument("--burst-window", type=float, default=5.0,
+                        help="seconds that define a burst (default: %(default)s)")
     parser.add_argument("--year", type=int, help="year for BSD syslog lines (default: server decides)")
     parser.add_argument("--from-start", action="store_true",
                         help="ship existing content of files seen for the first time (default: only new lines)")
@@ -294,11 +475,14 @@ def main(argv=None):
         token = read_token(args)
         files = [parse_file_spec(spec) for spec in args.file]
         shipper = Shipper(args.url, token, files, args.state, batch_lines=args.batch_lines, year=args.year,
-                          from_start=args.from_start, cafile=args.cafile)
+                          from_start=args.from_start, cafile=args.cafile,
+                          burst_threshold=args.burst_threshold, burst_window=args.burst_window)
         try:
             if args.once:
                 sent = shipper.ship_once(max_retries=args.max_retries)
-                log(f"done: {sent} line(s) processed, {shipper.stats['skipped_batches']} batch(es) skipped")
+                log(f"done: {sent} line(s) processed, {shipper.stats['skipped_batches']} batch(es) "
+                    f"skipped, {shipper.stats['suppressed']} line(s) suppressed across "
+                    f"{shipper.stats['bursts']} burst(s)")
                 return 0
             log(f"shipping {len(files)} file(s) to {args.url} every {args.interval}s")
             shipper.run(args.interval)

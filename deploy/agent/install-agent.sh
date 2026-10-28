@@ -68,7 +68,7 @@ usage() {
 # only "unknown option" sends people looking for a bug instead of at the env file.
 # --dry-run and --allow-insecure-http are deliberately absent: the installer handles both itself
 # (see --help), because a service cannot usefully run in the agent's dry-run mode.
-AGENT_VALUE_FLAGS="--batch-lines --max-batches-per-pass --interval --year --cafile --state \
+AGENT_VALUE_FLAGS="--batch-lines --burst-threshold --burst-window --max-batches-per-pass --interval --year --cafile --state \
 --source --hostname --source-prefix --token-env --max-retries"
 AGENT_BOOL_FLAGS="--from-start --once --list-sources --check"
 

@@ -390,6 +390,11 @@ def build_parser():
     parser.add_argument("--token-file", help="file holding the token (mode 0600 recommended)")
     parser.add_argument("--interval", type=float, default=2.0, help="seconds between polls")
     parser.add_argument("--batch-lines", type=int, default=500)
+    parser.add_argument("--burst-threshold", type=int, default=50,
+                        help="web lines from one client within --burst-window before the rest are "
+                             "coalesced into a single summary event (0 disables)")
+    parser.add_argument("--burst-window", type=float, default=5.0,
+                        help="seconds that define a burst (default: %(default)s)")
     parser.add_argument("--year", type=int, help="year for BSD syslog lines (default: the server decides)")
     parser.add_argument("--from-start", action="store_true",
                         help="ship existing content of files seen for the first time (default: new lines only)")
@@ -480,6 +485,7 @@ def main(argv=None):
 
         agent = AgentShipper(args.url, token, files, args.state, batch_lines=args.batch_lines,
                              year=args.year, from_start=args.from_start, cafile=args.cafile,
+                             burst_threshold=args.burst_threshold, burst_window=args.burst_window,
                              transforms=transforms)
         try:
             if args.once:
