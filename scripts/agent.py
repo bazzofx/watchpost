@@ -18,7 +18,7 @@ formats, and under which source name.
 `--url` is passed as an option (`--url URL`), not as a bare argument. It is required to ship and
 to run `--check`, and not needed for `--list-sources` or `--dry-run`, which only read this host.
 
-Sources (`--source`, default: auth, firewall, web, audit — see SOURCES):
+Sources (`--source`, default: auth, firewall, web, audit â€” see SOURCES):
 
     auth      /var/log/auth.log          SSH logins and failures, sudo/su, account creation
     firewall  /var/log/ufw.log           UFW/iptables denials and allows -> fw_deny / fw_allow
@@ -27,8 +27,8 @@ Sources (`--source`, default: auth, firewall, web, audit — see SOURCES):
     syslog    /var/log/syslog            everything else, as generic events (opt-in: see below)
 
 `web` takes every `*.log` under nginx/ and apache2/ (per-vhost files included) and skips rotated
-ones (`access.log.1`, `*.gz`). Each file gets its own source name — `access.log` keeps
-`<host>-web`, `error.log` becomes `<host>-web-error` — and its own server format: `weblog` for
+ones (`access.log.1`, `*.gz`). Each file gets its own source name â€” `access.log` keeps
+`<host>-web`, `error.log` becomes `<host>-web-error` â€” and its own server format: `weblog` for
 access logs, `nginx_error` for error logs, which are not in the combined access format.
 
 `syslog` is deliberately **not** part of `--source all`. On Ubuntu and Debian, rsyslog copies
@@ -194,7 +194,7 @@ def _source_name(source, path, host, log_dir):
     """A stable source name: <host>-<source>, or <host>-<source>-<file> for the extra files.
 
     Only a source that declares `primary` can produce more than one file, and only then do the
-    extra files get a suffix — so a single-file source such as `auth` keeps the plain
+    extra files get a suffix â€” so a single-file source such as `auth` keeps the plain
     `<host>-auth` name it has always had.
     """
     base = f"{sanitize_source(host)}-{source['name']}"
@@ -350,7 +350,7 @@ def list_sources(hostname, prefix="", log_dir=DEFAULT_LOG_DIR):
             description = source["description"] if index == 0 else ""
             print(f"  {name:<9} {path:<38} {_format_for(source, path):<12} {description}")
     print("\n  Default (--source all): " + ", ".join(DEFAULT_SOURCES))
-    print("  Opt-in only:             syslog  (overlaps auth/firewall — see the module docstring)")
+    print("  Opt-in only:             syslog  (overlaps auth/firewall â€” see the module docstring)")
     print("\n  Read access usually comes from the 'adm' group:")
     print("    sudo usermod -aG adm watchpost-agent")
 
