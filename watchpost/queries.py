@@ -7,7 +7,7 @@ import json
 import sqlite3
 from datetime import timedelta
 
-from . import archive
+from . import archive, geo
 from .db import audit, iso, now_iso, parse_iso, row_to_dict, transaction, utcnow
 from .normalize import EVENT_TYPES, SEVERITIES, EventError, parse_timestamp
 
@@ -479,6 +479,7 @@ def dashboard(conn):
         f"SELECT {EVENT_FIELDS} FROM events ORDER BY ts DESC, id DESC LIMIT 60")]
     return {
         "generated_at": now_iso(),
+        "hq": geo.hq(conn),
         "events_total": one("SELECT COUNT(*) FROM events"),
         "synthetic_events": one("SELECT COUNT(*) FROM events WHERE synthetic = 1"),
         "alerts_open": one("SELECT COUNT(*) FROM alerts WHERE status = 'open'"),

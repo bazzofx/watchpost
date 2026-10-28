@@ -215,14 +215,14 @@ class EntityUiTests(unittest.TestCase):
     """No JS runtime in CI: check that the entity links are built with encoded values."""
 
     def test_entity_links_encode_the_value(self):
-        app = (STATIC / "app.js").read_text()
+        app = (STATIC / "app.js").read_text(encoding="utf-8")
         self.assertIn("#entity/${kind}/${encodeURIComponent(value)}", app)
         self.assertIn("/api/entities/${kind}/${encodeURIComponent(value)}", app)
-        self.assertIn("entityLink(", (STATIC / "dashboard.js").read_text())
+        self.assertIn("entityLink(", (STATIC / "dashboard.js").read_text(encoding="utf-8"))
         # The kind comes from location.hash: it is checked before it reaches the API path ("#entity/../audit").
         self.assertIn('if (!Object.hasOwn(ENTITY_KINDS, kind)) throw new Error("Unknown entity kind");\n'
                       "  const e = await api(`/api/entities/${kind}/", app)
-        self.assertIn("#p-entities", (STATIC / "style.css").read_text())
+        self.assertIn("#p-entities", (STATIC / "style.css").read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

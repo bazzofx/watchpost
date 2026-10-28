@@ -328,7 +328,7 @@ class SampleFileTests(unittest.TestCase):
                     "linux_host.log": "privilege_escalation"}
         for name, event_type in expected.items():
             with self.subTest(sample=name):
-                events, rejections = parse_payload((samples / name).read_text(), "auto", "sample", year=2026, now=NOW)
+                events, rejections = parse_payload((samples / name).read_text(encoding="utf-8"), "auto", "sample", year=2026, now=NOW)
                 self.assertEqual(len(rejections), 1)
                 self.assertIn(event_type, {e["event_type"] for e in events})
 

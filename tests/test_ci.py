@@ -8,7 +8,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 class CiConfigurationTests(unittest.TestCase):
     def test_supported_python_matrix_and_required_checks(self):
-        workflow = (ROOT / ".github/workflows/tests.yml").read_text()
+        workflow = (ROOT / ".github/workflows/tests.yml").read_text(encoding="utf-8")
         self.assertIn('python: ["3.11", "3.12", "3.13", "3.14"]', workflow)
         self.assertNotIn('"3.10"', workflow)
         self.assertIn("permissions:\n  contents: read", workflow)
@@ -20,7 +20,7 @@ class CiConfigurationTests(unittest.TestCase):
         self.assertTrue(all(re.fullmatch(r"[0-9a-f]{40}", revision) for _, revision in actions), actions)
 
     def test_readme_has_the_live_workflow_badge(self):
-        readme = (ROOT / "README.md").read_text()
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
         badge = "https://github.com/talalkashar/watchpost/actions/workflows/tests.yml/badge.svg"
         target = "https://github.com/talalkashar/watchpost/actions/workflows/tests.yml"
         self.assertIn(f"[![tests]({badge})]({target})", readme)

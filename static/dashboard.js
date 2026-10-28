@@ -16,7 +16,11 @@ const TACTICS = [
   ["Lateral Movement", "Lateral"], ["Collection", "Collect"], ["Command and Control", "C2"],
   ["Exfiltration", "Exfil"], ["Impact", "Impact"],
 ];
-const HQ_DEFAULT = { city: "Watchpost HQ (internal)", lat: 39.1, lon: -94.6, internal: true, synthetic: true };
+// Fallback only: the server sends `hq` in the dashboard payload (Admin > Map location picks the
+// country). The centroid here matches watchpost/geo.py's DEFAULT_COUNTRY so the fallback is the same
+// place, not a second opinion.
+const HQ_DEFAULT = { city: "United States (HQ)", country: "US", name: "United States",
+                     lat: 39.83, lon: -98.58, internal: true, synthetic: true };
 const FEED_MAX = 140;
 const DASH_PANELS = ["p-map", "p-feed", "p-timeline", "p-attackers", "p-attack", "p-board", "p-rules", "p-health", "p-entities"];
 const DASH_LAYOUTS = {
@@ -341,7 +345,7 @@ const Dash = {
         el("div", { class: "mapwrap", id: "map" }),
         el("div", { class: "map-side", id: "map-side" }),
         el("div", { class: "map-legend" }, ...["critical", "high", "medium", "low"].map((s) => el("span", {}, el("i", { class: `dot sev-${s}` }), s)),
-          el("span", {}, el("i", { class: "dot hq" }), "HQ target"))),
+          el("span", {}, el("i", { class: "dot hq" }), el("span", { id: "hq-label" }, "HQ target")))),
       panel("p-feed", "Live event stream", [el("span", { class: "muted", id: "feed-rate" }), pause],
         el("div", { class: "feed-head" }, el("span", {}, "TIME"), el("span", {}, "SEV"), el("span", {}, "TYPE"), el("span", {}, "SOURCE → TARGET")),
         el("div", { class: "feed", id: "feed", onmouseenter: () => this.hover(true), onmouseleave: () => this.hover(false) })),
@@ -462,8 +466,9 @@ const Dash = {
 
   // --- map ---
   hq() {
-    const loc = Geo.get("10.0.0.10");
-    return loc || HQ_DEFAULT;
+    // The server owns the HQ position now: the country is a saved setting, and the dashboard payload
+    // carries its centroid. HQ_DEFAULT is only for a payload from an older build.
+    return (this.data && this.data.hq) || HQ_DEFAULT;
   },
   renderMap() {
     const box = $("#map");
@@ -520,8 +525,10 @@ const Dash = {
         (i < 7 ? `<text class="ml" x="${(x + r + 3).toFixed(1)}" y="${(y + 3).toFixed(1)}">${esc(c.city)}</text>` : "") + `</g>`;
     });
     const [hx, hy] = WPMap.project(hq.lon, hq.lat, w, h);
-    marks += `<g class="hq"><title>${esc(`${hq.city} (synthetic geo)`)}</title><circle class="ring" cx="${hx.toFixed(1)}" cy="${hy.toFixed(1)}" r="9"/>` +
+    marks += `<g class="hq"><title>${esc(`${hq.name || hq.city} — HQ target (synthetic geo)`)}</title><circle class="ring" cx="${hx.toFixed(1)}" cy="${hy.toFixed(1)}" r="9"/>` +
       `<circle class="core" cx="${hx.toFixed(1)}" cy="${hy.toFixed(1)}" r="3.6"/><text class="ml" x="${(hx + 8).toFixed(1)}" y="${(hy + 12).toFixed(1)}">HQ</text></g>`;
+    const hqLabel = $("#hq-label");
+    if (hqLabel) hqLabel.textContent = `HQ · ${hq.name || hq.city}`;
     setSvgChildren(svg.querySelector("g.arcs"), arcs);
     setSvgChildren(svg.querySelector("g.marks"), marks);
     $("#map-count").textContent = `${ranked.length} source locations · ${unknown.length} unknown`;

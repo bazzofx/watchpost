@@ -287,8 +287,8 @@ class HuntUiTests(unittest.TestCase):
 
     def test_hunt_view_is_linked_and_encoded(self):
         static = Path(__file__).resolve().parent.parent / "static"
-        app = (static / "app.js").read_text()
-        self.assertIn('<button data-view="hunt">', (static / "index.html").read_text())
+        app = (static / "app.js").read_text(encoding="utf-8")
+        self.assertIn('<button data-view="hunt">', (static / "index.html").read_text(encoding="utf-8"))
         self.assertIn("const huntHref = (q) => `#hunt/${encodeURIComponent(q)}`;", app)
         self.assertIn("hunt: () => huntView(huntQueryFromHash(", app)
         # Entity pages and the event detail pivot into a prefilled hunt; values with spaces or quotes are quoted.

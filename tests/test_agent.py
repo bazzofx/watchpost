@@ -558,7 +558,7 @@ BASH = shutil.which("bash") if os.name == "posix" else None
 @unittest.skipUnless(BASH, "needs a POSIX shell to run the installer's own command")
 class InstallerChildPayloadTests(unittest.TestCase):
     def payload(self, marker):
-        text = (ROOT / "deploy" / "agent" / "install-agent.sh").read_text()
+        text = (ROOT / "deploy" / "agent" / "install-agent.sh").read_text(encoding="utf-8")
         for found in re.findall(r"bash -c[^']*'([^']*)'", text, re.S):
             if marker in found:
                 return found

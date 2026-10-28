@@ -418,7 +418,7 @@ class IncidentApiTests(ServerTestCase):
             self.assertTrue(t["comment"].startswith(coverage[t["techniqueID"]]["level"].capitalize()))
         self.assertIn("firewall_port_sweep", {t["techniqueID"]: t for t in layer["techniques"]}["T1046"]["comment"])
         self.assertEqual(layer["gradient"]["maxValue"], max(t["hits"] for t in coverage.values()))
-        self.assertIn('href: "/api/attack/navigator.json"', (STATIC_DIR / "dashboard.js").read_text())
+        self.assertIn('href: "/api/attack/navigator.json"', (STATIC_DIR / "dashboard.js").read_text(encoding="utf-8"))
 
     def test_existing_database_upgrades_in_place(self):
         # A 1.0 database: no techniques column, no new event columns, no incidents tables.

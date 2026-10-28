@@ -340,7 +340,7 @@ class ShipperTests(unittest.TestCase):
         self.assertEqual(request["query"], {"format": "authlog", "source": "box-auth"})
         self.assertEqual(request["auth"], f"Bearer {self.TOKEN}")
         self.assertEqual(request["body"], b"line 1\nline 2\nline 3\n")
-        saved = json.loads(self.state.read_text())[str(self.log)]
+        saved = json.loads(self.state.read_text(encoding="utf-8"))[str(self.log)]
         self.assertEqual(saved, {"inode": os.stat(self.log).st_ino, "offset": len(b"line 1\nline 2\n\nline 3\n")})
 
         self.append(" done\nline 4\n")
@@ -423,7 +423,7 @@ class ShipperTests(unittest.TestCase):
 
         first = self.multi(fake, files, batch_lines=5, from_start=True, max_batches_per_pass=1)
         first.ship_once()
-        saved = json.loads(self.state.read_text())
+        saved = json.loads(self.state.read_text(encoding="utf-8"))
         self.assertIn(shipper.CURSOR_KEY, saved, "a capped pass must record whose turn is next")
         self.assertTrue(saved[shipper.CURSOR_KEY].endswith("b.log"))
 
@@ -438,7 +438,7 @@ class ShipperTests(unittest.TestCase):
         (self.dir / "a.log").write_text("a\n")
         tail = self.multi(fake, [("a.log", "box-a")], batch_lines=5, from_start=True)
         tail.ship_once()
-        self.assertNotIn(shipper.CURSOR_KEY, json.loads(self.state.read_text()))
+        self.assertNotIn(shipper.CURSOR_KEY, json.loads(self.state.read_text(encoding="utf-8")))
 
     def test_batches_respect_line_limit(self):
         fake = self.fake()
@@ -490,7 +490,7 @@ class ShipperTests(unittest.TestCase):
         self.append("new 1\n")
         tail.ship_once()
         self.assertEqual(b"".join(r["body"] for r in fake.requests), b"old 1\nold 2\nold 3\nnew 1\n")
-        self.assertEqual(json.loads(self.state.read_text())[str(self.log)]["inode"], os.stat(self.log).st_ino)
+        self.assertEqual(json.loads(self.state.read_text(encoding="utf-8"))[str(self.log)]["inode"], os.stat(self.log).st_ino)
 
     def test_handles_truncation_in_place(self):
         fake = self.fake()
@@ -502,7 +502,7 @@ class ShipperTests(unittest.TestCase):
         self.append("after\n")
         tail.ship_once()
         self.assertEqual([r["body"] for r in fake.requests], [b"first line that is long\n", b"after\n"])
-        self.assertEqual(json.loads(self.state.read_text())[str(self.log)]["offset"], 6)
+        self.assertEqual(json.loads(self.state.read_text(encoding="utf-8"))[str(self.log)]["offset"], 6)
 
     def test_new_file_starts_at_end_unless_from_start(self):
         fake = self.fake()
@@ -561,7 +561,7 @@ class ShipperEndToEndTests(ServerTestCase):
         status, data, _ = self.client("analyst").get("/api/events?source=web01-auth")
         self.assertEqual(data["total"], 2)
         self.assertEqual({e["event_type"] for e in data["events"]}, {"auth_failure", "auth_success"})
-        self.assertEqual(json.loads(state.read_text())[str(log_path)]["offset"], log_path.stat().st_size)
+        self.assertEqual(json.loads(state.read_text(encoding="utf-8"))[str(log_path)]["offset"], log_path.stat().st_size)
 
     def test_shipper_cli_delivers_nginx_access_log_as_web_events(self):
         admin = self.client("admin")

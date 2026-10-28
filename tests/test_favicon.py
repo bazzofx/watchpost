@@ -7,7 +7,7 @@ STATIC = Path(__file__).resolve().parent.parent / "static"
 
 class FaviconTests(unittest.TestCase):
     def test_every_icon_the_page_links_exists(self):
-        html = (STATIC / "index.html").read_text()
+        html = (STATIC / "index.html").read_text(encoding="utf-8")
         icons = re.findall(r'<link rel="(?:icon|apple-touch-icon)" href="/([^"]+)"', html)
         self.assertIn("favicon.ico", icons)
         for name in icons:

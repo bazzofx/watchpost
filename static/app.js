@@ -1717,9 +1717,9 @@ async function health() {
 // ---------- admin ----------
 async function admin() {
   if (!can("admin")) return render(el("p", {}, "Admins only."));
-  const [tokens, audit, inventory, chain, sessions, logData] = await Promise.all([
+  const [tokens, audit, inventory, chain, sessions, logData, hqSettings] = await Promise.all([
     api("/api/tokens"), api("/api/audit"), api("/api/assets"), api("/api/audit/verify"), api("/api/sessions"),
-    api("/api/admin/log-data")]);
+    api("/api/admin/log-data"), api("/api/settings/hq")]);
   const tokenOut = el("div");
   const tokenForm = el("form", { class: "row" },
     el("label", {}, "Token name", el("input", { name: "name", required: true, maxlength: 64, placeholder: "e.g. web01-forwarder" })),
@@ -1759,8 +1759,32 @@ async function admin() {
   });
   const demoOut = el("div");
   let inventoryCard = assetsCard(inventory);
+  // Map location: the attack map draws one HQ marker and arcs every attacker to it. This is where it
+  // sits. Cosmetic, so it saves directly (a rule threshold goes through a reviewed change request)
+  // and is audited like any other admin action.
+  const hqForm = el("form", { class: "row" },
+    el("label", {}, "HQ country",
+      el("select", { name: "country" },
+        ...hqSettings.countries.map((c) => el("option", { value: c.code }, c.name)))),
+    el("button", { type: "submit" }, "Save"));
+  hqForm.elements.country.value = hqSettings.current.country;
+  hqForm.addEventListener("submit", (ev) => {
+    ev.preventDefault();
+    const country = new FormData(hqForm).get("country");
+    guarded(async () => {
+      const saved = await api("/api/settings/hq", { method: "POST", body: { country } });
+      toast(`Map HQ moved to ${saved.current.name}`);
+      admin();
+    });
+  });
+  const hqCard = el("div", { class: "card", id: "hq-card" },
+    el("h2", {}, "Map location"),
+    el("p", { class: "muted" }, "Where the dashboard's attack map puts its HQ marker, and where every attack arc points. Country centroids only — no geolocation service is contacted."),
+    hqForm,
+    el("p", { class: "muted" }, "Now: ", el("strong", {}, hqSettings.current.name || hqSettings.current.city)));
   render(
     el("h1", {}, "Administration"),
+    hqCard,
     el("div", { class: "card" }, el("h2", {}, "Demo data"),
       el("p", {}, "Loads the labeled synthetic dataset: normal office activity, brute force, password spraying, a compromised account, an off-hours root login, and a noisy but authorized internal scanner. Events are dated on the most recent weekday, tagged ", el("code", {}, "demo:*"), ", and marked synthetic everywhere in the UI."),
       el("button", { onclick: () => guarded(async () => {

@@ -216,7 +216,7 @@ class CompileTests(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 1.0)
 
     def test_example_rule_compiles(self):
-        c = sigma.compile_rule(EXAMPLE.read_text())
+        c = sigma.compile_rule(EXAMPLE.read_text(encoding="utf-8"))
         self.assertEqual(c["rule_id"], "sigma_failed_admin_login_from_external_source")
         self.assertEqual([t["id"] for t in c["techniques"]], ["T1110.001"])
         self.assertTrue(sigma.matches(c["params"], {"event_type": "auth_failure", "user": "root", "src_ip": "203.0.113.5"}))
@@ -368,7 +368,7 @@ class ImportWorkflowTests(ServerTestCase):
         sample = {"malicious": [{"event_type": "auth_failure", "user": "root", "src_ip": "203.0.113.5"}],
                   "benign": [{"event_type": "auth_failure", "user": "root", "src_ip": "10.0.0.8"},
                              {"event_type": "auth_failure", "user": "alice", "src_ip": "203.0.113.5"}]}
-        status, change, _ = self.import_rule(analyst, EXAMPLE.read_text(), sample)
+        status, change, _ = self.import_rule(analyst, EXAMPLE.read_text(encoding="utf-8"), sample)
         self.assertEqual(status, 201, change)
         self.assertTrue(change["evaluation"]["sample"]["passes"])
         self.approve(admin, change)

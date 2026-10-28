@@ -221,7 +221,7 @@ class AssetApiTests(ServerTestCase):
 
     def test_admin_page_redraws_the_inventory_after_a_demo_load(self):
         # No JS runtime in CI: the demo-load handler must refetch the inventory and swap the card in place.
-        app = (Path(__file__).resolve().parent.parent / "static" / "app.js").read_text()
+        app = (Path(__file__).resolve().parent.parent / "static" / "app.js").read_text(encoding="utf-8")
         handler = app[app.index('api("/api/demo/load"'):app.index('"Load synthetic demo data"')]
         self.assertIn('assetsCard(await api("/api/assets"))', handler)
         self.assertIn("inventoryCard.replaceWith(", handler)
@@ -487,7 +487,7 @@ class AssetReviewApiTests(ServerTestCase):
 
     def test_ui_offers_review_for_gated_edits(self):
         # No JS runtime in CI: the asset card shows pending proposals and the dialog falls back to proposing.
-        app = (Path(__file__).resolve().parent.parent / "static" / "app.js").read_text()
+        app = (Path(__file__).resolve().parent.parent / "static" / "app.js").read_text(encoding="utf-8")
         card = app[app.index("function assetsCard("):app.index("function storyCard(")]
         self.assertIn("pending review", card)
         self.assertIn("review_required", card)

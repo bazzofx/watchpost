@@ -355,5 +355,5 @@ class NestedChildrenTests(unittest.TestCase):
         # el() flattens one level, so `.map(x => [el(...), " "])` renders "[object HTMLSpanElement]"; use flatMap.
         import re
         from pathlib import Path
-        app = (Path(__file__).resolve().parent.parent / "static" / "app.js").read_text()
+        app = (Path(__file__).resolve().parent.parent / "static" / "app.js").read_text(encoding="utf-8")
         self.assertEqual(re.findall(r"\.map\(\([^)]*\) => \[el\(", app), [])

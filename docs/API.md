@@ -267,6 +267,8 @@ Asset fields: `id`, `name`, `kind` (`server`, `workstation`, `network`, `cloud`,
 | `GET /api/noise-lab` | viewer | Each rule against the labeled scenarios and its benign look-alikes: recall, precision, tp/fn/fp, look-alikes tested and fired, and a `verdict` (`quiet`, `noisy`, `blind`, `untested`, `disabled`) |
 | `GET /api/settings` | viewer | Security settings with allowed ranges |
 | `POST /api/settings/{key}/proposals` | admin | `{value, reason}` |
+| `GET /api/settings/hq` | viewer | The map's HQ country — `current: {country, name, city, lat, lon}` — and every selectable `countries: [{code, name}]` |
+| `POST /api/settings/hq` | admin | `{country}` moves the dashboard's HQ marker. Unknown code → `400`; audited as `hq_country_changed` |
 | `GET /api/changes?status=pending` | viewer | Change requests |
 | `POST /api/changes/{id}/review` | admin | `{decision: approve\|reject, note, evidence_digest?, acknowledge_detection_loss?}`. Approval must send the `evidence_digest` of the evidence the reviewer was shown; if the evidence changed, nothing is applied and the answer is 409. A rule change that loses a labeled detection also needs `acknowledge_detection_loss: true`. Self-review → 403; already reviewed → 409 |
 | `GET /api/evaluations` / `POST /api/evaluations` | viewer / analyst | Evaluation history / run one now |

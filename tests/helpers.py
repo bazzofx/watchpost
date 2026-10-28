@@ -39,7 +39,7 @@ def cleanup_tempdir(tmp, attempts=5, delay=0.05):
 def read_text(path):
     """Read a repository file as UTF-8, whatever the platform's default encoding is.
 
-    The static assets and docs contain non-ASCII characters; on Windows `Path.read_text()` defaults
+    The static assets and docs contain non-ASCII characters; on Windows `Path.read_text(encoding="utf-8")` defaults
     to cp1252 and raises UnicodeDecodeError, which has nothing to do with what the test is checking.
     """
     with open(path, encoding="utf-8") as handle:

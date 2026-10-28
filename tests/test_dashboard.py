@@ -271,7 +271,7 @@ class StaticAssetTests(unittest.TestCase):
     """No JS runtime in CI, so check the browser code's shape and CSP hygiene from Python."""
 
     def read(self, name):
-        return (STATIC / name).read_text()
+        return (STATIC / name).read_text(encoding="utf-8")
 
     def exported(self, name, namespace):
         match = re.search(namespace + r"\s*=\s*Object\.freeze\(\{([^}]*)\}\)", self.read(name))
@@ -304,7 +304,7 @@ class StaticAssetTests(unittest.TestCase):
 
     def test_js_never_uses_html_injection_or_eval(self):
         for path in STATIC.glob("*.js"):
-            text = path.read_text()
+            text = path.read_text(encoding="utf-8")
             for bad in (".innerHTML", ".outerHTML", "insertAdjacentHTML", "document.write", "eval(", "new Function"):
                 with self.subTest(file=path.name, pattern=bad):
                     self.assertNotIn(bad, text)

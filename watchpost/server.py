@@ -937,6 +937,32 @@ def settings(req):
     return improve.list_settings(req.conn)
 
 
+@route("GET", "/api/settings/hq")
+def hq_settings(req):
+    """The map's HQ country and every country it can be moved to."""
+    return {"current": geo.hq(req.conn), "countries": geo.country_list()}
+
+
+@route("POST", "/api/settings/hq", role="admin")
+def hq_set(req):
+    """Move the HQ marker to a country.
+
+    Cosmetic, so it is a direct admin action rather than a two-person change request like a rule
+    threshold: nothing about detection depends on where the marker sits. It is still audited, because
+    "who changed what" should not depend on whether the change was security-relevant.
+    """
+    code = str(body_json(req).get("country") or "").strip().upper()
+    if code not in geo.COUNTRIES:
+        raise ApiError(400, "country must be one of: " + ", ".join(sorted(geo.COUNTRIES)))
+    req.conn.execute(
+        "INSERT INTO settings(key, value, updated_at, updated_by) VALUES (?,?,?,?)"
+        " ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at,"
+        " updated_by = excluded.updated_by",
+        (geo.HQ_SETTING, code, now_iso(), req.user["username"]))
+    audit(req.conn, req.user["username"], "hq_country_changed", code, {"country": code})
+    return {"current": geo.hq(req.conn), "countries": geo.country_list()}
+
+
 @route("POST", r"/api/settings/([a-z_]+)/proposals", role="admin")
 def setting_propose(req, key):
     data = body_json(req)
