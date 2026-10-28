@@ -56,6 +56,54 @@ only the inserts and updates. Two resilience changes came with it:
 | Stage counts | `GET /api/pipeline` |
 | The lock error itself | **`error_log` will often be empty during a lock storm**, because recording an error also needs the write lock. The log file is the reliable record. |
 
+## The second flaw: evidence grew without bound
+
+Every detection run links the events a rule matched to the alert as evidence. A rule that keeps
+matching — a scanner, a brute force, a burst — linked **every** matching event, forever. Correlation
+then reads all of an alert's evidence on every ingest, so each run was slower than the last, each
+ingest queued longer behind it, and eventually nothing could get the write lock. The tell is a
+detection run whose `events_scanned` climbs batch after batch and whose gap to the next run grows:
+18 s, 23 s, 28 s, 35 s, 43 s, 54 s.
+
+Measured, 15 batches of 500 alerting events against one long-lived alert:
+
+| Evidence cap | Evidence rows | Correlation, first 3 batches | last 3 batches | Growth |
+|---|---|---|---|---|
+| uncapped (old) | 7,500 | 0.010 s | 0.075 s | **×7.5** |
+| 500 (new default) | 500 | 0.005 s | 0.005 s | ×1.0 |
+| 100 | 100 | 0.003 s | 0.002 s | ×0.7 |
+
+`SIEM_ALERT_EVIDENCE_MAX` (default 500) now bounds it. The first N matches stay linked; the overflow is
+recorded as an `evidence_capped` activity entry, so the alert says how many it did not link instead of
+silently under-reporting.
+
+## The third: ingest no longer queues behind detection
+
+Detection has a process-wide lock, and ingest used to block on it. A 50-second run therefore parked
+every incoming request until each one hit its `busy_timeout`. Ingest now tries the lock **without
+blocking**: if a run is in progress the batch is stored, its `detection_status` becomes `deferred`,
+and the next run widens its window back to the earliest deferred event so nothing is left undetected
+(the batch becomes `recovered`). The ingest response says `detection.status: "deferred"`.
+
+## Coalescing rapid, repetitive rows (opt-in)
+
+The decision a burst deserves is usually one alert, not one row per request. After detection has run
+over the whole batch, `SIEM_BURST_KEEP` limits how many stored rows survive per
+`(source, src_ip, event_type)` in that batch:
+
+```
+SIEM_BURST_KEEP=50                      # 0 (default) = off
+SIEM_BURST_TYPES=web_request,fw_allow   # which event types may be reduced
+```
+
+Properties worth knowing:
+
+- **detection has already seen the whole batch** when this runs, so no rule misses the burst;
+- **evidence is never removed** — only rows with no `alert_events` reference;
+- only the listed event types are touched; auth failures and probes stay as they are;
+- it is a trade, which is why it is off by default: anything that later reads *stored* events — a
+  rule's history window, an analyst scrolling the list — will see fewer of them.
+
 ## What to do when it happens
 
 1. **One instance per database file.** Two processes against one file always contend and no timeout

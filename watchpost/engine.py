@@ -1,6 +1,7 @@
 """Ingestion and detection orchestration against the database."""
 
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -29,6 +30,22 @@ RULE_EVENT_FIELDS = ("id, ts, event_type, user, src_ip, host, dest_ip, dest_port
 # SQLite caps bound parameters (999 on older builds, 32766 on modern ones). Any query built from an
 # unbounded list of ids must be chunked or it fails at scale — see _count_present.
 IN_CHUNK = 900
+
+# How many evidence rows one alert may accumulate. A rule that keeps matching (a scanner, a brute
+# force, a burst) otherwise links every matching event forever; correlation then reads all of them on
+# every ingest, which is what made each detection run slower than the last until ingest failed on the
+# write lock. Bounded evidence keeps the cost flat; the overflow is counted, not silently lost.
+EVIDENCE_MAX = int(os.environ.get("SIEM_ALERT_EVIDENCE_MAX", "500"))
+
+# Burst coalescing (off by default). A scanner walking paths, or a burst of identical allowed flows,
+# arrives as hundreds of rows that differ only by path; they cost storage and future scan time without
+# changing a decision — the alert *is* the summary. With SIEM_BURST_KEEP set, at most that many stored
+# rows survive per (source, src_ip, event_type) within one batch. Events already linked as evidence
+# are never removed, and only the event types listed in SIEM_BURST_TYPES are touched.
+BURST_KEEP = int(os.environ.get("SIEM_BURST_KEEP", "0"))
+BURST_TYPES = tuple(part.strip() for part in
+                    os.environ.get("SIEM_BURST_TYPES", "web_request,fw_allow,other,cloud_api_call")
+                    .split(",") if part.strip())
 # Fields detection rules can read.
 #
 # `http_status` was added for the OWASP web rules, which need the response code as a field rather
@@ -136,6 +153,37 @@ def store_batch(conn, events, rejections, source, fmt, submitted_by, synthetic=F
     return batch_id
 
 
+def coalesce_batch(conn, batch_id, keep=None, event_types=None):
+    """Keep at most `keep` stored rows per (source, src_ip, event_type) for one batch.
+
+    Detection has already run over the whole batch by the time this is called, so the decision has
+    been made; what is dropped are the redundant rows behind that decision. Evidence already linked to
+    an alert is never touched. Returns how many rows were removed.
+
+    Off unless SIEM_BURST_KEEP is set, because it is a trade: anything that later reads *stored*
+    events (a rule's history window, an analyst scrolling the list) sees fewer of them.
+    """
+    keep = BURST_KEEP if keep is None else keep
+    if keep <= 0:
+        return 0
+    types = event_types or BURST_TYPES
+    if not types:
+        return 0
+    placeholders = ",".join("?" for _ in types)
+    try:
+        cur = conn.execute(
+            "DELETE FROM events WHERE id IN ("
+            " SELECT id FROM ("
+            "  SELECT id, ROW_NUMBER() OVER (PARTITION BY source, src_ip, event_type ORDER BY id) AS rn"
+            f"  FROM events WHERE batch_id = ? AND event_type IN ({placeholders})"
+            " ) WHERE rn > ?"
+            ") AND id NOT IN (SELECT event_id FROM alert_events)",
+            (batch_id, *types, keep))
+    except sqlite3.OperationalError:
+        return 0      # a SQLite without window functions: leave the rows alone
+    return max(cur.rowcount, 0)
+
+
 def ingest(conn, events, rejections, source, fmt, submitted_by, synthetic=False, batch_id=None):
     """Store a batch, then detect over it. With a batch_id, a replay changes nothing.
 
@@ -174,8 +222,24 @@ def ingest(conn, events, rejections, source, fmt, submitted_by, synthetic=False,
     # Scan the time range touched by this batch, widened by the longest rule window.
     start = min(e["ts"] for e in events)
     end = max(e["ts"] for e in events)
-    run = run_detection(conn, trigger=f"ingest:{batch_id[:8]}", start=start, end=end)
+    # If an earlier batch had to defer detection, start from its earliest event so nothing is left
+    # undetected when this run does get the lock.
+    deferred_from = conn.execute(
+        "SELECT MIN(e.ts) FROM events e JOIN ingest_batches b ON e.batch_id = b.id"
+        " WHERE b.detection_status = 'deferred'").fetchone()[0]
+    if deferred_from and deferred_from < start:
+        start = deferred_from
+    run = run_detection(conn, trigger=f"ingest:{batch_id[:8]}", start=start, end=end, blocking=False)
     conn.execute("UPDATE ingest_batches SET detection_status = ? WHERE id = ?", (run["status"], batch_id))
+    if run["status"] == "ok" and deferred_from:
+        # This run started at the earliest deferred event, so those batches are covered now.
+        conn.execute("UPDATE ingest_batches SET detection_status = 'recovered'"
+                     " WHERE detection_status = 'deferred' AND created_at <= ?", (now_iso(),))
+    if run["status"] == "ok":
+        # Detection has already seen the whole batch; now drop the redundant rows behind its decision.
+        removed = coalesce_batch(conn, batch_id)
+        if removed:
+            result["coalesced"] = removed
     result["detection"] = run
     return result
 
@@ -249,10 +313,26 @@ def _apply_finding(conn, rule, finding, synthetic, assets_idx):
     window = rule["params"].get("window_seconds", 3600)
     existing = _existing_alert(conn, rule["id"], finding["group_key"], finding["first_seen"], window)
     if existing:
-        conn.executemany("INSERT OR IGNORE INTO alert_events(alert_id, event_id) VALUES (?,?)",
-                         [(existing["id"], i) for i in ids])
+        linked = conn.execute("SELECT COUNT(*) FROM alert_events WHERE alert_id = ?",
+                              (existing["id"],)).fetchone()[0]
+        # Bounded evidence. A rule that keeps matching (a scanner, a brute force) used to link every
+        # matching event forever: the alert grew without limit, correlation then had to read all of it
+        # on every run, and each run got slower until ingest started failing on the write lock. The
+        # first EVIDENCE_MAX are kept, the rest are counted in an activity entry.
+        kept = ids[:max(0, EVIDENCE_MAX - linked)]
+        if kept:
+            conn.executemany("INSERT OR IGNORE INTO alert_events(alert_id, event_id) VALUES (?,?)",
+                             [(existing["id"], i) for i in kept])
         count = conn.execute("SELECT COUNT(*) FROM alert_events WHERE alert_id = ?",
                              (existing["id"],)).fetchone()[0]
+        dropped = len(ids) - len(kept)
+        if dropped:
+            conn.execute(
+                "INSERT INTO alert_activity(alert_id, actor, action, detail, created_at) VALUES (?,?,?,?,?)",
+                (existing["id"], "detection", "evidence_capped",
+                 f"{dropped} further matching event(s) not linked; an alert keeps at most "
+                 f"{EVIDENCE_MAX} evidence rows (SIEM_ALERT_EVIDENCE_MAX)", now),
+            )
         weighed = _weigh(conn, rule, existing["id"], assets_idx)
         conn.execute(
             "UPDATE alerts SET last_seen = MAX(last_seen, ?), first_seen = MIN(first_seen, ?),"
@@ -283,8 +363,16 @@ def _apply_finding(conn, rule, finding, synthetic, assets_idx):
          int(synthetic), now, now),
     )
     alert_id = cur.lastrowid
+    kept = ids[:EVIDENCE_MAX]
     conn.executemany("INSERT OR IGNORE INTO alert_events(alert_id, event_id) VALUES (?,?)",
-                     [(alert_id, i) for i in ids])
+                     [(alert_id, i) for i in kept])
+    if len(ids) > len(kept):
+        conn.execute(
+            "INSERT INTO alert_activity(alert_id, actor, action, detail, created_at) VALUES (?,?,?,?,?)",
+            (alert_id, "detection", "evidence_capped",
+             f"{len(ids) - len(kept)} matching event(s) not linked; an alert keeps at most "
+             f"{EVIDENCE_MAX} evidence rows (SIEM_ALERT_EVIDENCE_MAX)", now),
+        )
     conn.execute(
         "INSERT INTO alert_activity(alert_id, actor, action, detail, created_at) VALUES (?,?,?,?,?)",
         (alert_id, "detection", "created", f"rule {rule['id']} v{rule['version']}", now),
@@ -372,7 +460,7 @@ def rule_findings(rule, events, history_events, scan_start, suppressed, suppress
     return findings, skipped
 
 
-def run_detection(conn, trigger="manual", start=None, end=None):
+def run_detection(conn, trigger="manual", start=None, end=None, blocking=True):
     """Run all enabled rules over a time range (default: all events).
 
     Rules are evaluated *before* any write transaction is opened. They are pure Python over
@@ -380,9 +468,18 @@ def run_detection(conn, trigger="manual", start=None, end=None):
     what makes unrelated requests fail with "database is locked"; the lock is now held only for the
     inserts that follow.
 
+    `blocking=False` is the ingest path: if a run is already in progress the batch is **not** queued
+    behind it (a slow run used to make every ingest wait and then fail on the write lock). The events
+    are stored, the run is reported as `deferred`, and the next run widens its window to cover them.
+
     Failures are recorded in detection_runs and error_log and returned honestly;
     the ingested events stay stored so the run can be retried.
     """
+    if not blocking and detection_lock.locked():
+        return {"status": "deferred", "events_scanned": 0, "alerts_created": 0, "alerts_updated": 0,
+                "alerts_suppressed": 0,
+                "reason": "a detection run is already in progress; this range is covered by the "
+                          "next run"}
     with detection_lock:
         started = now_iso()
         run_id = conn.execute(

@@ -6,6 +6,7 @@ in a partition — including when the partition write fails or is incomplete.
 """
 
 import sqlite3
+import threading
 import unittest
 from unittest import mock
 
@@ -203,6 +204,141 @@ class LockErrorHandlingTests(unittest.TestCase):
         self.assertIn("correlation_seconds", result["detection"])
         self.assertGreaterEqual(result["detection"]["correlation_seconds"], 0.0)
         conn.close()
+
+
+class EvidenceCapTests(unittest.TestCase):
+    """A rule that keeps matching must not make its alert — and correlation — grow forever."""
+
+    def setUp(self):
+        self.conn = connect(":memory:")
+        init_schema(self.conn)
+        engine.seed_rules(self.conn)
+
+    def tearDown(self):
+        self.conn.close()
+
+    def failures(self, n=12, offset=0):
+        return [{"ts": "2026-10-03T%02d:%02d:%02d.000Z" % ((offset // 3600) % 24, (offset // 60) % 60,
+                                                           (offset + i) % 60),
+                 "source": "auth", "event_type": "auth_failure", "severity": "medium",
+                 "user": "admin", "src_ip": "203.0.113.9", "message": f"fail {i}"} for i in range(n)]
+
+    def test_evidence_per_alert_is_capped_and_the_overflow_is_recorded(self):
+        with mock.patch.object(engine, "EVIDENCE_MAX", 3):
+            engine.ingest(self.conn, self.failures(12), [], "auth", "json", "t")
+            engine.ingest(self.conn, self.failures(12, offset=60), [], "auth", "json", "t")
+        worst = self.conn.execute(
+            "SELECT MAX(linked) FROM (SELECT COUNT(*) AS linked FROM alert_events GROUP BY alert_id)"
+        ).fetchone()[0]
+        self.assertLessEqual(worst, 3, "evidence must stay bounded per alert")
+        capped = self.conn.execute(
+            "SELECT COUNT(*) FROM alert_activity WHERE action = 'evidence_capped'").fetchone()[0]
+        self.assertGreater(capped, 0, "the overflow must be recorded, not silently dropped")
+
+    def test_correlation_cost_no_longer_grows_with_matches(self):
+        with mock.patch.object(engine, "EVIDENCE_MAX", 5):
+            for offset in range(0, 600, 60):
+                engine.ingest(self.conn, self.failures(12, offset=offset), [], "auth", "json", "t")
+        total = self.conn.execute("SELECT COUNT(*) FROM alert_events").fetchone()[0]
+        alerts = self.conn.execute("SELECT COUNT(*) FROM alerts").fetchone()[0]
+        self.assertLessEqual(total, 5 * alerts, "evidence must stay proportional to alerts, not events")
+
+
+class DeferredDetectionTests(unittest.TestCase):
+    """Ingest must never queue behind a slow detection run — that is what produced the lock storm."""
+
+    def setUp(self):
+        self.conn = connect(":memory:")
+        init_schema(self.conn)
+        engine.seed_rules(self.conn)
+
+    def tearDown(self):
+        self.conn.close()
+
+    def batch(self, offset):
+        return [{"ts": "2026-10-03T10:%02d:%02d.000Z" % ((offset // 60) % 60, (offset + i) % 60),
+                 "source": "auth", "event_type": "auth_failure", "severity": "medium",
+                 "user": "admin", "src_ip": "203.0.113.9", "message": "fail"} for i in range(12)]
+
+    def test_ingest_defers_instead_of_waiting_when_a_run_is_in_progress(self):
+        busy = threading.Lock()
+        busy.acquire()                      # a detection run is in progress
+        with mock.patch.object(engine, "detection_lock", busy):
+            result = engine.ingest(self.conn, self.batch(0), [], "auth", "json", "t")
+        self.assertEqual(result["detection"]["status"], "deferred")
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM events").fetchone()[0], 12,
+                         "the events must still be stored")
+        status = self.conn.execute(
+            "SELECT detection_status FROM ingest_batches ORDER BY id DESC LIMIT 1").fetchone()[0]
+        self.assertEqual(status, "deferred")
+
+    def test_the_next_run_covers_the_deferred_range(self):
+        busy = threading.Lock()
+        busy.acquire()
+        with mock.patch.object(engine, "detection_lock", busy):
+            engine.ingest(self.conn, self.batch(0), [], "auth", "json", "t")
+        busy.release()
+        result = engine.ingest(self.conn, self.batch(30), [], "auth", "json", "t")
+        self.assertEqual(result["detection"]["status"], "ok")
+        statuses = [r[0] for r in self.conn.execute(
+            "SELECT detection_status FROM ingest_batches ORDER BY id")]
+        self.assertIn("recovered", statuses, "the deferred batch must be marked covered")
+        self.assertGreater(self.conn.execute("SELECT COUNT(*) FROM alerts").fetchone()[0], 0,
+                           "detection must actually have run over the stored events")
+
+
+class BurstCoalescingTests(unittest.TestCase):
+    """Rapid, repetitive rows are stored once per bucket — after detection, never through evidence."""
+
+    def setUp(self):
+        self.conn = connect(":memory:")
+        init_schema(self.conn)
+        engine.seed_rules(self.conn)
+
+    def tearDown(self):
+        self.conn.close()
+
+    def web(self, n, ip="198.51.100.7"):
+        return [{"ts": "2026-10-03T10:00:%02d.000Z" % i, "source": "web01-web",
+                 "event_type": "web_request", "severity": "low", "src_ip": ip,
+                 "message": f"GET /path/{i} 404"} for i in range(n)]
+
+    def test_off_by_default(self):
+        engine.ingest(self.conn, self.web(10), [], "web", "json", "t")
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM events").fetchone()[0], 10)
+
+    def test_repetitive_rows_are_reduced_to_the_keep_limit(self):
+        with mock.patch.object(engine, "BURST_KEEP", 3):
+            result = engine.ingest(self.conn, self.web(10), [], "web", "json", "t")
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM events").fetchone()[0], 3)
+        self.assertEqual(result["coalesced"], 7)
+
+    def test_evidence_is_never_removed(self):
+        # Twelve failures trip a rule, so those events become evidence; they are tier A and linked.
+        failures = [{"ts": "2026-10-03T10:01:%02d.000Z" % i, "source": "auth",
+                     "event_type": "auth_failure", "severity": "medium", "user": "admin",
+                     "src_ip": "203.0.113.9", "message": "fail"} for i in range(12)]
+        engine.ingest(self.conn, failures, [], "auth", "json", "t")
+        linked = self.conn.execute("SELECT COUNT(DISTINCT event_id) FROM alert_events").fetchone()[0]
+        self.assertGreater(linked, 0)
+        with mock.patch.object(engine, "BURST_KEEP", 1), \
+                mock.patch.object(engine, "BURST_TYPES", ("auth_failure",)):
+            engine.coalesce_batch(self.conn, self.conn.execute(
+                "SELECT id FROM ingest_batches ORDER BY id DESC LIMIT 1").fetchone()[0])
+        remaining = self.conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+        self.assertGreaterEqual(remaining, linked, "linked evidence must survive coalescing")
+
+    def test_other_event_types_are_untouched(self):
+        engine.ingest(self.conn, self.web(5), [], "web", "json", "t")
+        engine.ingest(self.conn, [{"ts": "2026-10-03T10:02:00.000Z", "source": "web",
+                                   "event_type": "web_scan", "severity": "medium",
+                                   "src_ip": "198.51.100.7", "message": "probe"}],
+                      [], "web", "json", "t")
+        with mock.patch.object(engine, "BURST_KEEP", 1):
+            engine.coalesce_batch(self.conn, self.conn.execute(
+                "SELECT id FROM ingest_batches ORDER BY id DESC LIMIT 1").fetchone()[0])
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) FROM events WHERE event_type = 'web_scan'").fetchone()[0], 1)
 
 
 if __name__ == "__main__":
