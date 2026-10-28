@@ -31,7 +31,7 @@ def add_alert(conn, severity="critical", created=0, acked=None, resolved=None, s
 
 class DbTestCase(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self.tmp.cleanup)
         self.conn = connect(os.path.join(self.tmp.name, "t.db"))
         self.addCleanup(self.conn.close)
@@ -231,7 +231,7 @@ class TriageApiTests(ServerTestCase):
 class MigrationTests(unittest.TestCase):
     def test_v6_database_gains_acknowledged_at_and_keeps_rows_null(self):
         self.assertEqual(SCHEMA_VERSION, 15)
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             path = os.path.join(tmp, "v6.db")
             conn = connect(path)
             init_schema(conn)

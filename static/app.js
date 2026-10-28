@@ -861,7 +861,7 @@ async function agentsView() {
           { num: src.batches }, { num: src.accepted }, { num: src.rejected }, { num: src.events },
           when(src.last_log_at)] }))),
       el("p", {}, el("button", { onclick: () => $("#modal").close() }, "Close")));
-    $("#modal").showModal();
+    openModal();
   };
 
   render(
@@ -1625,7 +1625,7 @@ function resetDialog(logData) {
     }
   });
   $("#modal-body").replaceChildren(form);
-  $("#modal").showModal();
+  openModal();
 }
 
 // ---------- health ----------

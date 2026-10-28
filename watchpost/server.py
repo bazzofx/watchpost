@@ -269,7 +269,11 @@ def _batch_id(req):
     Accepted as `batch_id` in the query string or as an `Idempotency-Key` header, so a sender that
     already has a stable per-batch identifier does not have to reshape its request.
     """
-    value = req.query.get("batch_id") or req.headers.get("Idempotency-Key")
+    # `headers` is read defensively: a caller that builds a light request object (the scale test does)
+    # may not carry any, and a missing header simply means "no idempotency key".
+    headers = getattr(req, "headers", None)
+    value = (req.query.get("batch_id")
+             or (headers.get("Idempotency-Key") if headers is not None else None))
     if value is None:
         return None
     value = value.strip()

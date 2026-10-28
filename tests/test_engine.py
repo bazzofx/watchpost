@@ -2,8 +2,8 @@
 
 These are the regression guards for the "database is locked" report. Two properties matter:
 
-1. A rule reads only its own window. Previously one global window — the longest lookback plus the
-   longest history, about 30 hours — was read and handed to every rule, so a 300-second rule cost
+1. A rule reads only its own window. Previously one global window â€” the longest lookback plus the
+   longest history, about 30 hours â€” was read and handed to every rule, so a 300-second rule cost
    the same as a 24-hour one and the cost of an ingest grew with the whole store.
 2. Rules are evaluated *before* a write transaction is opened. They are pure Python over possibly
    large event lists, and holding SQLite's single writer lock for that whole time is what made
@@ -26,7 +26,7 @@ class _Detector(unittest.TestCase):
     """A file-backed store, because lock behaviour needs two connections to the same database."""
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.db_path = os.path.join(self.tmp.name, "test.db")
         self.conn = connect(self.db_path)
         init_schema(self.conn)
@@ -159,7 +159,7 @@ class ScenarioPathTests(unittest.TestCase):
     """Every labeled scenario must alert through the engine, not only through improve.evaluate().
 
     Regression: RULE_EVENT_FIELDS did not list `outcome`, so a rule reading it got None. Nothing in
-    the evaluation harness could see that — it feeds rules the raw scenario dicts, which carry
+    the evaluation harness could see that â€” it feeds rules the raw scenario dicts, which carry
     `outcome` themselves, whereas the engine hands rules the projected columns. web_path_discovery
     therefore passed its labeled scenario and never fired on a real ingested event, and a new rule
     reading `outcome` would have been stillborn in exactly the same way. This walks the real path:

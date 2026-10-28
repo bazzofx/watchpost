@@ -1,7 +1,9 @@
 import json
 import os
+import shutil
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -15,6 +17,33 @@ from watchpost.server import make_server  # noqa: E402
 ADMIN_PW = "admin-test-password-1"
 ANALYST_PW = "analyst-test-password-1"
 VIEWER_PW = "viewer-test-password-1"
+
+
+def cleanup_tempdir(tmp, attempts=5, delay=0.05):
+    """Remove a TemporaryDirectory even when a file handle is still closing.
+
+    Windows refuses to unlink a file that a handle still refers to ("The process cannot access the
+    file because it is being used by another process"), and a handler thread that has just served a
+    request can hold the SQLite file for a moment after shutdown. Retrying briefly turns that race
+    into a pass instead of a teardown error; on POSIX the first attempt simply succeeds.
+    """
+    for _ in range(attempts):
+        try:
+            tmp.cleanup()
+            return
+        except OSError:
+            time.sleep(delay)
+    shutil.rmtree(tmp.name, ignore_errors=True)
+
+
+def read_text(path):
+    """Read a repository file as UTF-8, whatever the platform's default encoding is.
+
+    The static assets and docs contain non-ASCII characters; on Windows `Path.read_text()` defaults
+    to cp1252 and raises UnicodeDecodeError, which has nothing to do with what the test is checking.
+    """
+    with open(path, encoding="utf-8") as handle:
+        return handle.read()
 
 
 class Client:
@@ -54,7 +83,7 @@ class Client:
 
 class ServerTestCase(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.db_path = os.path.join(self.tmp.name, "test.db")
         self.config = Config.from_env(db_path=self.db_path, host="127.0.0.1", port=0,
                                       admin_password=ADMIN_PW, analyst_password=ANALYST_PW,
@@ -71,7 +100,8 @@ class ServerTestCase(unittest.TestCase):
     def tearDown(self):
         self.server.shutdown()
         self.server.server_close()
-        self.tmp.cleanup()
+        self.thread.join(timeout=5)
+        cleanup_tempdir(self.tmp)
 
     def client(self, user=None):
         client = Client(self.base)

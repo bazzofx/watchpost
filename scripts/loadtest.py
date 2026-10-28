@@ -170,13 +170,27 @@ def call(app, path):
 def read_paths(app, events):
     """(label, path) for each hot read. Filter values are picked from the generated data with a fixed rule."""
     conn = app.conn()
+
+    def first(sql):
+        """The first column of the first row, or a safe empty value.
+
+        The generated data does not always contain a row matching the pick (a tiny run, or a generator
+        whose naming changed), and a benchmark should measure the read paths rather than crash on the
+        filter it could not derive.
+        """
+        row = conn.execute(sql).fetchone()
+        return row[0] if row and row[0] is not None else ""
+
     try:
-        user = conn.execute("SELECT user FROM events WHERE user LIKE 'user%' GROUP BY user"
-                            " ORDER BY COUNT(*) DESC, user LIMIT 1").fetchone()[0]
-        ip = conn.execute("SELECT src_ip FROM events WHERE src_ip LIKE '10.%' GROUP BY src_ip"
-                          " ORDER BY COUNT(*) DESC, src_ip LIMIT 1").fetchone()[0]
-        host = conn.execute("SELECT host FROM events GROUP BY host ORDER BY COUNT(*) DESC, host LIMIT 1").fetchone()[0]
-        alert = conn.execute("SELECT MIN(id) FROM alerts").fetchone()[0]
+        # Derived from the data that is actually there, not from a naming convention the generator may
+        # not follow: an empty filter value makes the API reject the read path.
+        user = first("SELECT user FROM events WHERE user IS NOT NULL AND user != '' GROUP BY user"
+                     " ORDER BY COUNT(*) DESC, user LIMIT 1")
+        ip = first("SELECT src_ip FROM events WHERE src_ip IS NOT NULL AND src_ip != '' GROUP BY src_ip"
+                   " ORDER BY COUNT(*) DESC, src_ip LIMIT 1")
+        host = first("SELECT host FROM events WHERE host IS NOT NULL AND host != '' GROUP BY host"
+                     " ORDER BY COUNT(*) DESC, host LIMIT 1")
+        alert = first("SELECT MIN(id) FROM alerts")
     finally:
         conn.close()
     newest = events[-1]["ts"]
@@ -209,6 +223,13 @@ def read_paths(app, events):
     ]
     if alert:
         paths.insert(15, ("alert detail", f"/api/alerts/{alert}"))
+    # Never build a path around a value that could not be derived: the API rejects an empty filter.
+    if not user:
+        paths = [p for p in paths if "user" not in p[0] and "/user/" not in p[1]]
+    if not ip:
+        paths = [p for p in paths if "ip" not in p[0] and "/src_ip/" not in p[1]]
+    if not host:
+        paths = [p for p in paths if "host" not in p[0] and "/host/" not in p[1]]
     return paths
 
 

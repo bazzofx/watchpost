@@ -577,7 +577,7 @@ class InstallerChildPayloadTests(unittest.TestCase):
         the service was fine and only this check was wrong -- which made a healthy install look
         broken. Hence `set -a` in the payload.
         """
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             env_file = Path(tmp) / "agent.env"
             env_file.write_text(
                 "WATCHPOST_AGENT_URL=http://127.0.0.1:1\n"   # nothing listens on port 1

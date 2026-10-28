@@ -41,7 +41,7 @@ def add_alert(conn, severity, last_seen, event_ids, status="open", disposition=N
 
 class RiskScoreTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.conn = connect(os.path.join(self.tmp.name, "t.db"))
         init_schema(self.conn)
 

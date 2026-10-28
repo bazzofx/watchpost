@@ -10,7 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from tests.helpers import ServerTestCase
+from tests.helpers import ServerTestCase, cleanup_tempdir
 from watchpost import health, syslog_listener
 from watchpost.config import Config
 from watchpost.db import connect
@@ -66,7 +66,7 @@ class SyslogParsingTests(unittest.TestCase):
         self.assertEqual((event["host"], event["event_type"], event["severity"]), ("192.0.2.2", "syslog", "low"))
 
     def test_rfc5424_structured_data_bom_and_nil_values(self):
-        parsed = parse_frame('<165>1 2026-09-28T10:00:05Z - app - ID47 [ex@32473 iut="3" x="a\\]b"] ﻿Hello')
+        parsed = parse_frame('<165>1 2026-09-28T10:00:05Z - app - ID47 [ex@32473 iut="3" x="a\\]b"] ï»¿Hello')
         self.assertEqual((parsed["format"], parsed["host"], parsed["app"], parsed["msg"], parsed["facility"],
                           parsed["level"]), ("rfc5424", None, "app", "Hello", 20, 5))
 
@@ -115,7 +115,7 @@ class SyslogParsingTests(unittest.TestCase):
 
 class SyslogListenerTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.db_path = os.path.join(self.tmp.name, "test.db")
         App(Config.from_env(db_path=self.db_path, admin_password="admin-test-password-1",
                             analyst_password="analyst-test-password-1"))
@@ -125,7 +125,7 @@ class SyslogListenerTests(unittest.TestCase):
         for listener in self.listeners:
             listener.stop()
         self.assertNotIn("syslog", health._COMPONENT_CHECKS)
-        self.tmp.cleanup()
+        cleanup_tempdir(self.tmp)
 
     def listener(self, **kw):
         kw.setdefault("port", 0)
@@ -304,7 +304,7 @@ class ShipperTests(unittest.TestCase):
     TOKEN = "wp_test-token-value-0123456789"
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.dir = Path(self.tmp.name)
         self.log = self.dir / "auth.log"
         self.state = self.dir / "state" / "positions.json"
@@ -314,7 +314,7 @@ class ShipperTests(unittest.TestCase):
     def tearDown(self):
         for fake in self.fakes:
             fake.close()
-        self.tmp.cleanup()
+        cleanup_tempdir(self.tmp)
 
     def fake(self, statuses=(201,)):
         fake = FakeIngest(statuses)
@@ -388,7 +388,7 @@ class ShipperTests(unittest.TestCase):
 
         A capped pass used to walk the file list from the top and return the moment the budget was
         spent, so one source with a backlog larger than a single pass starved every file after it.
-        Those files were not shipped slowly — they were never shipped at all.
+        Those files were not shipped slowly â€” they were never shipped at all.
         """
         fake = self.fake()
         (self.dir / "auth.log").write_text("".join(f"b{i}\n" for i in range(40)))
@@ -534,10 +534,12 @@ class ShipperTests(unittest.TestCase):
                 os.environ["WATCHPOST_TOKEN"] = old
 
     def test_file_spec_parsing(self):
+        # The spec returns an absolute path; that is platform-specific by design, so compare with the
+        # same normalisation rather than hard-coding a POSIX string (it fails on Windows otherwise).
         self.assertEqual(shipper.parse_file_spec("/var/log/auth.log", hostname="box"),
-                         ("/var/log/auth.log", "auto", "box-auth"))
+                         (os.path.abspath("/var/log/auth.log"), "auto", "box-auth"))
         self.assertEqual(shipper.parse_file_spec("/var/log/nginx/access.log:nginx:web 01", hostname="box"),
-                         ("/var/log/nginx/access.log", "nginx", "web-01"))
+                         (os.path.abspath("/var/log/nginx/access.log"), "nginx", "web-01"))
 
 
 class ShipperEndToEndTests(ServerTestCase):

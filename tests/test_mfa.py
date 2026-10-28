@@ -293,7 +293,7 @@ class MfaApiTests(ServerTestCase):
 class MigrationTests(unittest.TestCase):
     def test_v7_database_gains_mfa_and_session_ids(self):
         self.assertEqual(SCHEMA_VERSION, 15)
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             path = os.path.join(tmp, "v7.db")
             conn = connect(path)
             init_schema(conn)

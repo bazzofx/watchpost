@@ -1,7 +1,7 @@
 """Retention and archiving: the dry run, the mover, pinning, and cross-tier reads.
 
-⚠ These tests need a writable temporary directory for the archive partitions. Where the environment
-denies one (some sandboxes), each test skips rather than failing — the mover is exercised on a real
+âš  These tests need a writable temporary directory for the archive partitions. Where the environment
+denies one (some sandboxes), each test skips rather than failing â€” the mover is exercised on a real
 filesystem wherever the suite can write, including the deployment host.
 """
 
@@ -26,7 +26,7 @@ def old_event(i, event_type="other", ip="203.0.113.7", user=None):
 class ArchiveTests(unittest.TestCase):
     def setUp(self):
         try:
-            self.tmp = tempfile.TemporaryDirectory()
+            self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
             probe = os.path.join(self.tmp.name, "probe")
             with open(probe, "w") as fh:
                 fh.write("x")
@@ -260,7 +260,7 @@ class JournalModeTests(unittest.TestCase):
 
     def test_partitions_are_listed_newest_first(self):
         try:
-            with tempfile.TemporaryDirectory() as tmp:
+            with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
                 for day in ("2026-01-01", "2026-01-03", "2026-01-02"):
                     archive.partition_path(tmp, day).write_bytes(b"")
                 names = [p.name for p in archive.list_partitions(tmp)]
@@ -311,7 +311,7 @@ class RetentionRouteGuardTests(unittest.TestCase):
 class AlertsOnlyDiscardTests(unittest.TestCase):
     """Policy: keep the events an alert references, discard everything else past the grace window.
 
-    Exercised with `archive_first=False`, which is the mode that deletes outright — so these run in
+    Exercised with `archive_first=False`, which is the mode that deletes outright â€” so these run in
     memory, everywhere, with no temporary directory.
     """
 

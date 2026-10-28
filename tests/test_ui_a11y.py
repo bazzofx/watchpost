@@ -12,7 +12,8 @@ STATIC = Path(__file__).resolve().parent.parent / "static"
 
 
 def read(name):
-    return (STATIC / name).read_text()
+    # Explicit encoding: the assets contain non-ASCII, and Windows would default to cp1252.
+    return (STATIC / name).read_text(encoding="utf-8")
 
 
 def function_body(source, name):

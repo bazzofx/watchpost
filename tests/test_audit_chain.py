@@ -16,7 +16,7 @@ class ChainTestCase(unittest.TestCase):
     key = None
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self.tmp.cleanup)
         self.db_path = os.path.join(self.tmp.name, "chain.db")
         self.conn = connect(self.db_path, audit_key=self.key)
@@ -269,7 +269,7 @@ class UpgradeTests(unittest.TestCase):
     key = "upgrade-key"
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self.tmp.cleanup)
         self.db_path = os.path.join(self.tmp.name, "old.db")
 

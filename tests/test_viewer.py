@@ -126,7 +126,7 @@ class ViewerAccessTests(ServerTestCase):
 class ViewerSeedingTests(unittest.TestCase):
     def setUp(self):
         os.environ.setdefault("SIEM_PBKDF2_ITERATIONS", "1000")
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.conn = connect(os.path.join(self.tmp.name, "t.db"))
         init_schema(self.conn)
 

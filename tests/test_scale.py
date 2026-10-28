@@ -22,7 +22,7 @@ NEW_INDEXES = ("idx_events_user_nocase", "idx_events_host", "idx_events_dest_ip"
 class SchemaSixUpgradeTests(unittest.TestCase):
     def test_v5_database_gains_the_indexes_and_keeps_its_audit_chain(self):
         from watchpost.server import App
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             config = Config.from_env(db_path=os.path.join(tmp, "v5.db"), admin_password=ADMIN_PW,
                                      analyst_password=ANALYST_PW)
             App(config)
@@ -119,7 +119,7 @@ class LoadScriptTests(unittest.TestCase):
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
         self.addCleanup(sys.path.pop, 0)
         import loadtest
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
                 loadtest.main(["--events", "500", "--repeat", "1", "--json", "--db", os.path.join(tmp, "l.db")])

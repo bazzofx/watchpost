@@ -286,7 +286,7 @@ class StorylineTests(unittest.TestCase):
     def test_a_real_storyline_run_raises_no_silence_alert(self):
         import os
         import tempfile
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             path = os.path.join(tmp, "story.db")
             conn = connect(path)
             init_schema(conn)

@@ -1,7 +1,7 @@
 """Connection and schema behaviour (watchpost/db.py).
 
 Journalling is a property of the database *file*, not of a connection, so it is set once when the
-schema is created. Setting it in connect() — which the server calls for every HTTP request — meant
+schema is created. Setting it in connect() â€” which the server calls for every HTTP request â€” meant
 every request took a lock on the database header, one of the causes of "database is locked" under
 load. These tests pin that down, because the difference is invisible until the store is busy.
 """
@@ -15,7 +15,7 @@ from watchpost.db import ADDED_COLUMNS, SCHEMA_VERSION, connect, init_schema
 
 class JournalModeTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.db_path = os.path.join(self.tmp.name, "test.db")
 
     def tearDown(self):
@@ -95,7 +95,7 @@ class ConnectionTests(unittest.TestCase):
             conn.close()
 
     def test_the_parent_directory_is_created(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             nested = os.path.join(tmp, "a", "b", "test.db")
             conn = connect(nested)
             try:
